@@ -10,6 +10,10 @@ import (
 	"github.com/coder/websocket"
 )
 
+// defaultSDKVersion is reported as Agent.SDKVersion in the hello message
+// when the caller doesn't set one. Single source for this package.
+const defaultSDKVersion = "0.2.0"
+
 // ClientOptions configures Dial. This is a minimal Go client sufficient for
 // tests and a future Go SDK; it does not implement reconnect/backoff (that is
 // the JS SDK's job, per OVERVIEW.md section 2.9's reconnect table).
@@ -93,7 +97,7 @@ func clientHandshake(ctx context.Context, c *Conn, opts ClientOptions) error {
 	}
 	if hello.Agent.SDK == "" {
 		hello.Agent.SDK = "ws-mixer-go"
-		hello.Agent.SDKVersion = "0.1.0"
+		hello.Agent.SDKVersion = defaultSDKVersion
 	}
 	if opts.Meta != nil {
 		b, err := json.Marshal(opts.Meta)
@@ -150,11 +154,13 @@ func (c *Conn) applyWelcome(helloWindow int64, welcome *WelcomeMsg) error {
 	if welcome.V != 1 {
 		return &ConnError{Code: UnsupportedCode, Message: fmt.Sprintf("welcome.v=%d does not match ws-mixer.v1", welcome.V)}
 	}
-	if welcome.PingInterval < 5000 {
-		return newConnErrorf(ProtocolErrorCode, "welcome.ping_interval %d is below the 5000ms floor", welcome.PingInterval)
-	}
-	if welcome.PingTimeout < 2*welcome.PingInterval {
-		return newConnErrorf(ProtocolErrorCode, "welcome.ping_timeout (%d) must be at least 2x ping_interval (%d)", welcome.PingTimeout, welcome.PingInterval)
+	if !c.opts.allowSubfloorTiming {
+		if welcome.PingInterval < pingIntervalMin {
+			return newConnErrorf(ProtocolErrorCode, "welcome.ping_interval %d is below the %dms floor", welcome.PingInterval, pingIntervalMin)
+		}
+		if welcome.PingTimeout < 2*welcome.PingInterval {
+			return newConnErrorf(ProtocolErrorCode, "welcome.ping_timeout (%d) must be at least 2x ping_interval (%d)", welcome.PingTimeout, welcome.PingInterval)
+		}
 	}
 	c.session = welcome.Session
 	c.peerWindow = welcome.Window

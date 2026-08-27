@@ -1,6 +1,7 @@
 package wsmixer
 
 import (
+	"context"
 	"io"
 	"testing"
 	"time"
@@ -46,6 +47,39 @@ func TestStreamCloseResetsWhenPeerStillSending(t *testing.T) {
 	}
 	if st.State() != "closed" {
 		t.Errorf("state = %s, want closed", st.State())
+	}
+}
+
+// TestStreamWriteAfterCloseWriteFails is the mutation-testing counterpart to
+// spec/fixtures/sequences/data_after_close_toward_client.json: that fixture
+// exercises a RECEIVER correctly RESETing a peer that illegally sends DATA
+// after its own CLOSE, but says nothing about the SENDER's own guard against
+// producing that stray DATA in the first place. CloseWrite sets state to
+// half_closed_local (or closed, if the peer had already half-closed); a
+// subsequent WriteContext must fail with STREAM_CLOSED rather than silently
+// queuing a chunk that would violate OVERVIEW.md section 2.5's "MUST NOT
+// send" row for half-closed(local)/closed.
+func TestStreamWriteAfterCloseWriteFails(t *testing.T) {
+	c := newTestSchedConn(t)
+	st := registerTestStream(c, 1)
+
+	if err := st.CloseWrite(); err != nil {
+		t.Fatalf("CloseWrite: %v", err)
+	}
+	if st.State() != "half_closed_local" {
+		t.Fatalf("state after CloseWrite = %s, want half_closed_local", st.State())
+	}
+
+	_, err := st.WriteContext(context.Background(), []byte("stray"))
+	if err == nil {
+		t.Fatal("WriteContext after CloseWrite succeeded, want an error")
+	}
+	se, ok := err.(*StreamError)
+	if !ok {
+		t.Fatalf("error = %#v, want *StreamError", err)
+	}
+	if se.Code != StreamClosedCode {
+		t.Errorf("error code = %s, want STREAM_CLOSED", se.Code)
 	}
 }
 

@@ -26,13 +26,15 @@ var sequenceWaitMsFixtures = map[string]bool{
 	"hello_timeout.json":                    true,
 	"ping_pong_then_dead_peer_timeout.json": true,
 	"drain_with_inflight_timeout.json":      true,
+	"client_dead_peer_timeout.json":         true,
 }
 
 type sequenceStep struct {
-	Recv   json.RawMessage `json:"recv"`
-	Send   json.RawMessage `json:"send"`
-	WaitMs *int            `json:"wait_ms"`
-	Expect map[string]any  `json:"expect"`
+	Recv         json.RawMessage `json:"recv"`
+	Send         json.RawMessage `json:"send"`
+	WaitMs       *int            `json:"wait_ms"`
+	Expect       map[string]any  `json:"expect"`
+	SchemaExempt bool            `json:"schema_exempt"`
 }
 
 type sequenceFixture struct {
@@ -165,7 +167,17 @@ func runSequence(t *testing.T, seq sequenceFixture) {
 		case step.Send != nil:
 			rt.doSend(step.Send)
 		case step.WaitMs != nil:
-			time.Sleep(time.Millisecond) // negligible: only non-timing fixtures reach here
+			wait := time.Duration(*step.WaitMs) * time.Millisecond
+			if scriptsAutonomousPing(seq) {
+				// runSequence shortened c.pingInterval 250x (welcome's 5000ms
+				// floor -> 20ms) so a real autonomous ping actually fires
+				// within this test; scale the fixture's protocol-time
+				// wait_ms by the same 250x factor instead of the previous
+				// fixed 1ms no-op, which never gave the ping loop a real
+				// chance to tick before the next step ran.
+				wait /= 250
+			}
+			time.Sleep(wait)
 		case step.Expect != nil:
 			rt.checkExpect(step.Expect)
 		default:
@@ -213,25 +225,48 @@ func performHandshakePrelude(t *testing.T, rt *seqRuntime, seq sequenceFixture, 
 	ctx := context.Background()
 
 	if seq.Role == "client" {
-		if step0.Recv == nil {
-			return 0
+		if step0.Recv != nil {
+			var probe genericStepProbe
+			_ = json.Unmarshal(step0.Recv, &probe)
+			if probe.T != "welcome" {
+				return 0
+			}
+			rt.fake.feedInbound(EncodeData(0, step0.Recv))
+			if err := clientHandshake(ctx, c, ClientOptions{
+				Options: opts, Token: harnessHelloToken,
+				Agent: AgentInfo{SDK: "ws-mixer-go-harness", SDKVersion: "0.0.0"},
+			}); err != nil {
+				t.Fatalf("prelude client handshake: %v", err)
+			}
+			// clientHandshake wrote a real hello frame before reading the welcome
+			// we just fed it; no step scripts that hello, so drain it here.
+			<-rt.fake.outbound
+			return 1
 		}
-		var probe genericStepProbe
-		_ = json.Unmarshal(step0.Recv, &probe)
-		if probe.T != "welcome" {
-			return 0
+		// A client-role fixture that scripts its own "send hello" as step 0,
+		// followed by "recv welcome" as step 1 (e.g. duplicate_pong_from_server.json,
+		// client_dead_peer_timeout.json): run the real clientHandshake against the
+		// scripted welcome, and assert the hello it produces matches step 0, so both
+		// steps are consumed here instead of leaving the Conn's handshake incomplete
+		// when the main loop reaches step 1's "recv".
+		if step0.Send != nil && len(seq.Steps) > 1 && seq.Steps[1].Recv != nil && !seq.Steps[1].SchemaExempt {
+			var probe0, probe1 genericStepProbe
+			_ = json.Unmarshal(step0.Send, &probe0)
+			_ = json.Unmarshal(seq.Steps[1].Recv, &probe1)
+			if probe0.T == "hello" && probe1.T == "welcome" {
+				rt.fake.feedInbound(EncodeData(0, seq.Steps[1].Recv))
+				if err := clientHandshake(ctx, c, ClientOptions{
+					Options: opts, Token: harnessHelloToken,
+					Agent: AgentInfo{SDK: "ws-mixer-go-harness", SDKVersion: "0.0.0"},
+				}); err != nil {
+					t.Fatalf("prelude client handshake: %v", err)
+				}
+				got := <-rt.fake.outbound
+				rt.assertMatches(got, step0.Send, probe0)
+				return 2
+			}
 		}
-		rt.fake.feedInbound(EncodeData(0, step0.Recv))
-		if err := clientHandshake(ctx, c, ClientOptions{
-			Options: opts, Token: harnessHelloToken,
-			Agent: AgentInfo{SDK: "ws-mixer-go-harness", SDKVersion: "0.0.0"},
-		}); err != nil {
-			t.Fatalf("prelude client handshake: %v", err)
-		}
-		// clientHandshake wrote a real hello frame before reading the welcome
-		// we just fed it; no step scripts that hello, so drain it here.
-		<-rt.fake.outbound
-		return 1
+		return 0
 	}
 
 	if step0.Recv != nil {
@@ -300,14 +335,33 @@ func applyWelcomeStepOptions(seq sequenceFixture, opts *Options) {
 				MaxStreams int64  `json:"max_streams"`
 			}
 			_ = json.Unmarshal(raw, &w)
-			if w.T != "welcome" {
-				continue
-			}
-			if w.Window > 0 {
-				opts.Window = w.Window
-			}
-			if w.MaxStreams > 0 {
-				opts.MaxStreams = w.MaxStreams
+			switch w.T {
+			case "welcome":
+				// welcome.window/max_streams are THIS side's own advertised
+				// values only when this side plays server (Options.Window
+				// governs what a real server puts in its own welcome); for
+				// a client-role fixture, welcome carries the *peer's*
+				// window, which must not overwrite opts.Window (our own
+				// receive window, taken from our own hello below instead).
+				if seq.Role != "client" {
+					if w.Window > 0 {
+						opts.Window = w.Window
+					}
+					if w.MaxStreams > 0 {
+						opts.MaxStreams = w.MaxStreams
+					}
+				}
+			case "hello":
+				// A client-role fixture's own scripted hello declares this
+				// side's receive window; apply it so the real
+				// clientHandshake (run by performHandshakePrelude) actually
+				// advertises it, instead of silently falling back to the
+				// harness default (credit_violation_toward_client.json
+				// depends on this: the server DATAs it up to exactly its
+				// declared window).
+				if seq.Role == "client" && w.Window > 0 {
+					opts.Window = w.Window
+				}
 			}
 		}
 	}
@@ -317,15 +371,40 @@ func applyWelcomeStepOptions(seq sequenceFixture, opts *Options) {
 // (only pong_for_unsent_id.json does): runSequence uses this to shorten the
 // Conn's ping ticker after the handshake completes, so a real autonomous
 // ping actually fires within doSend's 2s wait bound.
+// scriptsAutonomousPing reports whether a fixture needs the Conn's real ping
+// ticker sped up to actually fire within this test: either it scripts a
+// "send ping" step directly (pong_for_unsent_id.json, server role), or it
+// receives a "pong" for the same id twice (duplicate_pong_from_server.json)
+// -- the latter can only be a genuine duplicate ack if the client itself
+// autonomously sent that ping id at least once first, which requires the
+// real pingLoop to have ticked. A single (non-repeated) "recv pong" id, as in
+// pong_for_unsent_id_from_server.json, is deliberately unsent and must NOT
+// trigger this -- speeding up the ticker there would risk the client
+// autonomously sending that exact id itself before the fixture's step lands,
+// turning the intended PROTOCOL_ERROR case into a false pass.
 func scriptsAutonomousPing(seq sequenceFixture) bool {
+	pongIDSeen := map[int64]bool{}
 	for _, step := range seq.Steps {
-		if step.Send == nil {
-			continue
+		if step.Send != nil {
+			var p genericStepProbe
+			_ = json.Unmarshal(step.Send, &p)
+			if p.T == "ping" {
+				return true
+			}
 		}
-		var p genericStepProbe
-		_ = json.Unmarshal(step.Send, &p)
-		if p.T == "ping" {
-			return true
+		if step.Recv != nil {
+			var p genericStepProbe
+			_ = json.Unmarshal(step.Recv, &p)
+			if p.T == "pong" {
+				var pm struct {
+					ID int64 `json:"id"`
+				}
+				_ = json.Unmarshal(step.Recv, &pm)
+				if pongIDSeen[pm.ID] {
+					return true
+				}
+				pongIDSeen[pm.ID] = true
+			}
 		}
 	}
 	return false

@@ -149,17 +149,16 @@ func parseWelcome(top map[string]json.RawMessage) (*WelcomeMsg, error) {
 	if m.MaxStreams < maxStreamsMin || m.MaxStreams > maxStreamsMax {
 		return nil, newConnErrorf(ProtocolErrorCode, "welcome.max_streams %d out of range %d..%d", m.MaxStreams, maxStreamsMin, maxStreamsMax)
 	}
+	// The ping_interval >= 5000ms / ping_timeout >= 2x ping_interval floor
+	// (OVERVIEW.md section 2.9/2.10) is enforced by Conn.applyWelcome
+	// (client.go), not here: this parser is a stateless wire decoder with no
+	// notion of the conformance-only allowSubfloorTiming escape hatch, and
+	// applyWelcome is the one place that can gate the check on it.
 	if m.PingInterval, err = requireInt(top, "ping_interval"); err != nil {
 		return nil, connErr(err)
 	}
-	if m.PingInterval < pingIntervalMin {
-		return nil, newConnErrorf(ProtocolErrorCode, "welcome.ping_interval %d is below the %dms floor", m.PingInterval, pingIntervalMin)
-	}
 	if m.PingTimeout, err = requireInt(top, "ping_timeout"); err != nil {
 		return nil, connErr(err)
-	}
-	if m.PingTimeout < 2*m.PingInterval {
-		return nil, newConnErrorf(ProtocolErrorCode, "welcome.ping_timeout (%d) must be at least 2x ping_interval (%d)", m.PingTimeout, m.PingInterval)
 	}
 
 	if raw, ok := top["server"]; ok {

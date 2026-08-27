@@ -49,6 +49,30 @@ func loadControlFixtures(t *testing.T) []controlFixture {
 	return out
 }
 
+// validateControl runs ParseControl and, for a welcome message, additionally
+// applies the same ping_interval/ping_timeout floor check applyWelcome
+// (client.go) enforces during a real handshake -- so a fixture's wire_valid
+// is asserted against the full validation path an SDK actually runs, not
+// just the stateless wire parser. This mirrors conformance/README.md's
+// "AllowSubfloorTiming now actually reaches the real Go client": the floor
+// check was deliberately moved out of ParseControl/parseWelcome (which now
+// just decodes the ints) and into the connection-scoped applyWelcome.
+func validateControl(raw []byte) error {
+	msg, err := ParseControl(raw)
+	if err != nil {
+		return err
+	}
+	if w, ok := msg.(*WelcomeMsg); ok {
+		if w.PingInterval < pingIntervalMin {
+			return newConnErrorf(ProtocolErrorCode, "welcome.ping_interval %d is below the %dms floor", w.PingInterval, pingIntervalMin)
+		}
+		if w.PingTimeout < 2*w.PingInterval {
+			return newConnErrorf(ProtocolErrorCode, "welcome.ping_timeout (%d) must be at least 2x ping_interval (%d)", w.PingTimeout, w.PingInterval)
+		}
+	}
+	return nil
+}
+
 // TestControlFixtures asserts that ParseControl's pass/fail verdict agrees
 // with each fixture's wire_valid, per spec/README.md: "SDK runtime validators
 // assert wire_valid". Fixtures that fail only the strict test-time schema
@@ -64,7 +88,7 @@ func TestControlFixtures(t *testing.T) {
 			} else {
 				raw = f.Message
 			}
-			_, err := ParseControl(raw)
+			err := validateControl(raw)
 			if f.WireValid {
 				if err != nil {
 					t.Fatalf("expected wire_valid=true, got parse error: %v", err)
@@ -89,7 +113,7 @@ func TestControlEnvelopeErrorsAreConnectionFatal(t *testing.T) {
 		} else {
 			raw = f.Message
 		}
-		_, err := ParseControl(raw)
+		err := validateControl(raw)
 		if err == nil {
 			t.Errorf("%s: expected error", f.Path)
 			continue

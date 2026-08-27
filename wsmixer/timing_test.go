@@ -168,6 +168,45 @@ func TestKeepaliveTimeout(t *testing.T) {
 	}
 }
 
+// TestClientKeepaliveTimeout mirrors client_dead_peer_timeout.json (skipped
+// from sequence_test.go's generic harness alongside the other wait_ms
+// fixtures): the CLIENT side's own watchdog fires when the server never
+// answers any of its pings.
+func TestClientKeepaliveTimeout(t *testing.T) {
+	fake := newFakeWS()
+	opts := Options{
+		Window: 262144, MaxStreams: 64,
+		PingInterval: 20 * time.Millisecond, PingTimeout: 60 * time.Millisecond,
+		Logger: discardLogger(), Metrics: NoopMetrics{},
+	}
+	c := newConn(fake, RoleClient, opts)
+	c.session = "test"
+	c.ourWindow = opts.Window
+	c.peerWindow = opts.Window
+	c.maxStreams = opts.MaxStreams
+	c.pingInterval = opts.PingInterval
+	c.pingTimeout = opts.PingTimeout
+	c.finishHandshake()
+	c.run()
+	defer fake.Close(0, "")
+
+	select {
+	case <-c.closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("connection never closed on keepalive timeout")
+	}
+	ce, ok := c.Err().(*ConnError)
+	if !ok {
+		t.Fatalf("expected *ConnError, got %#v", c.Err())
+	}
+	if ce.Code != KeepaliveTimeout {
+		t.Errorf("error code = %s, want KEEPALIVE_TIMEOUT", ce.Code)
+	}
+	if ce.CloseCode() != 4013 {
+		t.Errorf("close code = %d, want 4013", ce.CloseCode())
+	}
+}
+
 // TestDrainWithInflightTimeout mirrors drain_with_inflight_timeout.json: a
 // stream still open at the drain deadline is RESET(CANCEL), then the
 // connection closes with GOING_AWAY/4012.

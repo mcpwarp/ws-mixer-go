@@ -58,6 +58,18 @@ type Options struct {
 	// ENHANCE_YOUR_CALM. Defaults: 50 messages/s, burst 100.
 	Stream0RateLimit float64
 	Stream0Burst     float64
+
+	// allowSubfloorTiming is a test-only escape hatch: when true, the client
+	// handshake (applyWelcome, client.go) skips the wire's ping_interval
+	// >= 5000ms and ping_timeout >= 2x ping_interval floor checks (OVERVIEW.md
+	// section 2.9/2.10), so a scaled-clock test harness (e.g. the conformance
+	// runner's --time-scale) can run a real Dial against a welcome carrying
+	// values below those floors. Mirrors the JS SDK's ConnOptions._timing.
+	// Unexported and settable only through the conformance-hooks.go
+	// AllowSubfloorTiming(*Options) function, which is compiled in only
+	// under the `conformance` build tag -- never available in a normal
+	// build, let alone production.
+	allowSubfloorTiming bool
 }
 
 func (o *Options) setDefaults() {
@@ -183,10 +195,11 @@ type Conn struct {
 	streams            map[uint32]*Stream
 	highestOpened      uint32
 	nextStreamID       uint32
-	draining           bool // this side has initiated its own Drain() sequence
+	draining           bool // this side has initiated its own Drain() sequence, or (client) the peer's drain was received
 	peerRequestedDrain bool // the peer sent drain{client_requested}; server-only
 	announcedLastID    uint32
 	hasAnnouncedLast   bool
+	peerLastStreamID   uint32              // client-only: last_stream_id from the server's drain message
 	outstandingPings   map[int64]time.Time // ids in [lowestUnacked, nextPingID) still awaiting a pong
 	lowestUnacked      int64               // watermark: every id below this has been acked at least once
 	nextPingID         int64

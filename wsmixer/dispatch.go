@@ -103,6 +103,17 @@ func (c *Conn) handleRemoteOpen(id uint32) bool {
 		c.fail(newConnErrorf(ProtocolErrorCode, "OPEN for id %d is not greater than highest_opened %d", id, c.highestOpened))
 		return true
 	}
+	// OVERVIEW.md section 2.7 Drain: an OPEN with id > last_stream_id after
+	// the server has drained means the server violated the boundary it
+	// already promised -- connection-fatal, not a stream-scoped
+	// REFUSED_STREAM, because only the server opens streams and this is
+	// therefore always a peer protocol violation, never self-inflicted.
+	if c.draining && id > c.peerLastStreamID {
+		lastStreamID := c.peerLastStreamID
+		c.mu.Unlock()
+		c.fail(newConnErrorf(ProtocolErrorCode, "OPEN for id %d exceeds drain last_stream_id %d", id, lastStreamID))
+		return true
+	}
 	c.highestOpened = id
 	overLimit := int64(len(c.streams)) >= c.maxStreams
 	declared := c.declaredMaxStreams
@@ -393,6 +404,7 @@ func (c *Conn) handleDrainMsg(m *DrainMsg) (fatal bool) {
 		c.peerRequestedDrain = true
 	} else {
 		c.draining = true
+		c.peerLastStreamID = m.LastStreamID
 	}
 	c.mu.Unlock()
 	c.opts.Metrics.DrainReceived(c.session, reason)

@@ -261,6 +261,44 @@ func TestRefusedOpenNoEscalationWhenSelfLimited(t *testing.T) {
 	}
 }
 
+// TestOpenAboveDrainLastStreamIDIsProtocolError checks that a client which
+// has received drain{last_stream_id: N} from the server, then sees an OPEN
+// for an id above N, fails the whole connection with PROTOCOL_ERROR rather
+// than just refusing the one stream: only the server opens streams, so an
+// OPEN above the boundary it already promised is always the server
+// violating its own promise, never something the client could have
+// self-inflicted (OVERVIEW.md section 2.7 Drain, decision log 2026-08-27).
+func TestOpenAboveDrainLastStreamIDIsProtocolError(t *testing.T) {
+	ws := newFakeWS()
+	c := newConn(ws, RoleClient, Options{}) // only the client receives OPEN
+	c.opts.setDefaults()
+	c.session = "test-session"
+	c.ourWindow = 262144
+	c.peerWindow = 262144
+	c.maxStreams = 64
+	c.pingInterval = time.Minute
+	c.pingTimeout = 5 * time.Minute
+	c.finishHandshake()
+	c.run()
+	defer func() { _ = ws.CloseNow() }()
+
+	ws.feedInbound(EncodeData(0, []byte(`{"t":"drain","reason":"maintenance","last_stream_id":3,"deadline_ms":0}`)))
+	// Give the delivery/dispatch loop a moment to process the drain before
+	// the OPEN that violates its boundary.
+	time.Sleep(50 * time.Millisecond)
+	ws.feedInbound(EncodeOpen(5))
+
+	select {
+	case <-c.closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("connection never failed on OPEN above drain last_stream_id")
+	}
+	ce, ok := c.Err().(*ConnError)
+	if !ok || ce.Code != ProtocolErrorCode {
+		t.Errorf("Err() = %#v, want PROTOCOL_ERROR", c.Err())
+	}
+}
+
 // TestOpenStreamDoesNotDeadlockWithFailWrite covers the OpenStream/failWrite
 // deadlock: OpenStream must never hold c.mu while blocking on a full,
 // stalled controlQueue, or a concurrent write failure that needs c.mu to
