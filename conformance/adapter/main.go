@@ -79,17 +79,289 @@ type adapterState struct {
 	// stream_closed{direction:"both"} alongside the existing per-direction
 	// event (docs/CONFORMANCE.md section 1.2).
 	closed map[uint32]closedDirs
+
+	// pendingHello carries the peer's hello.agent/hello.meta from the
+	// Authenticate hook (the only place a server-role adapter ever sees
+	// them, go/wsmixer has no exported Conn accessor for either) across to
+	// OnConn, which fires immediately afterward on the same handshake
+	// goroutine (server.go: OnConn runs once the handshake completes). See
+	// the "connected" event emitted from OnConn below, and
+	// docs/CONFORMANCE.md section 1.2's event table.
+	pendingHello *helloInfo
+
+	// streamWorkers serializes write/close_write per stream id
+	// (docs/CONFORMANCE.md section 1.1): `write` acks asynchronously (a
+	// goroutine per call) while `close_write` used to run synchronously in
+	// the command-reading loop, so a close_write issued before an
+	// in-flight write's ack could send CLOSE (which jumps the writer
+	// loop's DATA rotation entirely, sched.go's writerLoop) before that
+	// write's chunk ever reached the wire, truncating the stream. Each
+	// stream id gets its own FIFO worker goroutine fed by a bounded
+	// (cap 64) channel, so commands for one stream take effect in the
+	// order the runner sent them regardless of ack timing; acks are still
+	// emitted from inside each queued job, unchanged in shape or timing
+	// relative to their own command. The channel is a bound, not an
+	// unbounded queue: a worker stalled behind a blocked write (e.g. send
+	// credit exhausted) must not wedge the stdin-reading loop, so
+	// enqueueOnStream never blocks on it -- once the 64-deep buffer is
+	// full it error-acks the new command with "queue_full" instead of
+	// waiting for room.
+	//
+	// RESET (OVERVIEW.md section 2.5: abortive, discards buffered data and
+	// unblocks writers) deliberately does NOT go through this FIFO --
+	// resetStream below cancels the worker's context (unblocking any
+	// WriteContext call that is queued and currently blocked on send
+	// credit), calls Stream.Reset directly, and drains any operations
+	// still sitting in the channel with an error ack, rather than waiting
+	// behind them.
+	streamWorkers map[uint32]*streamWorker
+}
+
+// streamQueueCap bounds the per-stream FIFO worker's channel: how many
+// write/close_write commands may be queued ahead of a stalled worker before
+// enqueueOnStream starts rejecting new ones with a "queue_full" error ack
+// instead of blocking the stdin-reading loop.
+const streamQueueCap = 64
+
+// resetWorkerDrainBudget bounds how long resetStream will wait for a job
+// that was already running on the stream's worker to notice cancellation
+// and report its own outcome before reset's own ack (see resetStream). It
+// is not a normal-path latency: a job respecting its context (WriteContext)
+// unblocks near-instantly once cancelled, so this only matters for a job
+// that doesn't (e.g. CloseWrite has no context), where it caps the cost of
+// waiting instead of leaving RESET's promptness unbounded.
+const resetWorkerDrainBudget = 500 * time.Millisecond
+
+// streamJob is one FIFO-queued write or close_write, carrying the seq its
+// error ack (if any) should be reported against -- needed so a RESET that
+// drains the queue out from under a stalled worker can still emit an
+// aborted-command error ack per dropped job (see streamWorkers' comment).
+type streamJob struct {
+	seq float64
+	run func(ctx context.Context)
+}
+
+// streamWorker is one stream id's FIFO worker: a bounded job channel plus a
+// per-stream cancelable context, so RESET can unblock a job (e.g. a Write
+// stuck on exhausted send credit) that is already running when it fires.
+// done is closed by the worker's own goroutine right as it returns (always
+// via ctx being cancelled -- see the goroutine in enqueueOnStream), which
+// resetStream waits on (bounded) after cancelling: a job already running
+// when RESET fires reports its own outcome (e.g. a blocked write's "write:
+// context canceled" error ack) from inside itself before the goroutine
+// loop notices ctx.Done() and returns, so waiting for done makes RESET's
+// own ack observably follow that job's outcome rather than racing it.
+type streamWorker struct {
+	jobs   chan streamJob
+	ctx    context.Context
+	cancel context.CancelFunc
+	done   chan struct{}
 }
 
 type closedDirs struct{ read, write bool }
+
+// helloInfo is the subset of go/wsmixer's *Hello the server-role "connected"
+// event reports (docs/CONFORMANCE.md section 1.2's event table): the peer's
+// agent identity and opaque meta, exactly as seen by the Authenticate hook.
+type helloInfo struct {
+	agent wsmixer.AgentInfo
+	meta  json.RawMessage
+}
 
 func newState() *adapterState {
 	return &adapterState{
 		window: 262144, maxStreams: 64,
 		pingIntMs: 30000, pingTOMs: 90000, helloTOMs: 10000,
 		timeScale: 1, floorMs: 300,
-		streams: make(map[uint32]*wsmixer.Stream),
-		closed:  make(map[uint32]closedDirs),
+		streams:       make(map[uint32]*wsmixer.Stream),
+		closed:        make(map[uint32]closedDirs),
+		streamWorkers: make(map[uint32]*streamWorker),
+	}
+}
+
+// setPendingHello/takePendingHello hand the Authenticate hook's *Hello across
+// to OnConn (see the pendingHello field comment).
+func (s *adapterState) setPendingHello(h *wsmixer.Hello) {
+	s.mu.Lock()
+	s.pendingHello = &helloInfo{agent: h.Agent, meta: h.Meta}
+	s.mu.Unlock()
+}
+
+func (s *adapterState) takePendingHello() *helloInfo {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	h := s.pendingHello
+	s.pendingHello = nil
+	return h
+}
+
+// enqueueOnStream atomically looks up stream id and enqueues a job onto its
+// FIFO worker (write and close_write only -- see the streamWorkers field
+// comment; reset bypasses this entirely via resetStream), starting the
+// worker's goroutine lazily on first use. The lookup, any worker creation,
+// and the send onto the worker's channel all happen under s.mu, in the same
+// critical section teardownStream/resetStream use to remove a stream --
+// without that, a lookup that found the stream just before a concurrent
+// teardownStream (from autoRead or watchDisconnect) removed it could still
+// go on to create a brand new worker for an id nothing will ever tear down
+// again, leaking its goroutine and map entry forever. Returns false if
+// stream id is not (or no longer) tracked, in which case the caller should
+// report a "no such stream" error; buildJob receives the exact
+// *wsmixer.Stream found under the lock, so the job always acts on the
+// stream that was actually still live at enqueue time.
+//
+// Commands for the same stream id run strictly in the order they were
+// enqueued, regardless of how long any individual job takes (e.g. a
+// blocking WriteContext). The worker's channel is bounded (streamQueueCap):
+// if a stalled worker has let it fill up, enqueueOnStream does not block the
+// stdin-reading loop waiting for room -- it error-acks seq with
+// "queue_full" instead.
+func (s *adapterState) enqueueOnStream(id uint32, seq float64, buildJob func(strm *wsmixer.Stream) func(ctx context.Context)) bool {
+	s.mu.Lock()
+	strm, ok := s.streams[id]
+	if !ok {
+		s.mu.Unlock()
+		return false
+	}
+	w, wok := s.streamWorkers[id]
+	if !wok {
+		ctx, cancel := context.WithCancel(context.Background())
+		w = &streamWorker{jobs: make(chan streamJob, streamQueueCap), ctx: ctx, cancel: cancel, done: make(chan struct{})}
+		s.streamWorkers[id] = w
+		go func() {
+			defer close(w.done)
+			for {
+				select {
+				case j := <-w.jobs:
+					j.run(w.ctx)
+				case <-w.ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+	s.mu.Unlock()
+
+	select {
+	case w.jobs <- streamJob{seq: seq, run: buildJob(strm)}:
+	default:
+		cmdErr(seq, fmt.Sprintf("queue_full: stream %d's write/close_write queue (cap %d) is full", id, streamQueueCap))
+	}
+	return true
+}
+
+// teardownStream removes id's bookkeeping (streams, closed, streamWorkers)
+// and stops its FIFO worker goroutine. Called once a stream reaches a
+// terminal state -- closed both ways (noteHalfClosed returning true) or
+// reset by either side -- or when the connection itself fails
+// (teardownAllStreams). Without this the streamWorkers/streams map entries
+// and the worker goroutine leak for the rest of the process's life.
+func (s *adapterState) teardownStream(id uint32) {
+	s.mu.Lock()
+	delete(s.streams, id)
+	delete(s.closed, id)
+	w, ok := s.streamWorkers[id]
+	delete(s.streamWorkers, id)
+	s.mu.Unlock()
+	if ok {
+		w.cancel()
+	}
+}
+
+// teardownAllStreams tears down every still-tracked stream, used once the
+// connection itself fails (watchDisconnect): none of those streams will
+// ever reach a graceful terminal state on their own once the socket is
+// gone, so their FIFO workers would otherwise leak forever. Iterates the
+// union of streams and streamWorkers -- not just streams -- so a worker
+// whose id has no (or no longer has a) streams entry still gets found and
+// torn down; relying on streams alone would miss it.
+func (s *adapterState) teardownAllStreams() {
+	s.mu.Lock()
+	idSet := make(map[uint32]struct{}, len(s.streams)+len(s.streamWorkers))
+	for id := range s.streams {
+		idSet[id] = struct{}{}
+	}
+	for id := range s.streamWorkers {
+		idSet[id] = struct{}{}
+	}
+	ids := make([]uint32, 0, len(idSet))
+	for id := range idSet {
+		ids = append(ids, id)
+	}
+	s.mu.Unlock()
+	for _, id := range ids {
+		s.teardownStream(id)
+	}
+}
+
+// drainAbortedJobs error-acks every job still buffered in w's channel
+// (queued write/close_write commands that never got to run) after a RESET
+// has cancelled the worker -- see resetStream and OVERVIEW.md section 2.5
+// ("RESET is abortive; it discards buffered data and unblocks writers").
+func drainAbortedJobs(w *streamWorker) {
+	for {
+		select {
+		case j := <-w.jobs:
+			cmdErr(j.seq, "reset: queued command aborted by RESET")
+		default:
+			return
+		}
+	}
+}
+
+// resetStream runs RESET out-of-band, immediately, bypassing the per-stream
+// FIFO that serializes write/close_write (see the streamWorkers field
+// comment and OVERVIEW.md section 2.5): it cancels the stream's worker
+// context first, so a write already running on the worker and blocked on
+// exhausted send credit (WriteContext) unblocks right away instead of
+// stalling the reset behind it, then calls Stream.Reset (which discards
+// buffered data and unblocks the peer), then drains anything still queued
+// behind it with an error ack instead of letting it run against an
+// already-reset stream.
+//
+// resetStream waits up to resetWorkerDrainBudget (500ms) on the worker's
+// command loop for that already-running job to notice the cancellation and
+// finish before proceeding. If the job ignores ctx and outlives the budget,
+// resetStream proceeds anyway rather than blocking indefinitely: Stream.Reset
+// still runs and drainAbortedJobs still error-acks the queue, but a job that
+// was still queued behind the slow one may get scheduled on the worker
+// before drainAbortedJobs reaches it and end up observing an already-reset
+// stream instead of a clean abort. This is a bounded, accepted race -- the
+// alternative is an unbounded wait that would defeat RESET's own promptness
+// guarantee -- not a correctness bug.
+func (s *adapterState) resetStream(id uint32, strm *wsmixer.Stream, code wsmixer.ErrorCode, msg string, seq float64) {
+	s.mu.Lock()
+	w, hasWorker := s.streamWorkers[id]
+	delete(s.streamWorkers, id)
+	delete(s.streams, id)
+	delete(s.closed, id)
+	s.mu.Unlock()
+
+	if hasWorker {
+		w.cancel()
+		// Wait (bounded) for a job that was already running on this worker
+		// to notice the cancellation and report its own outcome -- e.g. a
+		// blocked write's "write: context canceled" error ack -- before
+		// this reset's own ack below, so the runner never observes RESET
+		// "complete" ahead of being told the write it unblocked failed. A
+		// job respecting ctx (WriteContext) unblocks near-instantly, so
+		// this bound is only ever a real wait for a pathological job that
+		// ignores ctx entirely; it must not be unbounded, or such a job
+		// would defeat RESET's own promptness guarantee.
+		select {
+		case <-w.done:
+		case <-time.After(resetWorkerDrainBudget):
+		}
+	}
+
+	if err := strm.Reset(code, msg); err != nil {
+		cmdErr(seq, "reset: "+err.Error())
+	} else {
+		ack(seq)
+	}
+
+	if hasWorker {
+		drainAbortedJobs(w)
 	}
 }
 
@@ -272,10 +544,32 @@ func handleCommand(st *adapterState, name string, seq float64, cmd map[string]an
 				// deliberately mismatching its own Authorization header
 				// against hello.token, which go/wsmixer's built-in
 				// performServerHandshake rejects before this hook even runs.
+				//
+				// Stash h so OnConn (which fires right after this hook
+				// succeeds) can report the peer's hello.agent/hello.meta on
+				// the server-role "connected" event (docs/CONFORMANCE.md
+				// section 1.2) -- go/wsmixer's Conn has no exported accessor
+				// for either on the server side (Conn.Meta() only returns
+				// hello.meta, not agent).
+				st.setPendingHello(h)
 				return wsmixer.WelcomeMeta{}, nil
 			},
 			OnConn: func(c *wsmixer.Conn) {
 				st.setConn(c)
+				hello := st.takePendingHello()
+				helloObj := map[string]any{}
+				if hello != nil {
+					helloObj["agent"] = hello.agent
+					if len(hello.meta) > 0 {
+						var v any
+						_ = json.Unmarshal(hello.meta, &v)
+						helloObj["meta"] = v
+					}
+				}
+				emit(map[string]any{
+					"event": "connected", "role": "server",
+					"session": c.Session(), "hello": helloObj,
+				})
 				c.OnApp(func(body json.RawMessage) {
 					var v any
 					_ = json.Unmarshal(body, &v)
@@ -284,7 +578,7 @@ func handleCommand(st *adapterState, name string, seq float64, cmd map[string]an
 				c.OnDrain(func(d *wsmixer.DrainMsg) {
 					emit(drainEvent(d))
 				})
-				go watchDisconnect(c)
+				go watchDisconnect(st, c)
 			},
 		})
 		mux := http.NewServeMux()
@@ -345,7 +639,7 @@ func handleCommand(st *adapterState, name string, seq float64, cmd map[string]an
 				"session": c.Session(),
 				"welcome": map[string]any{"session": c.Session()},
 			})
-			go watchDisconnect(c)
+			go watchDisconnect(st, c)
 		}()
 
 	case "open_stream":
@@ -371,37 +665,49 @@ func handleCommand(st *adapterState, name string, seq float64, cmd map[string]an
 	case "write":
 		id := uint32ID(cmd["id"])
 		data := decodeB64(cmd["data_b64"])
-		s := st.stream(id)
-		if s == nil {
-			cmdErr(seq, fmt.Sprintf("write: no such stream %d", id))
-			return
-		}
-		go func() {
-			if _, err := s.Write(data); err != nil {
-				cmdErr(seq, "write: "+err.Error())
-				return
+		// Looked up and queued on this stream's own worker atomically (see
+		// enqueueOnStream): write acks asynchronously, so a close_write/reset
+		// for the same id that arrives before this ack must still wait
+		// behind this write's chunk actually reaching the wire, or
+		// CLOSE/RESET (which jump the writer loop's DATA rotation,
+		// sched.go) could truncate it.
+		ok := st.enqueueOnStream(id, seq, func(s *wsmixer.Stream) func(ctx context.Context) {
+			return func(ctx context.Context) {
+				if _, err := s.WriteContext(ctx, data); err != nil {
+					cmdErr(seq, "write: "+err.Error())
+					return
+				}
+				ack(seq)
 			}
-			ack(seq)
-		}()
+		})
+		if !ok {
+			cmdErr(seq, fmt.Sprintf("write: no such stream %d", id))
+		}
 
 	case "close_write":
 		id := uint32ID(cmd["id"])
-		s := st.stream(id)
-		if s == nil {
+		ok := st.enqueueOnStream(id, seq, func(s *wsmixer.Stream) func(ctx context.Context) {
+			return func(ctx context.Context) {
+				if err := s.CloseWrite(); err != nil {
+					cmdErr(seq, "close_write: "+err.Error())
+					return
+				}
+				ack(seq)
+				emit(map[string]any{"event": "stream_closed", "id": id, "direction": "write", "t_ms": tMs()})
+				if st.noteHalfClosed(id, "write") {
+					emit(map[string]any{"event": "stream_closed", "id": id, "direction": "both", "t_ms": tMs()})
+					st.teardownStream(id)
+				}
+			}
+		})
+		if !ok {
 			cmdErr(seq, fmt.Sprintf("close_write: no such stream %d", id))
-			return
-		}
-		if err := s.CloseWrite(); err != nil {
-			cmdErr(seq, "close_write: "+err.Error())
-			return
-		}
-		ack(seq)
-		emit(map[string]any{"event": "stream_closed", "id": id, "direction": "write", "t_ms": tMs()})
-		if st.noteHalfClosed(id, "write") {
-			emit(map[string]any{"event": "stream_closed", "id": id, "direction": "both", "t_ms": tMs()})
 		}
 
 	case "reset":
+		// RESET is abortive (OVERVIEW.md section 2.5) and runs out-of-band,
+		// immediately -- it must not wait behind a blocked write on the
+		// per-stream FIFO the way write/close_write do. See resetStream.
 		id := uint32ID(cmd["id"])
 		code, _ := cmd["code"].(float64)
 		msg, _ := cmd["message"].(string)
@@ -410,11 +716,7 @@ func handleCommand(st *adapterState, name string, seq float64, cmd map[string]an
 			cmdErr(seq, fmt.Sprintf("reset: no such stream %d", id))
 			return
 		}
-		if err := s.Reset(wsmixer.ErrorCode(uint32(code)), msg); err != nil {
-			cmdErr(seq, "reset: "+err.Error())
-			return
-		}
-		ack(seq)
+		st.resetStream(id, s, wsmixer.ErrorCode(uint32(code)), msg, seq)
 
 	case "send_app":
 		conn := st.getConn()
@@ -487,31 +789,44 @@ func autoRead(st *adapterState, s *wsmixer.Stream) {
 			if err == io.EOF {
 				emit(map[string]any{"event": "stream_closed", "id": s.ID(), "direction": "read", "t_ms": tMs()})
 				if st.noteHalfClosed(s.ID(), "read") {
+					// Both directions closed: the stream is fully terminal
+					// (OVERVIEW.md section 2.5), so there is nothing further
+					// to legally watch for -- tear down now rather than
+					// leaking a poll goroutine per stream for the rest of
+					// the connection's life (see the 50-cycle open/close
+					// case in race_test.go).
 					emit(map[string]any{"event": "stream_closed", "id": s.ID(), "direction": "both", "t_ms": tMs()})
+					st.teardownStream(s.ID())
+				} else {
+					// Only the read side closed (half-closed-remote); this
+					// side may still send, and the peer may still illegally
+					// send more DATA later (OVERVIEW.md section 2.5's
+					// half-closed(remote) row: "recv DATA -> RESET(STREAM_CLOSED)"
+					// -- see spec/fixtures/sequences/data_after_close_toward_client.json).
+					// Stream.Read would busy-loop returning io.EOF forever
+					// once its internal eof flag is set (it has no blocking
+					// wait for a later terminal error alone), so watch
+					// LastError() instead of calling Read() again --
+					// bounded by the stream itself reaching a terminal
+					// teardown (e.g. this side's own later close_write
+					// completing "both") or the connection closing.
+					waitForLateStreamReset(st, s)
 				}
-				// The read side reached a clean EOF, but the peer may still
-				// illegally send more DATA later (OVERVIEW.md section 2.5's
-				// half-closed(remote) row: "recv DATA -> RESET(STREAM_CLOSED)"
-				// -- see spec/fixtures/sequences/data_after_close_toward_client.json).
-				// Stream.Read would busy-loop returning io.EOF forever once
-				// its internal eof flag is set (it has no blocking wait for
-				// a later terminal error alone), so watch LastError() instead
-				// of calling Read() again.
-				waitForLateStreamReset(st, s)
 			} else if se, ok := err.(*wsmixer.StreamError); ok {
-				emitStreamReset(s, se)
+				emitStreamReset(st, s, se)
 			}
 			return
 		}
 	}
 }
 
-func emitStreamReset(s *wsmixer.Stream, se *wsmixer.StreamError) {
+func emitStreamReset(st *adapterState, s *wsmixer.Stream, se *wsmixer.StreamError) {
 	emit(map[string]any{
 		"event": "stream_reset", "id": s.ID(),
 		"code": uint32(se.Code), "name": se.Code.String(), "message": se.Message,
 		"t_ms": tMs(),
 	})
+	st.teardownStream(s.ID())
 }
 
 // waitForLateStreamReset polls Stream.LastError() (there is no blocking
@@ -525,7 +840,7 @@ func waitForLateStreamReset(st *adapterState, s *wsmixer.Stream) {
 	for {
 		if err := s.LastError(); err != nil {
 			if se, ok := err.(*wsmixer.StreamError); ok {
-				emitStreamReset(s, se)
+				emitStreamReset(st, s, se)
 			}
 			return
 		}
@@ -536,12 +851,24 @@ func waitForLateStreamReset(st *adapterState, s *wsmixer.Stream) {
 			default:
 			}
 		}
+		if st.stream(s.ID()) == nil {
+			// The stream was already torn down by another path (this
+			// side's own later close_write completing "both", or a RESET
+			// handled elsewhere) -- once that happens there is nothing
+			// further to legally watch for, and continuing to poll would
+			// leak this goroutine for the rest of the connection's life.
+			return
+		}
 		<-ticker.C
 	}
 }
 
-func watchDisconnect(c *wsmixer.Conn) {
+func watchDisconnect(st *adapterState, c *wsmixer.Conn) {
 	<-c.Done()
+	// The connection itself is gone: none of its still-open streams will
+	// ever reach a graceful terminal state on their own, so tear them all
+	// down here rather than leaking their FIFO worker goroutines forever.
+	st.teardownAllStreams()
 	err := c.Err()
 	e := map[string]any{"fatal": false}
 	if ce, ok := err.(*wsmixer.ConnError); ok {
