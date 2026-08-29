@@ -31,7 +31,14 @@ import (
 var (
 	outMu sync.Mutex
 	out   = bufio.NewWriter(os.Stdout)
+
+	// startTime anchors t_ms (docs/CONFORMANCE.md section 1): milliseconds
+	// since this adapter process started, monotonic, stamped on every data,
+	// stream_closed, and stream_reset event.
+	startTime = time.Now()
 )
+
+func tMs() int64 { return time.Since(startTime).Milliseconds() }
 
 func emit(e map[string]any) {
 	b, _ := json.Marshal(e)
@@ -389,9 +396,9 @@ func handleCommand(st *adapterState, name string, seq float64, cmd map[string]an
 			return
 		}
 		ack(seq)
-		emit(map[string]any{"event": "stream_closed", "id": id, "direction": "write"})
+		emit(map[string]any{"event": "stream_closed", "id": id, "direction": "write", "t_ms": tMs()})
 		if st.noteHalfClosed(id, "write") {
-			emit(map[string]any{"event": "stream_closed", "id": id, "direction": "both"})
+			emit(map[string]any{"event": "stream_closed", "id": id, "direction": "both", "t_ms": tMs()})
 		}
 
 	case "reset":
@@ -474,13 +481,13 @@ func autoRead(st *adapterState, s *wsmixer.Stream) {
 	for {
 		n, err := s.Read(buf)
 		if n > 0 {
-			emit(map[string]any{"event": "data", "id": s.ID(), "data_b64": encodeB64(buf[:n])})
+			emit(map[string]any{"event": "data", "id": s.ID(), "data_b64": encodeB64(buf[:n]), "t_ms": tMs()})
 		}
 		if err != nil {
 			if err == io.EOF {
-				emit(map[string]any{"event": "stream_closed", "id": s.ID(), "direction": "read"})
+				emit(map[string]any{"event": "stream_closed", "id": s.ID(), "direction": "read", "t_ms": tMs()})
 				if st.noteHalfClosed(s.ID(), "read") {
-					emit(map[string]any{"event": "stream_closed", "id": s.ID(), "direction": "both"})
+					emit(map[string]any{"event": "stream_closed", "id": s.ID(), "direction": "both", "t_ms": tMs()})
 				}
 				// The read side reached a clean EOF, but the peer may still
 				// illegally send more DATA later (OVERVIEW.md section 2.5's
@@ -503,6 +510,7 @@ func emitStreamReset(s *wsmixer.Stream, se *wsmixer.StreamError) {
 	emit(map[string]any{
 		"event": "stream_reset", "id": s.ID(),
 		"code": uint32(se.Code), "name": se.Code.String(), "message": se.Message,
+		"t_ms": tMs(),
 	})
 }
 
