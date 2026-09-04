@@ -38,7 +38,7 @@ type ClientOptions struct {
 // Dial connects to a ws-mixer.v1 server, performs the hello/welcome
 // handshake, and returns a ready-to-use *Conn.
 func Dial(ctx context.Context, url string, opts ClientOptions) (*Conn, error) {
-	opts.Options.setDefaults()
+	opts.Options.SetDefaults()
 
 	header := opts.HTTPHeader.Clone()
 	if header == nil {
@@ -56,7 +56,7 @@ func Dial(ctx context.Context, url string, opts ClientOptions) (*Conn, error) {
 	}
 	// Mirrors Listener.ServeHTTP's `defer ws.CloseNow()`: guarantee the socket
 	// is released on every exit path from here down, success included (the
-	// success path disarms it once c.run() owns the connection's lifecycle).
+	// success path disarms it once c.Run() owns the connection's lifecycle).
 	succeeded := false
 	defer func() {
 		if !succeeded {
@@ -81,11 +81,11 @@ func Dial(ctx context.Context, url string, opts ClientOptions) (*Conn, error) {
 	}
 
 	c.opts.Metrics.ConnectionOpened(c.session, "client")
-	c.run()
+	c.Run()
 	succeeded = true
 	go func() {
 		<-c.closed
-		c.opts.Metrics.ConnectionClosed(c.session, closeCodeOf(c), errCodeOf(c))
+		c.opts.Metrics.ConnectionClosed(c.session, c.CloseCode(), c.ErrCodeName())
 	}()
 	return c, nil
 }

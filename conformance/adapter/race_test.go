@@ -93,7 +93,7 @@ func captureEmittedEvents(t *testing.T, fn func()) []map[string]any {
 }
 
 func TestWriteCloseWriteOrderingRace(t *testing.T) {
-	st := newState()
+	st := newState(acceptBackend{})
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -101,7 +101,7 @@ func TestWriteCloseWriteOrderingRace(t *testing.T) {
 	}
 	defer ln.Close()
 
-	listener := wsmixer.NewListener(wsmixer.ServerOptions{
+	listener := acceptBackend{}.Handler(ServerConfig{
 		Options: st.options(),
 		Authenticate: func(_ context.Context, h *wsmixer.Hello) (wsmixer.WelcomeMeta, error) {
 			return wsmixer.WelcomeMeta{}, nil
@@ -270,9 +270,9 @@ func settleGoroutines(t *testing.T) int {
 // ctx.Err()'s "context canceled", so it fails the cancel-reason check below
 // instead.
 func TestResetUnblocksBlockedWrite(t *testing.T) {
-	st := newState()
-	st.window = 16384 // go/wsmixer's floor for hello.window (server.go's
-	// handshake validation rejects anything smaller); a write of several
+	st := newState(acceptBackend{})
+	st.window = 16384 // go/wsmixer's floor for hello.window (control.go's
+	// windowMin validation rejects anything smaller); a write of several
 	// times this size will exhaust it and block on credit after its first
 	// chunk, since the peer never reads (no credit is ever returned).
 
@@ -282,7 +282,7 @@ func TestResetUnblocksBlockedWrite(t *testing.T) {
 	}
 	defer ln.Close()
 
-	listener := wsmixer.NewListener(wsmixer.ServerOptions{
+	listener := acceptBackend{}.Handler(ServerConfig{
 		Options: st.options(),
 		Authenticate: func(_ context.Context, h *wsmixer.Hello) (wsmixer.WelcomeMeta, error) {
 			return wsmixer.WelcomeMeta{}, nil
@@ -466,7 +466,7 @@ func TestResetUnblocksBlockedWrite(t *testing.T) {
 // goroutines (or their streams/streamWorkers bookkeeping) survive the
 // stream reaching closed -- see teardownStream's call sites.
 func TestNoWorkerLeakAfterManyOpenCloseCycles(t *testing.T) {
-	st := newState()
+	st := newState(acceptBackend{})
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -474,7 +474,7 @@ func TestNoWorkerLeakAfterManyOpenCloseCycles(t *testing.T) {
 	}
 	defer ln.Close()
 
-	listener := wsmixer.NewListener(wsmixer.ServerOptions{
+	listener := acceptBackend{}.Handler(ServerConfig{
 		Options: st.options(),
 		Authenticate: func(_ context.Context, h *wsmixer.Hello) (wsmixer.WelcomeMeta, error) {
 			return wsmixer.WelcomeMeta{}, nil
@@ -605,7 +605,7 @@ func TestNoWorkerLeakAfterManyOpenCloseCycles(t *testing.T) {
 // remaining tests in this file build on.
 func newTestConn(t *testing.T, configure func(*adapterState)) (st *adapterState, srvConn *wsmixer.Conn, streamOpened chan *wsmixer.Stream) {
 	t.Helper()
-	st = newState()
+	st = newState(acceptBackend{})
 	if configure != nil {
 		configure(st)
 	}
@@ -616,7 +616,7 @@ func newTestConn(t *testing.T, configure func(*adapterState)) (st *adapterState,
 	}
 	t.Cleanup(func() { ln.Close() })
 
-	listener := wsmixer.NewListener(wsmixer.ServerOptions{
+	listener := acceptBackend{}.Handler(ServerConfig{
 		Options: st.options(),
 		Authenticate: func(_ context.Context, h *wsmixer.Hello) (wsmixer.WelcomeMeta, error) {
 			return wsmixer.WelcomeMeta{}, nil

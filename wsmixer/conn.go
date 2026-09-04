@@ -72,7 +72,8 @@ type Options struct {
 	allowSubfloorTiming bool
 }
 
-func (o *Options) setDefaults() {
+// SetDefaults fills in zero-valued fields with their documented defaults.
+func (o *Options) SetDefaults() {
 	if o.Window == 0 {
 		o.Window = 262144
 	}
@@ -141,9 +142,10 @@ func (b *tokenBucket) Allow() bool {
 	return true
 }
 
-// wsConn is the subset of *websocket.Conn that Conn depends on, so tests can
-// substitute a fake transport.
-type wsConn interface {
+// WSConn is the subset of *websocket.Conn that Conn depends on. It is
+// exported so an already-upgraded socket can be handed to AcceptConn across
+// a package boundary, and so tests can substitute a fake transport.
+type WSConn interface {
 	Read(ctx context.Context) (websocket.MessageType, []byte, error)
 	Write(ctx context.Context, typ websocket.MessageType, p []byte) error
 	Close(code websocket.StatusCode, reason string) error
@@ -153,7 +155,7 @@ type wsConn interface {
 
 // Conn is one accepted or dialed, handshaken ws-mixer connection.
 type Conn struct {
-	ws   wsConn
+	ws   WSConn
 	role Role
 	opts Options
 
@@ -205,7 +207,7 @@ type Conn struct {
 	nextPingID         int64
 	lastPongAt         time.Time
 	err                error
-	running            bool // true once run() has started the writer loop
+	running            bool // true once Run() has started the writer loop
 
 	closeOnce sync.Once
 	closed    chan struct{}
@@ -293,9 +295,9 @@ type deliveryEvent struct {
 	drain *DrainMsg
 }
 
-func newConn(ws wsConn, role Role, opts Options) *Conn {
+func newConn(ws WSConn, role Role, opts Options) *Conn {
 	// Fall back directly here (rather than requiring every caller to have run
-	// Options.setDefaults) so a test or embedder building Options by hand
+	// Options.SetDefaults) so a test or embedder building Options by hand
 	// doesn't end up with a zero-capacity bucket that rejects everything.
 	rate := opts.Stream0RateLimit
 	if rate <= 0 {
@@ -322,9 +324,9 @@ func newConn(ws wsConn, role Role, opts Options) *Conn {
 	}
 }
 
-// run starts the connection's background goroutines. Must be called exactly
+// Run starts the connection's background goroutines. Must be called exactly
 // once, after the handshake has completed.
-func (c *Conn) run() {
+func (c *Conn) Run() {
 	c.mu.Lock()
 	c.running = true
 	c.mu.Unlock()

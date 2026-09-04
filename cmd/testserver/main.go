@@ -40,6 +40,7 @@ import (
 	"time"
 
 	"github.com/mcpwarp/ws-mixer/go/wsmixer"
+	"github.com/mcpwarp/ws-mixer/go/wsmixerserver"
 )
 
 type event map[string]any
@@ -75,7 +76,7 @@ func main() {
 	connCh := make(chan *wsmixer.Conn, 4)
 	appCh := make(chan json.RawMessage, 16)
 
-	listener := wsmixer.NewListener(wsmixer.ServerOptions{
+	listener := wsmixerserver.NewListener(wsmixerserver.ServerOptions{
 		Options: wsmixer.Options{
 			Window:       262144,
 			MaxStreams:   64,

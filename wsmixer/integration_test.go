@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -17,18 +16,20 @@ import (
 	"github.com/coder/websocket"
 )
 
-// These tests exercise the real Listener + Dial path end to end over an
-// actual loopback WebSocket (httptest.Server), unlike sequence_test.go which
-// drives *Conn directly against a fake transport.
+// These tests exercise the real AcceptConn (via testAcceptHandler) + Dial
+// path end to end over an actual loopback WebSocket (httptest.Server),
+// unlike sequence_test.go which drives *Conn directly against a fake
+// transport. The production HTTP-layer glue (wsmixerserver.Listener) is
+// tested in that package instead (docs/MIGRATION.md section 0.5).
 
 func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
-func startTestServer(t *testing.T, opts ServerOptions) (*httptest.Server, string) {
+func startTestServer(t *testing.T, opts testAcceptHandler) (*httptest.Server, string) {
 	t.Helper()
 	if opts.Logger == nil {
 		opts.Logger = discardLogger()
 	}
-	ln := NewListener(opts)
+	ln := newTestListener(opts)
 	srv := httptest.NewServer(ln)
 	t.Cleanup(srv.Close)
 	url := "ws" + srv.URL[len("http"):] + "/tunnel"
@@ -58,7 +59,7 @@ func TestIntegrationHandshakeAndRequestResponse(t *testing.T) {
 	var mu sync.Mutex
 	var serverConn *Conn
 	connCh := make(chan *Conn, 1)
-	ln := NewListener(ServerOptions{
+	ln := newTestListener(testAcceptHandler{
 		Authenticate: func(ctx context.Context, h *Hello) (WelcomeMeta, error) {
 			mu.Lock()
 			gotHello = h
@@ -137,7 +138,7 @@ func TestIntegrationHandshakeAndRequestResponse(t *testing.T) {
 
 func TestIntegrationAppRoundTrip(t *testing.T) {
 	connCh := make(chan *Conn, 1)
-	_, url := startTestServer(t, ServerOptions{OnConn: func(c *Conn) { connCh <- c }})
+	_, url := startTestServer(t, testAcceptHandler{OnConn: func(c *Conn) { connCh <- c }})
 
 	appCh := make(chan json.RawMessage, 1)
 	client := dialTestClient(t, url, ClientOptions{
@@ -169,17 +170,17 @@ func TestIntegrationAppRoundTrip(t *testing.T) {
 	_ = client
 }
 
-// spyWS wraps a wsConn and records every inbound message's decoded
+// spyWS wraps a WSConn and records every inbound message's decoded
 // StreamID, in the exact order the transport delivered them, so a test can
 // assert on fairness at the wire instead of on client-side read timing.
 type spyWS struct {
-	wsConn
+	WSConn
 	mu  sync.Mutex
 	ids []uint32
 }
 
 func (s *spyWS) Read(ctx context.Context) (websocket.MessageType, []byte, error) {
-	typ, data, err := s.wsConn.Read(ctx)
+	typ, data, err := s.WSConn.Read(ctx)
 	if err == nil {
 		if f, ferr := DecodeFrame(data); ferr == nil {
 			s.mu.Lock()
@@ -200,7 +201,7 @@ func (s *spyWS) sequence() []uint32 {
 // test can inspect the exact wire order of inbound frames.
 func dialWithSpy(t *testing.T, url string, opts ClientOptions) (*Conn, *spyWS) {
 	t.Helper()
-	opts.Options.setDefaults()
+	opts.Options.SetDefaults()
 	if opts.Token == "" {
 		opts.Token = "test-token"
 	}
@@ -221,14 +222,14 @@ func dialWithSpy(t *testing.T, url string, opts ClientOptions) (*Conn, *spyWS) {
 		t.Fatalf("dial: %v", err)
 	}
 	ws.SetReadLimit(opts.ReadLimit)
-	spy := &spyWS{wsConn: ws}
+	spy := &spyWS{WSConn: ws}
 
 	c := newConn(spy, RoleClient, opts.Options)
 	c.hp.Store(&handlers{onStream: opts.OnStream, onApp: opts.OnApp, onDrain: opts.OnDrain})
 	if err := clientHandshake(ctx, c, opts); err != nil {
 		t.Fatalf("clientHandshake: %v", err)
 	}
-	c.run()
+	c.Run()
 	t.Cleanup(func() { _ = c.Close(uint32(NoError), "test done") })
 	return c, spy
 }
@@ -239,7 +240,7 @@ func dialWithSpy(t *testing.T, url string, opts ClientOptions) (*Conn, *spyWS) {
 // round-robin one <=16KiB DATA chunk per ready stream).
 func TestIntegrationConcurrentStreamsFairness(t *testing.T) {
 	connCh := make(chan *Conn, 1)
-	_, url := startTestServer(t, ServerOptions{OnConn: func(c *Conn) { connCh <- c }})
+	_, url := startTestServer(t, testAcceptHandler{OnConn: func(c *Conn) { connCh <- c }})
 
 	const nStreams = 4
 	const chunkSize = 16384 // == maxChunk in stream.go
@@ -367,7 +368,7 @@ func TestIntegrationConcurrentStreamsFairness(t *testing.T) {
 // than highest_opened Y". Safe to run with `go test -count=N`.
 func TestIntegrationStressConcurrentOpens(t *testing.T) {
 	connCh := make(chan *Conn, 1)
-	_, url := startTestServer(t, ServerOptions{OnConn: func(c *Conn) { connCh <- c }})
+	_, url := startTestServer(t, testAcceptHandler{OnConn: func(c *Conn) { connCh <- c }})
 
 	const nOpens = 50
 
@@ -433,7 +434,7 @@ func TestNoGoroutineLeak(t *testing.T) {
 	before := runtime.NumGoroutine()
 
 	connCh := make(chan *Conn, 1)
-	_, url := startTestServer(t, ServerOptions{OnConn: func(c *Conn) { connCh <- c }})
+	_, url := startTestServer(t, testAcceptHandler{OnConn: func(c *Conn) { connCh <- c }})
 
 	client := dialTestClient(t, url, ClientOptions{})
 	var serverConn *Conn
@@ -462,14 +463,4 @@ func TestNoGoroutineLeak(t *testing.T) {
 	if after > before+2 {
 		t.Errorf("goroutine count grew from %d to %d after closing the connection", before, after)
 	}
-}
-
-func ExampleListener() {
-	ln := NewListener(ServerOptions{
-		Authenticate: func(ctx context.Context, h *Hello) (WelcomeMeta, error) {
-			return WelcomeMeta{}, nil
-		},
-	})
-	fmt.Println(ln != nil)
-	// Output: true
 }

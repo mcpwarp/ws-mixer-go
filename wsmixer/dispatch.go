@@ -55,7 +55,7 @@ func (c *Conn) handleReadError(err error) {
 		// Guarantee the transport is actually released here: a Read error
 		// (peer TCP reset, timeout, malformed close frame) does not always
 		// mean the library already tore the socket down, and nothing else on
-		// this path calls Close/CloseNow for it (server.go's Listener has its
+		// this path calls Close/CloseNow for it (wsmixerserver's Listener has its
 		// own defer ws.CloseNow(), but that only fires once ServeHTTP itself
 		// returns, and the client has no equivalent).
 		_ = c.ws.CloseNow()
@@ -302,8 +302,8 @@ func (c *Conn) handleControlData(payload []byte) bool {
 		return true
 	}
 
-	// Both hello and welcome are always completed synchronously before run()
-	// starts the read loop (server.go's performServerHandshake, client.go's
+	// Both hello and welcome are always completed synchronously before Run()
+	// starts the read loop (accept.go's AcceptConn, client.go's
 	// clientHandshake) — production never has handshakeDone false with the
 	// dispatch loop already running, so any stream-0 message seen here in
 	// that state is itself a protocol violation, not a handshake step.

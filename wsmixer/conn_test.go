@@ -16,7 +16,7 @@ import (
 func TestWriterLoopFailsConnOnWriteError(t *testing.T) {
 	ws := newFakeWS()
 	c := newConn(ws, RoleServer, Options{})
-	c.opts.setDefaults()
+	c.opts.SetDefaults()
 	c.writeTimeout = 50 * time.Millisecond // bound the test, not the real default
 	c.session = "test-session"
 	c.ourWindow = 262144
@@ -25,7 +25,7 @@ func TestWriterLoopFailsConnOnWriteError(t *testing.T) {
 	c.pingInterval = time.Minute
 	c.pingTimeout = 5 * time.Minute
 	c.finishHandshake()
-	c.run()
+	c.Run()
 	defer func() { _ = ws.CloseNow() }()
 
 	// Simulate "the peer stopped reading": fill fakeWS's outbound buffer so
@@ -68,7 +68,7 @@ func TestWriterLoopFailsConnOnWriteError(t *testing.T) {
 func TestAppDeliveryDoesNotBlockReadLoop(t *testing.T) {
 	ws := newFakeWS()
 	c := newConn(ws, RoleServer, Options{})
-	c.opts.setDefaults()
+	c.opts.SetDefaults()
 	c.session = "test-session"
 	c.ourWindow = 262144
 	c.peerWindow = 262144
@@ -83,7 +83,7 @@ func TestAppDeliveryDoesNotBlockReadLoop(t *testing.T) {
 		appSeen <- struct{}{}
 	})
 	c.finishHandshake()
-	c.run()
+	c.Run()
 	defer func() { _ = ws.CloseNow() }()
 
 	ws.feedInbound(EncodeData(0, []byte(`{"t":"app","body":{}}`)))
@@ -113,7 +113,7 @@ func TestAppDeliveryDoesNotBlockReadLoop(t *testing.T) {
 func TestAppDeliveryQueueFullIsEnhanceYourCalm(t *testing.T) {
 	ws := newFakeWS()
 	c := newConn(ws, RoleServer, Options{})
-	c.opts.setDefaults()
+	c.opts.SetDefaults()
 	c.session = "test-session"
 	c.ourWindow = 262144
 	c.peerWindow = 262144
@@ -122,7 +122,7 @@ func TestAppDeliveryQueueFullIsEnhanceYourCalm(t *testing.T) {
 	c.pingTimeout = 5 * time.Minute
 	c.OnApp(func(json.RawMessage) { select {} }) // never returns
 	c.finishHandshake()
-	c.run()
+	c.Run()
 	defer func() { _ = ws.CloseNow() }()
 
 	for i := 0; i < deliveryQueueSize+4; i++ {
@@ -149,7 +149,7 @@ func TestRepeatRefusedOpenEscalates(t *testing.T) {
 	ws := newFakeWS()
 	opts := Options{RefusedOpenLimit: 3, RefusedOpenWindow: time.Minute}
 	c := newConn(ws, RoleClient, opts) // only the client receives OPEN
-	c.opts.setDefaults()
+	c.opts.SetDefaults()
 	c.opts.RefusedOpenLimit = 3
 	c.opts.RefusedOpenWindow = time.Minute
 	c.session = "test-session"
@@ -159,7 +159,7 @@ func TestRepeatRefusedOpenEscalates(t *testing.T) {
 	c.pingInterval = time.Minute
 	c.pingTimeout = 5 * time.Minute
 	c.finishHandshake()
-	c.run()
+	c.Run()
 	defer func() { _ = ws.CloseNow() }()
 
 	// Fill the one allowed slot first so every further OPEN is over limit.
@@ -189,7 +189,7 @@ func TestStream0RateLimitEscalates(t *testing.T) {
 	ws := newFakeWS()
 	opts := Options{Stream0RateLimit: 5, Stream0Burst: 5}
 	c := newConn(ws, RoleServer, opts)
-	c.opts.setDefaults()
+	c.opts.SetDefaults()
 	c.opts.Stream0RateLimit = 5
 	c.opts.Stream0Burst = 5
 	c.session = "test-session"
@@ -199,7 +199,7 @@ func TestStream0RateLimitEscalates(t *testing.T) {
 	c.pingInterval = time.Minute
 	c.pingTimeout = 5 * time.Minute
 	c.finishHandshake()
-	c.run()
+	c.Run()
 	defer func() { _ = ws.CloseNow() }()
 
 	for i := 0; i < 50; i++ {
@@ -227,7 +227,7 @@ func TestRefusedOpenNoEscalationWhenSelfLimited(t *testing.T) {
 	ws := newFakeWS()
 	opts := Options{RefusedOpenLimit: 3, RefusedOpenWindow: time.Minute}
 	c := newConn(ws, RoleClient, opts) // only the client receives OPEN
-	c.opts.setDefaults()
+	c.opts.SetDefaults()
 	c.opts.RefusedOpenLimit = 3
 	c.opts.RefusedOpenWindow = time.Minute
 	c.session = "test-session"
@@ -238,7 +238,7 @@ func TestRefusedOpenNoEscalationWhenSelfLimited(t *testing.T) {
 	c.pingInterval = time.Minute
 	c.pingTimeout = 5 * time.Minute
 	c.finishHandshake()
-	c.run()
+	c.Run()
 	defer func() { _ = ws.CloseNow() }()
 
 	c.mu.Lock()
@@ -271,7 +271,7 @@ func TestRefusedOpenNoEscalationWhenSelfLimited(t *testing.T) {
 func TestOpenAboveDrainLastStreamIDIsProtocolError(t *testing.T) {
 	ws := newFakeWS()
 	c := newConn(ws, RoleClient, Options{}) // only the client receives OPEN
-	c.opts.setDefaults()
+	c.opts.SetDefaults()
 	c.session = "test-session"
 	c.ourWindow = 262144
 	c.peerWindow = 262144
@@ -279,7 +279,7 @@ func TestOpenAboveDrainLastStreamIDIsProtocolError(t *testing.T) {
 	c.pingInterval = time.Minute
 	c.pingTimeout = 5 * time.Minute
 	c.finishHandshake()
-	c.run()
+	c.Run()
 	defer func() { _ = ws.CloseNow() }()
 
 	ws.feedInbound(EncodeData(0, []byte(`{"t":"drain","reason":"maintenance","last_stream_id":3,"deadline_ms":0}`)))
@@ -308,7 +308,7 @@ func TestOpenStreamDoesNotDeadlockWithFailWrite(t *testing.T) {
 
 	ws := newFakeWS()
 	c := newConn(ws, RoleServer, Options{})
-	c.opts.setDefaults()
+	c.opts.SetDefaults()
 	c.writeTimeout = 50 * time.Millisecond // bound the test, not the real default
 	c.session = "test-session"
 	c.ourWindow = 262144
@@ -317,7 +317,7 @@ func TestOpenStreamDoesNotDeadlockWithFailWrite(t *testing.T) {
 	c.pingInterval = time.Minute
 	c.pingTimeout = 5 * time.Minute
 	c.finishHandshake()
-	c.run()
+	c.Run()
 	defer func() { _ = ws.CloseNow() }()
 
 	// Stall the writer: fill fakeWS's outbound buffer so the first write the
@@ -378,7 +378,7 @@ func TestWriterLoopRoundRobinsAcrossStreams(t *testing.T) {
 
 	ws := newFakeWS()
 	c := newConn(ws, RoleServer, Options{})
-	c.opts.setDefaults()
+	c.opts.SetDefaults()
 	c.session = "test-session"
 	c.ourWindow = 262144
 	c.peerWindow = 262144

@@ -1,10 +1,14 @@
 // Command go-adapter is the ws-mixer conformance runner's Go SDK adapter
 // (docs/CONFORMANCE.md section 1): a thin shell over go/wsmixer's public API
-// (server.go, client.go, conn.go, stream.go) plus the one test-only timing
+// (accept.go, client.go, conn.go, stream.go) plus the one test-only timing
 // hook (wsmixer.AllowSubfloorTiming, go/wsmixer/conformance_hooks.go). It
 // reads JSON-lines commands on stdin and writes JSON-lines events on stdout;
 // it has no protocol logic of its own -- every wire behaviour comes from
-// go/wsmixer itself.
+// go/wsmixer itself. The go-server role is wired directly on
+// wsmixer.AcceptConn (via the ServerBackend interface below), not on the
+// separate HTTP/upgrade/auth layer's Listener: this binary is what
+// go/wsmixer's own CI runs, and must prove the core conforms in both roles
+// with no dependency on that separate layer (docs/MIGRATION.md section 2.3).
 //
 // Must be built with `-tags conformance` (conformance/README.md, the
 // Makefile note there) -- without that tag, go/wsmixer/conformance_hooks.go
@@ -25,6 +29,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/mcpwarp/ws-mixer/go/wsmixer"
 )
 
@@ -72,6 +77,7 @@ type adapterState struct {
 	streams  map[uint32]*wsmixer.Stream
 	listener net.Listener
 	httpSrv  *http.Server
+	backend  ServerBackend
 
 	// closed tracks, per stream id, which half of a graceful close has
 	// happened locally: read (this side saw EOF) and write (this side sent
@@ -168,7 +174,7 @@ type helloInfo struct {
 	meta  json.RawMessage
 }
 
-func newState() *adapterState {
+func newState(be ServerBackend) *adapterState {
 	return &adapterState{
 		window: 262144, maxStreams: 64,
 		pingIntMs: 30000, pingTOMs: 90000, helloTOMs: 10000,
@@ -176,6 +182,7 @@ func newState() *adapterState {
 		streams:       make(map[uint32]*wsmixer.Stream),
 		closed:        make(map[uint32]closedDirs),
 		streamWorkers: make(map[uint32]*streamWorker),
+		backend:       be,
 	}
 }
 
@@ -465,8 +472,78 @@ func (s *adapterState) setHTTPSrv(srv *http.Server) {
 	s.mu.Unlock()
 }
 
+// ServerBackend produces an http.Handler that yields handshaken *wsmixer.Conn
+// (docs/MIGRATION.md section 2.3): the go-server matrix role is parameterized
+// over this so the harness below has no hard dependency on a concrete
+// upgrade/auth layer. acceptBackend (below) wires it directly on
+// wsmixer.AcceptConn, which is what this binary runs -- proving the protocol
+// core conforms in both roles with no dependency on the separate HTTP/upgrade
+// /auth layer.
+type ServerBackend interface {
+	Handler(cfg ServerConfig) http.Handler
+}
+
+// ServerConfig is everything a ServerBackend needs to build its handler: the
+// negotiated Options, the Authenticate hook, and the OnConn callback that
+// hands the harness its *wsmixer.Conn.
+type ServerConfig struct {
+	Options      wsmixer.Options
+	Authenticate func(ctx context.Context, h *wsmixer.Hello) (wsmixer.WelcomeMeta, error)
+	OnConn       func(*wsmixer.Conn)
+}
+
+// acceptBackend implements ServerBackend directly on wsmixer.AcceptConn, with
+// no HTTP-layer policy of its own (no pre-upgrade 400/401): this adapter's
+// harness has no fixture that exercises that policy layer, which belongs to
+// the separate HTTP/upgrade/auth layer instead (docs/MIGRATION.md section
+// 0.5).
+type acceptBackend struct{}
+
+func (acceptBackend) Handler(cfg ServerConfig) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bearer := bearerToken(r.Header.Get("Authorization"))
+		ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			Subprotocols:    []string{wsmixer.Subprotocol},
+			CompressionMode: websocket.CompressionDisabled,
+		})
+		if err != nil {
+			return
+		}
+		defer ws.CloseNow()
+
+		opts := cfg.Options
+		opts.SetDefaults()
+		ws.SetReadLimit(opts.ReadLimit)
+
+		c, err := wsmixer.AcceptConn(r.Context(), ws, bearer, wsmixer.AcceptOptions{
+			Options:      opts,
+			Authenticate: cfg.Authenticate,
+			Request:      r,
+		})
+		if err != nil {
+			return
+		}
+		cfg.OnConn(c)
+		c.Run()
+		<-c.Done()
+	})
+}
+
+// bearerToken extracts the token from "Authorization: Bearer <token>",
+// case-insensitively on the scheme. This harness has no pre-upgrade rejection
+// policy (that lives in the separate HTTP/upgrade/auth layer): an
+// empty/malformed header just yields an empty bearer, which
+// wsmixer.AcceptConn's own hello.token check rejects.
+func bearerToken(header string) string {
+	const prefix = "bearer "
+	if len(header) <= len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {
+		return ""
+	}
+	return strings.TrimSpace(header[len(prefix):])
+}
+
 func main() {
-	st := newState()
+	st := newState(acceptBackend{})
 	emit(map[string]any{
 		"event": "ready", "sdk": "ws-mixer-go", "sdk_version": "0.1.0",
 		"roles": []string{"server", "client"},
@@ -535,7 +612,7 @@ func handleCommand(st *adapterState, name string, seq float64, cmd map[string]an
 			return
 		}
 		st.setListener(ln)
-		listener := wsmixer.NewListener(wsmixer.ServerOptions{
+		handler := st.backend.Handler(ServerConfig{
 			Options: st.options(),
 			Authenticate: func(_ context.Context, h *wsmixer.Hello) (wsmixer.WelcomeMeta, error) {
 				// docs/CONFORMANCE.md section 1: the adapter has no protocol
@@ -543,7 +620,7 @@ func handleCommand(st *adapterState, name string, seq float64, cmd map[string]an
 				// failure (auth_failure.json) triggers it via the raw actor
 				// deliberately mismatching its own Authorization header
 				// against hello.token, which go/wsmixer's built-in
-				// performServerHandshake rejects before this hook even runs.
+				// AcceptConn rejects before this hook even runs.
 				//
 				// Stash h so OnConn (which fires right after this hook
 				// succeeds) can report the peer's hello.agent/hello.meta on
@@ -582,7 +659,7 @@ func handleCommand(st *adapterState, name string, seq float64, cmd map[string]an
 			},
 		})
 		mux := http.NewServeMux()
-		mux.Handle("/v1/tunnel", listener)
+		mux.Handle("/v1/tunnel", handler)
 		srv := &http.Server{Handler: mux}
 		st.setHTTPSrv(srv)
 		go func() { _ = srv.Serve(ln) }()

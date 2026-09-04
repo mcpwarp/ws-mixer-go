@@ -26,10 +26,11 @@ import (
 	"time"
 
 	"github.com/mcpwarp/ws-mixer/go/wsmixer"
+	"github.com/mcpwarp/ws-mixer/go/wsmixerserver"
 )
 
 func main() {
-	ln := wsmixer.NewListener(wsmixer.ServerOptions{
+	ln := wsmixerserver.NewListener(wsmixerserver.ServerOptions{
 		Options: wsmixer.Options{
 			Window:       256 << 10,
 			MaxStreams:   64,

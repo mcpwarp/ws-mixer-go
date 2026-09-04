@@ -11,7 +11,7 @@ func newTestSchedConn(t *testing.T) *Conn {
 	t.Helper()
 	ws := newFakeWS()
 	c := newConn(ws, RoleServer, Options{})
-	c.opts.setDefaults()
+	c.opts.SetDefaults()
 	c.session = "test"
 	c.ourWindow = 262144
 	c.peerWindow = 262144

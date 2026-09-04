@@ -37,7 +37,7 @@ func dialRaw(ctx context.Context, url string) (*websocket.Conn, error) {
 // TestHelloTimeout mirrors hello_timeout.json: no hello arrives within
 // HelloTimeout of the WebSocket accept -> error{PROTOCOL_ERROR} + close 4001.
 func TestHelloTimeout(t *testing.T) {
-	ln := NewListener(ServerOptions{
+	ln := newTestListener(testAcceptHandler{
 		Options: Options{HelloTimeout: 100 * time.Millisecond, Logger: discardLogger()},
 	})
 	srv := httptest.NewServer(ln)
@@ -48,14 +48,14 @@ func TestHelloTimeout(t *testing.T) {
 	rawDialAndWaitForClose(t, url)
 }
 
-// TestHelloTimeoutNearSimultaneous drives performServerHandshake directly
-// against a fake transport many times with a very short HelloTimeout and the
-// hello frame delivered right around the deadline (sometimes just before,
-// sometimes just after), so the timeout callback and the post-Read success
-// path in performServerHandshake are racing for real. Run with -race, this
-// catches a callback that writes error{}/closes the socket concurrently with
-// (or after) the handshake having already proceeded toward welcome: exactly
-// one of the two outcomes must win, and the wire must carry only the frame(s)
+// TestHelloTimeoutNearSimultaneous drives AcceptConn directly against a fake
+// transport many times with a very short HelloTimeout and the hello frame
+// delivered right around the deadline (sometimes just before, sometimes just
+// after), so the timeout callback and the post-Read success path in
+// AcceptConn's handshake are racing for real. Run with -race, this catches a
+// callback that writes error{}/closes the socket concurrently with (or
+// after) the handshake having already proceeded toward welcome: exactly one
+// of the two outcomes must win, and the wire must carry only the frame(s)
 // that outcome implies.
 func TestHelloTimeoutNearSimultaneous(t *testing.T) {
 	for i := 0; i < 200; i++ {
@@ -66,7 +66,6 @@ func TestHelloTimeoutNearSimultaneous(t *testing.T) {
 			HelloTimeout: time.Millisecond,
 			Logger:       discardLogger(), Metrics: NoopMetrics{},
 		}
-		c := newConn(fake, RoleServer, opts)
 
 		hb, err := json.Marshal(syntheticHello())
 		if err != nil {
@@ -79,7 +78,7 @@ func TestHelloTimeoutNearSimultaneous(t *testing.T) {
 			fake.feedInbound(EncodeData(0, hb))
 		}(i)
 
-		hsErr := performServerHandshake(context.Background(), c, harnessHelloToken, serverHandshakeOptions{
+		_, hsErr := AcceptConn(context.Background(), fake, harnessHelloToken, AcceptOptions{
 			Options: opts, Authenticate: harnessAuthenticate,
 		})
 
@@ -96,11 +95,11 @@ func TestHelloTimeoutNearSimultaneous(t *testing.T) {
 			switch msg.(type) {
 			case *WelcomeMsg:
 				if hsErr != nil {
-					t.Fatalf("iteration %d: got welcome{} on the wire but performServerHandshake returned %v", i, hsErr)
+					t.Fatalf("iteration %d: got welcome{} on the wire but AcceptConn returned %v", i, hsErr)
 				}
 			case *ErrorMsg:
 				if hsErr == nil {
-					t.Fatalf("iteration %d: got error{} on the wire but performServerHandshake returned nil", i)
+					t.Fatalf("iteration %d: got error{} on the wire but AcceptConn returned nil", i)
 				}
 			default:
 				t.Fatalf("iteration %d: unexpected control message %T", i, msg)
@@ -148,7 +147,7 @@ func TestKeepaliveTimeout(t *testing.T) {
 	c.pingInterval = opts.PingInterval
 	c.pingTimeout = opts.PingTimeout
 	c.finishHandshake()
-	c.run()
+	c.Run()
 	defer fake.Close(0, "")
 
 	select {
@@ -187,7 +186,7 @@ func TestClientKeepaliveTimeout(t *testing.T) {
 	c.pingInterval = opts.PingInterval
 	c.pingTimeout = opts.PingTimeout
 	c.finishHandshake()
-	c.run()
+	c.Run()
 	defer fake.Close(0, "")
 
 	select {
@@ -212,7 +211,7 @@ func TestClientKeepaliveTimeout(t *testing.T) {
 // connection closes with GOING_AWAY/4012.
 func TestDrainWithInflightTimeout(t *testing.T) {
 	connCh := make(chan *Conn, 1)
-	ln := NewListener(ServerOptions{OnConn: func(c *Conn) { connCh <- c }})
+	ln := newTestListener(testAcceptHandler{OnConn: func(c *Conn) { connCh <- c }})
 	srv := httptest.NewServer(ln)
 	defer srv.Close()
 	url := "ws" + srv.URL[len("http"):] + "/tunnel"
@@ -284,7 +283,7 @@ func TestStreamIDExhaustion(t *testing.T) {
 	c.pingInterval = time.Hour
 	c.pingTimeout = 2 * time.Hour
 	c.finishHandshake()
-	c.run()
+	c.Run()
 
 	c.nextStreamID = maxStreamIDValue + 2 // one past the last legal odd id (2^31-1)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

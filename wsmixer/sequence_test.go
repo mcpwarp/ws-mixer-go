@@ -97,7 +97,7 @@ type seqRuntime struct {
 
 // harnessHelloToken is the token the harness's synthetic hello (built for a
 // fixture that starts mid-connection with no hello of its own) carries, and
-// the bearer performServerHandshake is told to expect for it.
+// the bearer AcceptConn is told to expect for it.
 const harnessHelloToken = "harness-synthetic-token"
 
 // harnessAuthenticate is the sequence harness's Authenticate hook: it accepts
@@ -134,18 +134,28 @@ func runSequence(t *testing.T, seq sequenceFixture) {
 	} else {
 		role = RoleServer
 	}
+	// c is a placeholder Conn for fixtures whose first step needs no real
+	// handshake (deliberately pre-handshake protocol tests): performHandshakePrelude
+	// leaves rt.c pointing at it in that case. For a fixture whose server role
+	// runs a real handshake, performHandshakePrelude instead replaces rt.c with
+	// the *Conn AcceptConn actually produced (this placeholder is discarded
+	// unused -- it never touched fake, so that's safe).
 	c := newConn(fake, role, opts)
-
 	rt := &seqRuntime{t: t, c: c, fake: fake, streams: map[uint32]*Stream{}, openCh: make(chan *Stream, 16)}
-	c.OnStream(func(st *Stream) {
-		rt.openCh <- st
-	})
 
 	// The handshake (real or, for a fixture that starts mid-connection,
-	// synthetic-but-real) always completes before run() starts, exactly like
+	// synthetic-but-real) always completes before Run() starts, exactly like
 	// production: performHandshakePrelude returns the index of the first
 	// step not already consumed by it.
 	startIdx := performHandshakePrelude(t, rt, seq, opts)
+	c = rt.c
+
+	// OnStream is registered after the handshake, matching production's
+	// OnConn-before-Run ordering (AcceptConn returns a handshaken-but-not-
+	// running *Conn; nothing can dispatch a stream event until Run() below).
+	c.OnStream(func(st *Stream) {
+		rt.openCh <- st
+	})
 
 	if scriptsAutonomousPing(seq) {
 		// pong_for_unsent_id.json scripts a "send ping" step: the real
@@ -156,7 +166,7 @@ func runSequence(t *testing.T, seq sequenceFixture) {
 		c.pingInterval = 20 * time.Millisecond
 	}
 
-	c.run()
+	c.Run()
 	defer func() { _ = fake.Close(0, "") }()
 
 	for i := startIdx; i < len(seq.Steps); i++ {
@@ -186,13 +196,13 @@ func runSequence(t *testing.T, seq sequenceFixture) {
 	}
 }
 
-// performHandshakePrelude completes the handshake for real, before run()
-// starts, exactly as production does (server.go's performServerHandshake,
-// client.go's clientHandshake) — the one exception being a fixture that
-// deliberately tests pre-handshake behavior (its first step is a "recv" of
-// something other than hello), which is left alone with handshakeDone still
-// false. It returns the index of the first step the main loop should still
-// process; steps consumed here are not replayed.
+// performHandshakePrelude completes the handshake for real, before Run()
+// starts, exactly as production does (accept.go's AcceptConn, client.go's
+// clientHandshake) — the one exception being a fixture that deliberately
+// tests pre-handshake behavior (its first step is a "recv" of something
+// other than hello), which is left alone with handshakeDone still false. It
+// returns the index of the first step the main loop should still process;
+// steps consumed here are not replayed.
 //
 // Classification is keyed on the fixture's first step shape (never on a
 // timeout):
@@ -200,16 +210,15 @@ func runSequence(t *testing.T, seq sequenceFixture) {
 //     own "send hello" (e.g. max_streams_exceeded.json) -- run the real
 //     client handshake (clientHandshake) against the scripted welcome.
 //   - role server, first step "recv hello": the fixture scripts its own real
-//     handshake -- run performServerHandshake against the scripted hello,
-//     consuming just that one step so the loop's next step ("send welcome"
-//     or "send error") asserts against what performServerHandshake actually
-//     produced.
+//     handshake -- run AcceptConn against the scripted hello, consuming just
+//     that one step so the loop's next step ("send welcome" or "send error")
+//     asserts against what AcceptConn actually produced.
 //   - role server, first step "send" (a welcome, or a stream frame like
 //     OPEN): the fixture starts mid-connection with no hello of its own
 //     (e.g. pong_for_unsent_id.json, window_after_close.json,
 //     late_data_after_reset.json, request_response_half_close.json) -- run
-//     performServerHandshake against a synthetic hello so the Conn is
-//     genuinely handshaken, then let the loop run from the top.
+//     AcceptConn against a synthetic hello so the Conn is genuinely
+//     handshaken, then let the loop run from the top.
 //   - anything else (a "recv" of something other than hello/welcome): the
 //     fixture is deliberately exercising pre-handshake behavior
 //     (app_before_welcome.json, frame_before_hello.json,
@@ -280,15 +289,16 @@ func performHandshakePrelude(t *testing.T, rt *seqRuntime, seq sequenceFixture, 
 		}
 		_ = json.Unmarshal(step0.Recv, &h)
 		rt.fake.feedInbound(EncodeData(0, step0.Recv))
-		err := performServerHandshake(ctx, c, h.Token, serverHandshakeOptions{
+		hsConn, err := AcceptConn(ctx, rt.fake, h.Token, AcceptOptions{
 			Options: opts, Authenticate: harnessAuthenticate,
 		})
+		rt.c = hsConn
 		if err != nil {
-			ce, ok := err.(*ConnError)
-			if !ok {
+			// AcceptConn already performed the error{}+close teardown; the
+			// returned (failed) Conn is still what later steps must inspect.
+			if _, ok := err.(*ConnError); !ok {
 				t.Fatalf("prelude server handshake: %v", err)
 			}
-			c.fail(ce)
 		}
 		return 1
 	}
@@ -303,11 +313,13 @@ func performHandshakePrelude(t *testing.T, rt *seqRuntime, seq sequenceFixture, 
 		t.Fatalf("marshaling synthetic hello: %v", err)
 	}
 	rt.fake.feedInbound(EncodeData(0, hb))
-	if err := performServerHandshake(ctx, c, harnessHelloToken, serverHandshakeOptions{
+	hsConn, err := AcceptConn(ctx, rt.fake, harnessHelloToken, AcceptOptions{
 		Options: opts, Authenticate: harnessAuthenticate,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("prelude server handshake: %v", err)
 	}
+	rt.c = hsConn
 	if probe.T != "welcome" {
 		// The scripted first step is not itself "send welcome" (e.g. it's
 		// "send OPEN"), so no step will consume the real welcome the prelude
