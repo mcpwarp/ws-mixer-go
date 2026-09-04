@@ -1,4 +1,4 @@
-module github.com/mcpwarp/ws-mixer/go
+module github.com/mcpwarp/ws-mixer-go
 
 go 1.24
 

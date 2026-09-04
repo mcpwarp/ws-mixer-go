@@ -1,0 +1,7 @@
+{
+  "comment": "Per-repo floor for ws-mixer-go's own conformance run (docs/MIGRATION.md section 2.4/2.5): go-server via cmd/conformance-adapter's acceptBackend (wsmixer.AcceptConn), go-client via wsmixer.Dial. Values carried over from the monorepo's conformance/COUNTS.json floors at the pre-split base SHA. Other SDKs' keys (js-server, js-client, go->go, go->js) are not exercised by this repo's runner invocation and are intentionally omitted -- checkCounts only enforces keys present here and actually exercised by the run.",
+  "floors": {
+    "go-server": 19,
+    "go-client": 24
+  }
+}

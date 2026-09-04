@@ -1,19 +1,30 @@
-// Command go-adapter is the ws-mixer conformance runner's Go SDK adapter
+//go:build conformance
+
+// Package adapter is the ws-mixer conformance runner's Go SDK harness
 // (docs/CONFORMANCE.md section 1): a thin shell over go/wsmixer's public API
 // (accept.go, client.go, conn.go, stream.go) plus the one test-only timing
 // hook (wsmixer.AllowSubfloorTiming, go/wsmixer/conformance_hooks.go). It
 // reads JSON-lines commands on stdin and writes JSON-lines events on stdout;
 // it has no protocol logic of its own -- every wire behaviour comes from
-// go/wsmixer itself. The go-server role is wired directly on
-// wsmixer.AcceptConn (via the ServerBackend interface below), not on the
-// separate HTTP/upgrade/auth layer's Listener: this binary is what
-// go/wsmixer's own CI runs, and must prove the core conforms in both roles
-// with no dependency on that separate layer (docs/MIGRATION.md section 2.3).
+// go/wsmixer itself.
 //
-// Must be built with `-tags conformance` (conformance/README.md, the
-// Makefile note there) -- without that tag, go/wsmixer/conformance_hooks.go
-// is excluded from the build and wsmixer.AllowSubfloorTiming does not exist.
-package main
+// The go-server matrix role is factored behind the one-method ServerBackend
+// interface below (docs/MIGRATION.md section 2.3), so this package has no
+// hard dependency on any concrete HTTP upgrade/auth layer: a caller supplies
+// a ServerBackend and calls Run. ws-mixer-go's own thin main
+// (cmd/conformance-adapter) wires an acceptBackend directly on
+// wsmixer.AcceptConn -- proving the protocol core conforms in both roles with
+// no dependency on the separate HTTP/upgrade/auth layer. ws-mixer-server's
+// thin main (its own cmd/conformance-adapter, importing this package) wires
+// a listenerBackend on wsmixerserver.NewListener instead, proving the
+// production server conforms.
+//
+// Requires `-tags conformance` to build (conformance/README.md): this
+// package calls wsmixer.AllowSubfloorTiming
+// (go/wsmixer/conformance_hooks.go), which only exists under that tag, so
+// every consumer -- including ws-mixer-server's import of this package --
+// must also build with `-tags conformance`.
+package adapter
 
 import (
 	"bufio"
@@ -29,8 +40,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/coder/websocket"
-	"github.com/mcpwarp/ws-mixer/go/wsmixer"
+	"github.com/mcpwarp/ws-mixer-go/wsmixer"
 )
 
 var (
@@ -78,6 +88,14 @@ type adapterState struct {
 	listener net.Listener
 	httpSrv  *http.Server
 	backend  ServerBackend
+
+	// sdk/sdkVersion identify the running binary on the "ready" event and
+	// (as sdk+"-conformance", the same sdkVersion) on the client role's
+	// hello.agent -- set once from the Config passed to Run, zero-valued
+	// otherwise (e.g. in tests that build an *adapterState directly and
+	// never exercise the "connect" command).
+	sdk        string
+	sdkVersion string
 
 	// closed tracks, per stream id, which half of a graceful close has
 	// happened locally: read (this side saw EOF) and write (this side sent
@@ -475,10 +493,8 @@ func (s *adapterState) setHTTPSrv(srv *http.Server) {
 // ServerBackend produces an http.Handler that yields handshaken *wsmixer.Conn
 // (docs/MIGRATION.md section 2.3): the go-server matrix role is parameterized
 // over this so the harness below has no hard dependency on a concrete
-// upgrade/auth layer. acceptBackend (below) wires it directly on
-// wsmixer.AcceptConn, which is what this binary runs -- proving the protocol
-// core conforms in both roles with no dependency on the separate HTTP/upgrade
-// /auth layer.
+// upgrade/auth layer. Each consumer's own thin main supplies its own
+// ServerBackend (see the package doc comment).
 type ServerBackend interface {
 	Handler(cfg ServerConfig) http.Handler
 }
@@ -492,60 +508,27 @@ type ServerConfig struct {
 	OnConn       func(*wsmixer.Conn)
 }
 
-// acceptBackend implements ServerBackend directly on wsmixer.AcceptConn, with
-// no HTTP-layer policy of its own (no pre-upgrade 400/401): this adapter's
-// harness has no fixture that exercises that policy layer, which belongs to
-// the separate HTTP/upgrade/auth layer instead (docs/MIGRATION.md section
-// 0.5).
-type acceptBackend struct{}
-
-func (acceptBackend) Handler(cfg ServerConfig) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		bearer := bearerToken(r.Header.Get("Authorization"))
-		ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-			Subprotocols:    []string{wsmixer.Subprotocol},
-			CompressionMode: websocket.CompressionDisabled,
-		})
-		if err != nil {
-			return
-		}
-		defer ws.CloseNow()
-
-		opts := cfg.Options
-		opts.SetDefaults()
-		ws.SetReadLimit(opts.ReadLimit)
-
-		c, err := wsmixer.AcceptConn(r.Context(), ws, bearer, wsmixer.AcceptOptions{
-			Options:      opts,
-			Authenticate: cfg.Authenticate,
-			Request:      r,
-		})
-		if err != nil {
-			return
-		}
-		cfg.OnConn(c)
-		c.Run()
-		<-c.Done()
-	})
+// Config is everything Run needs from its caller's thin main: the
+// ServerBackend that wires the go-server matrix role, and the sdk identity
+// reported on the "ready" event and (as sdk+"-conformance") on the
+// client-role hello.agent.
+type Config struct {
+	Backend    ServerBackend
+	SDK        string
+	SDKVersion string
 }
 
-// bearerToken extracts the token from "Authorization: Bearer <token>",
-// case-insensitively on the scheme. This harness has no pre-upgrade rejection
-// policy (that lives in the separate HTTP/upgrade/auth layer): an
-// empty/malformed header just yields an empty bearer, which
-// wsmixer.AcceptConn's own hello.token check rejects.
-func bearerToken(header string) string {
-	const prefix = "bearer "
-	if len(header) <= len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {
-		return ""
-	}
-	return strings.TrimSpace(header[len(prefix):])
-}
-
-func main() {
-	st := newState(acceptBackend{})
+// Run is the adapter's stdin/stdout harness loop (docs/MIGRATION.md section
+// 2.3): it emits "ready", then reads JSON-lines commands from stdin and
+// dispatches them to handleCommand until a "shutdown" command is processed
+// or stdin closes. It returns an exit code (currently always 0; reserved so
+// a caller's thin main can `os.Exit(adapter.Run(cfg))`).
+func Run(cfg Config) int {
+	st := newState(cfg.Backend)
+	st.sdk = cfg.SDK
+	st.sdkVersion = cfg.SDKVersion
 	emit(map[string]any{
-		"event": "ready", "sdk": "ws-mixer-go", "sdk_version": "0.1.0",
+		"event": "ready", "sdk": cfg.SDK, "sdk_version": cfg.SDKVersion,
 		"roles": []string{"server", "client"},
 	})
 
@@ -565,9 +548,10 @@ func main() {
 		seq, _ := cmd["seq"].(float64)
 		handleCommand(st, name, seq, cmd)
 		if name == "shutdown" {
-			return
+			return 0
 		}
 	}
+	return 0
 }
 
 func handleCommand(st *adapterState, name string, seq float64, cmd map[string]any) {
@@ -692,7 +676,7 @@ func handleCommand(st *adapterState, name string, seq float64, cmd map[string]an
 			c, err := wsmixer.Dial(ctx, url, wsmixer.ClientOptions{
 				Options: st.options(),
 				Token:   token,
-				Agent:   wsmixer.AgentInfo{SDK: "ws-mixer-go-conformance", SDKVersion: "0.1.0"},
+				Agent:   wsmixer.AgentInfo{SDK: st.sdk + "-conformance", SDKVersion: st.sdkVersion},
 				OnStream: func(s *wsmixer.Stream) {
 					st.storeStream(s)
 					emit(map[string]any{"event": "stream_opened", "id": s.ID()})

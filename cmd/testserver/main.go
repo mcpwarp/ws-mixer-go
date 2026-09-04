@@ -1,10 +1,15 @@
-// Command goserver is a tiny ws-mixer.v1 test server used only by
+// Command testserver is a tiny ws-mixer.v1 test server used only by
 // js/test/interop.test.ts to exercise the JS client SDK against the real Go
 // implementation. It is driven over stdin/stdout with one JSON object per
-// line (never touches go/, per the JS SDK task's constraints): stdin carries
-// commands, stdout carries events, so the Node test can orchestrate a
-// request/response round trip, an `app` exchange, and a `Drain` without any
-// networked control plane of its own.
+// line: stdin carries commands, stdout carries events, so the Node test can
+// orchestrate a request/response round trip, an `app` exchange, and a
+// `Drain` without any networked control plane of its own.
+//
+// It is wired directly on wsmixer.AcceptConn (docs/MIGRATION.md section
+// 4.3): the HTTP upgrade/auth policy layer (Listener) lives in the private
+// ws-mixer-server repo, so this binary does its own minimal subprotocol +
+// bearer-token glue in front of AcceptConn, the same way
+// conformance/adapter's acceptBackend and wsmixer/accepthandler_test.go do.
 //
 // Commands (stdin, one JSON object per line):
 //
@@ -36,11 +41,12 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/mcpwarp/ws-mixer/go/wsmixer"
-	"github.com/mcpwarp/ws-mixer/go/wsmixerserver"
+	"github.com/coder/websocket"
+	"github.com/mcpwarp/ws-mixer-go/wsmixer"
 )
 
 type event map[string]any
@@ -76,32 +82,54 @@ func main() {
 	connCh := make(chan *wsmixer.Conn, 4)
 	appCh := make(chan json.RawMessage, 16)
 
-	listener := wsmixerserver.NewListener(wsmixerserver.ServerOptions{
-		Options: wsmixer.Options{
-			Window:       262144,
-			MaxStreams:   64,
-			PingInterval: 30 * time.Second,
-			PingTimeout:  90 * time.Second,
-		},
-		Authenticate: func(_ context.Context, h *wsmixer.Hello) (wsmixer.WelcomeMeta, error) {
-			if h.Token != "test-token" {
-				return wsmixer.WelcomeMeta{}, wsmixer.Unauthorized("bad token")
-			}
-			return wsmixer.WelcomeMeta{}, nil
-		},
-		OnConn: func(c *wsmixer.Conn) {
-			c.OnApp(func(body json.RawMessage) { appCh <- body })
-			connCh <- c
-			emit(event{"event": "connected", "session": c.Session()})
-			go func() {
-				<-c.Done()
-				emit(event{"event": "disconnected"})
-			}()
-		},
-	})
+	opts := wsmixer.Options{
+		Window:       262144,
+		MaxStreams:   64,
+		PingInterval: 30 * time.Second,
+		PingTimeout:  90 * time.Second,
+	}
+	opts.SetDefaults()
+	onConn := func(c *wsmixer.Conn) {
+		c.OnApp(func(body json.RawMessage) { appCh <- body })
+		connCh <- c
+		emit(event{"event": "connected", "session": c.Session()})
+		go func() {
+			<-c.Done()
+			emit(event{"event": "disconnected"})
+		}()
+	}
+	authenticate := func(_ context.Context, h *wsmixer.Hello) (wsmixer.WelcomeMeta, error) {
+		if h.Token != "test-token" {
+			return wsmixer.WelcomeMeta{}, wsmixer.Unauthorized("bad token")
+		}
+		return wsmixer.WelcomeMeta{}, nil
+	}
 
 	mux := http.NewServeMux()
-	mux.Handle("/v1/tunnel", listener)
+	mux.HandleFunc("/v1/tunnel", func(w http.ResponseWriter, r *http.Request) {
+		ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			Subprotocols:    []string{wsmixer.Subprotocol},
+			CompressionMode: websocket.CompressionDisabled,
+		})
+		if err != nil {
+			return
+		}
+		defer ws.CloseNow()
+		ws.SetReadLimit(opts.ReadLimit)
+
+		bearer := bearerToken(r.Header.Get("Authorization"))
+		c, err := wsmixer.AcceptConn(r.Context(), ws, bearer, wsmixer.AcceptOptions{
+			Options:      opts,
+			Authenticate: authenticate,
+			Request:      r,
+		})
+		if err != nil {
+			return
+		}
+		onConn(c)
+		c.Run()
+		<-c.Done()
+	})
 	server := &http.Server{Handler: mux}
 	go func() {
 		if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
@@ -181,6 +209,18 @@ func main() {
 			emit(event{"event": "error", "message": "unknown command " + cmd.Cmd})
 		}
 	}
+}
+
+// bearerToken extracts the token from an "Authorization: Bearer <token>"
+// header, the minimal pre-upgrade extraction AcceptConn expects its caller
+// to have already done (wsmixer.AcceptConn's doc comment; the same shape as
+// wsmixer/accepthandler_test.go's testBearerToken).
+func bearerToken(header string) string {
+	const prefix = "bearer "
+	if len(header) <= len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {
+		return ""
+	}
+	return strings.TrimSpace(header[len(prefix):])
 }
 
 func runOneStream(c *wsmixer.Conn, i int, prefix string) {

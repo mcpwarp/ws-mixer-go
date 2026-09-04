@@ -1,4 +1,6 @@
-package main
+//go:build conformance
+
+package adapter
 
 // Regression test for the write/close_write ordering race described in
 // docs/CONFORMANCE.md section 1.1 and conformance/README.md: `write` acks
@@ -32,8 +34,60 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mcpwarp/ws-mixer/go/wsmixer"
+	"github.com/coder/websocket"
+	"github.com/mcpwarp/ws-mixer-go/wsmixer"
 )
+
+// testAcceptBackend implements ServerBackend directly on wsmixer.AcceptConn,
+// with no HTTP-layer policy of its own -- the same wiring as
+// cmd/conformance-adapter's acceptBackend, which this package deliberately
+// does not export (docs/MIGRATION.md section 2.3: the real acceptBackend
+// belongs in that thin main, not in this library). Duplicated here, byte-for
+// -byte equivalent, so these whitebox tests of adapterState/handleCommand can
+// drive a real listener without importing the cmd package -- the same
+// approach docs/MIGRATION.md section 0.5 takes for wsmixer's own
+// testAcceptHandler.
+type testAcceptBackend struct{}
+
+func (testAcceptBackend) Handler(cfg ServerConfig) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bearer := testBearerToken(r.Header.Get("Authorization"))
+		ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			Subprotocols:    []string{wsmixer.Subprotocol},
+			CompressionMode: websocket.CompressionDisabled,
+		})
+		if err != nil {
+			return
+		}
+		defer ws.CloseNow()
+
+		opts := cfg.Options
+		opts.SetDefaults()
+		ws.SetReadLimit(opts.ReadLimit)
+
+		c, err := wsmixer.AcceptConn(r.Context(), ws, bearer, wsmixer.AcceptOptions{
+			Options:      opts,
+			Authenticate: cfg.Authenticate,
+			Request:      r,
+		})
+		if err != nil {
+			return
+		}
+		cfg.OnConn(c)
+		c.Run()
+		<-c.Done()
+	})
+}
+
+// testBearerToken mirrors cmd/conformance-adapter's bearerToken (see
+// testAcceptBackend).
+func testBearerToken(header string) string {
+	const prefix = "bearer "
+	if len(header) <= len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {
+		return ""
+	}
+	return strings.TrimSpace(header[len(prefix):])
+}
 
 // captureEmittedEvents redirects the process's real stdout (fd 1, which the
 // package-level `out` writer was bound to at package init) through a pipe
@@ -93,7 +147,7 @@ func captureEmittedEvents(t *testing.T, fn func()) []map[string]any {
 }
 
 func TestWriteCloseWriteOrderingRace(t *testing.T) {
-	st := newState(acceptBackend{})
+	st := newState(testAcceptBackend{})
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -101,7 +155,7 @@ func TestWriteCloseWriteOrderingRace(t *testing.T) {
 	}
 	defer ln.Close()
 
-	listener := acceptBackend{}.Handler(ServerConfig{
+	listener := testAcceptBackend{}.Handler(ServerConfig{
 		Options: st.options(),
 		Authenticate: func(_ context.Context, h *wsmixer.Hello) (wsmixer.WelcomeMeta, error) {
 			return wsmixer.WelcomeMeta{}, nil
@@ -270,7 +324,7 @@ func settleGoroutines(t *testing.T) int {
 // ctx.Err()'s "context canceled", so it fails the cancel-reason check below
 // instead.
 func TestResetUnblocksBlockedWrite(t *testing.T) {
-	st := newState(acceptBackend{})
+	st := newState(testAcceptBackend{})
 	st.window = 16384 // go/wsmixer's floor for hello.window (control.go's
 	// windowMin validation rejects anything smaller); a write of several
 	// times this size will exhaust it and block on credit after its first
@@ -282,7 +336,7 @@ func TestResetUnblocksBlockedWrite(t *testing.T) {
 	}
 	defer ln.Close()
 
-	listener := acceptBackend{}.Handler(ServerConfig{
+	listener := testAcceptBackend{}.Handler(ServerConfig{
 		Options: st.options(),
 		Authenticate: func(_ context.Context, h *wsmixer.Hello) (wsmixer.WelcomeMeta, error) {
 			return wsmixer.WelcomeMeta{}, nil
@@ -466,7 +520,7 @@ func TestResetUnblocksBlockedWrite(t *testing.T) {
 // goroutines (or their streams/streamWorkers bookkeeping) survive the
 // stream reaching closed -- see teardownStream's call sites.
 func TestNoWorkerLeakAfterManyOpenCloseCycles(t *testing.T) {
-	st := newState(acceptBackend{})
+	st := newState(testAcceptBackend{})
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -474,7 +528,7 @@ func TestNoWorkerLeakAfterManyOpenCloseCycles(t *testing.T) {
 	}
 	defer ln.Close()
 
-	listener := acceptBackend{}.Handler(ServerConfig{
+	listener := testAcceptBackend{}.Handler(ServerConfig{
 		Options: st.options(),
 		Authenticate: func(_ context.Context, h *wsmixer.Hello) (wsmixer.WelcomeMeta, error) {
 			return wsmixer.WelcomeMeta{}, nil
@@ -605,7 +659,7 @@ func TestNoWorkerLeakAfterManyOpenCloseCycles(t *testing.T) {
 // remaining tests in this file build on.
 func newTestConn(t *testing.T, configure func(*adapterState)) (st *adapterState, srvConn *wsmixer.Conn, streamOpened chan *wsmixer.Stream) {
 	t.Helper()
-	st = newState(acceptBackend{})
+	st = newState(testAcceptBackend{})
 	if configure != nil {
 		configure(st)
 	}
@@ -616,7 +670,7 @@ func newTestConn(t *testing.T, configure func(*adapterState)) (st *adapterState,
 	}
 	t.Cleanup(func() { ln.Close() })
 
-	listener := acceptBackend{}.Handler(ServerConfig{
+	listener := testAcceptBackend{}.Handler(ServerConfig{
 		Options: st.options(),
 		Authenticate: func(_ context.Context, h *wsmixer.Hello) (wsmixer.WelcomeMeta, error) {
 			return wsmixer.WelcomeMeta{}, nil

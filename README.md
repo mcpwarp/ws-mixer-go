@@ -1,136 +1,127 @@
-# wsmixer (Go)
+# ws-mixer-go
 
-`github.com/mcpwarp/ws-mixer/go/wsmixer`, package `wsmixer` — the Go implementation of the `ws-mixer.v1`
-wire protocol: N independent, flow-controlled byte streams over one WebSocket connection. See
-[`../docs/OVERVIEW.md`](../docs/OVERVIEW.md) for the normative spec. This package is a server (and a
-minimal test/reference client) built on [`coder/websocket`](https://github.com/coder/websocket).
+Go implementation of [`ws-mixer.v1`](https://github.com/mcpwarp/ws-mixer-spec): protocol core (frame
+codec, control channel, stream state machine, flow control, keepalive) and the Go client — N
+independent, flow-controlled byte streams over one WebSocket connection, built on
+[`coder/websocket`](https://github.com/coder/websocket).
+
+This repo is the protocol core and client SDK only. HTTP upgrade, auth policy, and the production
+`Listener` live in the separate `ws-mixer-server` module; this module exposes `wsmixer.AcceptConn` for
+anyone who wants to run the server side directly against their own `http.Handler`.
 
 ## Install
 
 ```sh
-go get github.com/mcpwarp/ws-mixer/go/wsmixer
+go get github.com/mcpwarp/ws-mixer-go
 ```
 
-Requires Go 1.23+ (forced by `coder/websocket`'s own `go.mod`; the wire spec itself only assumes 1.22+).
+## API
 
-## Server example
+| Type | Role |
+|---|---|
+| `Conn` | One handshaken connection, dialed (`Dial`) or accepted (`AcceptConn`). Opens streams, sends `app`, drains. |
+| `Stream` | One byte stream. `io.Reader` + `io.Writer` + `Close()` + `CloseWrite()` + `Reset(code, msg)`. |
+| `Options` | `Window`, `MaxStreams`, `PingInterval`, `PingTimeout`, `HelloTimeout`, `ReadLimit`, `Logger`, `Metrics`, plus the stream-0 flood-limit and refused-open-escalation knobs. |
+| `ConnError` / `StreamError` | Carry an `ErrorCode` and message; `errors.As` targets for connection- and stream-scoped failures respectively. |
+| `Metrics` | Interface the embedder implements (see [`docs/METRICS.md`](./docs/METRICS.md)), or `NoopMetrics{}` to disable observability. |
+
+`Conn` is a concrete struct, not an interface — both a dialed and an accepted connection are the same
+type, so `OnStream`/`OnApp`/`OnDrain` and `Drain` behave identically regardless of role:
 
 ```go
-package main
+func (c *Conn) Session() string
+func (c *Conn) Meta() json.RawMessage                       // hello.meta, verbatim
+func (c *Conn) OpenStream(ctx context.Context) (*Stream, error)  // blocks if at MaxStreams; client-only
+func (c *Conn) SendApp(ctx context.Context, body any) error
+func (c *Conn) OnApp(fn func(body json.RawMessage))
+func (c *Conn) OnStream(fn func(*Stream))
+func (c *Conn) OnDrain(fn func(*DrainMsg))
+func (c *Conn) Drain(ctx context.Context, reason string, opts DrainOptions) error
+func (c *Conn) Close(code uint32, msg string) error
+func (c *Conn) Done() <-chan struct{}
+func (c *Conn) Err() error
+func (c *Conn) Run()                                        // starts the read/write/keepalive loops
 
-import (
-	"context"
-	"encoding/json"
-	"log"
-	"net/http"
-	"time"
-
-	"github.com/mcpwarp/ws-mixer/go/wsmixer"
-	"github.com/mcpwarp/ws-mixer/go/wsmixerserver"
-)
-
-func main() {
-	ln := wsmixerserver.NewListener(wsmixerserver.ServerOptions{
-		Options: wsmixer.Options{
-			Window:       256 << 10,
-			MaxStreams:   64,
-			PingInterval: 30 * time.Second,
-			PingTimeout:  90 * time.Second,
-		},
-		Authenticate: func(ctx context.Context, h *wsmixer.Hello) (wsmixer.WelcomeMeta, error) {
-			if h.Token != "expected-token" {
-				return wsmixer.WelcomeMeta{}, wsmixer.Unauthorized("token invalid")
-			}
-			return wsmixer.WelcomeMeta{Meta: map[string]any{"public_url": "https://example.tunnels.dev"}}, nil
-		},
-		OnConn: func(c *wsmixer.Conn) {
-			c.OnApp(func(body json.RawMessage) { log.Printf("app: %s", body) })
-			go func() {
-				st, err := c.OpenStream(context.Background())
-				if err != nil {
-					return
-				}
-				defer st.Close()
-				st.Write([]byte("GET / HTTP/1.1\r\n\r\n"))
-				st.CloseWrite()
-			}()
-		},
-	})
-
-	http.Handle("/v1/tunnel", ln)
-	log.Fatal(http.ListenAndServe(":8080", nil))
-}
+type Stream struct{ /* … */ }
+func (s *Stream) Read(p []byte) (int, error)
+func (s *Stream) Write(p []byte) (int, error)
+func (s *Stream) CloseWrite() error                 // sends CLOSE; peer reads EOF
+func (s *Stream) Close() error                      // CloseWrite; if the peer may still send, also Reset(CANCEL) so it does not stall on a window nobody drains
+func (s *Stream) Reset(code ErrorCode, msg string) error
+func (s *Stream) ID() uint32
 ```
+
+`OpenStream` returns something `io.ReadWriteCloser`-shaped plus `CloseWrite()`, so a caller can hand it
+straight to `httputil`-style copying. `Read` returns `io.EOF` after the peer's `CLOSE` and a `*wsmixer.StreamError`
+after a `RESET` — the distinction the layer above needs.
+
+`OnStream`, `OnApp`, and `OnDrain` all fire from one shared, connection-owned delivery goroutine, strictly
+in the order their frames arrived on the wire, decoupled from the read loop so a slow callback never stalls
+frame parsing — but also never runs concurrently with itself or the other two, so each must hand off to its
+own goroutine for anything that blocks.
+
+There is no `Listener` type in this package — accepting a connection over `net/http` (subprotocol/bearer
+checks, `OnConn`, production auth policy) is [`ws-mixer-server`](https://github.com/mcpwarp/ws-mixer-server)'s
+job, built on top of `AcceptConn` below.
 
 ## Client example
 
 ```go
-package main
-
-import (
-	"context"
-	"io"
-	"log"
-
-	"github.com/mcpwarp/ws-mixer/go/wsmixer"
-)
-
-func main() {
-	conn, err := wsmixer.Dial(context.Background(), "ws://localhost:8080/v1/tunnel", wsmixer.ClientOptions{
-		Token: "expected-token",
-		OnStream: func(st *wsmixer.Stream) {
-			// OnStream, OnApp, and OnDrain all fire from the same connection
-			// goroutine, in wire order, so a handler that does I/O (like this
-			// one) must hand off to its own goroutine rather than block here
-			// -- otherwise it holds up delivery of every later stream/app/drain
-			// event on this connection.
-			go func() {
-				req, _ := io.ReadAll(st)
-				log.Printf("request: %s", req)
-				st.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
-				st.CloseWrite()
-			}()
-		},
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-	<-conn.Done()
-	log.Println(conn.Err())
+conn, err := wsmixer.Dial(context.Background(), "ws://localhost:8080/v1/tunnel", wsmixer.ClientOptions{
+	Token: "expected-token",
+	OnStream: func(st *wsmixer.Stream) {
+		go func() {
+			req, _ := io.ReadAll(st)
+			st.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
+			st.CloseWrite()
+		}()
+	},
+})
+if err != nil {
+	log.Fatal(err)
 }
+<-conn.Done()
 ```
 
-`OnStream`, `OnApp`, and `OnDrain` all run on the same shared connection-owned delivery goroutine, one event
-at a time, in the order their frames arrived on the wire. Register them at any point (before or after
-`Dial`/accept); none of the three may block: a handler that does anything blocking (I/O, waiting on another
-goroutine, calling `Drain` inline) must spawn its own goroutine for that work, or it holds up delivery of
-every later stream/app/drain event on that connection. In particular, answer a peer-requested drain
-(`PeerRequestedDrain`/`OnDrain`) by calling `Conn.Drain` from a goroutine, never inline from the callback.
+`OnStream`, `OnApp`, and `OnDrain` fire on one shared per-connection goroutine, in wire order; a handler
+that blocks (I/O, waiting on another goroutine, calling `Drain` inline) must hand off to its own goroutine
+instead, or it stalls every later event on that connection.
 
-The Go client has no reconnect/backoff logic (that is the JS SDK's job, per OVERVIEW.md section 2.9);
-it is a minimal implementation sufficient for tests and a future full Go SDK.
+Running the server side yourself (no production policy layer): accept the WebSocket upgrade with your own
+`http.Handler`, then call `wsmixer.AcceptConn` to run the ws-mixer handshake over it — see
+`wsmixer/accepthandler_test.go` for a minimal worked example. Most users running a real deployment want
+`ws-mixer-server`'s `Listener` instead, which adds subprotocol/bearer-token pre-upgrade checks and
+production auth policy on top of `AcceptConn`.
 
-## Tests and the spec fixtures
+## Tests
 
-`../../spec/fixtures/` is the cross-SDK conformance oracle and this package's actual test data:
+`go test ./wsmixer/` runs the fixture-driven suites (`frame_test.go`, `control_test.go`,
+`sequence_test.go`) against a checkout of [`ws-mixer-spec`](https://github.com/mcpwarp/ws-mixer-spec),
+resolved by `wsmixer/specdir_test.go`'s `specDir` helper:
 
-- `frame_test.go` decodes every `../../spec/fixtures/frames/*.json` and checks the result (or the error
-  code and connection-fatal/stream-scoped classification) against the fixture.
-- `control_test.go` runs every `../../spec/fixtures/control/**/*.json` through the hand-written
-  `ParseControl` validator and asserts the accept/reject verdict matches the fixture's `wire_valid`.
-- `sequence_test.go` replays `../../spec/fixtures/sequences/*.json` against a real `*Conn` wired to an
-  in-memory fake WebSocket transport, driving `recv`/`send`/`expect` steps. The three fixtures that
-  depend on wall-clock waits (`hello_timeout`, `ping_pong_then_dead_peer_timeout`,
-  `drain_with_inflight_timeout`) are instead covered behaviorally in `timing_test.go` with short,
-  scaled `Options` rather than literally sleeping ~2 real minutes.
-- `integration_test.go` exercises the real `Listener` + `Dial` path end to end over an actual
-  loopback WebSocket (`httptest.Server`): handshake, request/response streams, `app` messages,
-  concurrent-stream fairness, and a goroutine-leak check.
+1. `$WSMIXER_SPEC_DIR`, if set -- must exist. Accepts either directory shape: this repo's own
+   convention (repo-root, i.e. `$WSMIXER_SPEC_DIR/spec/fixtures` exists) or `ws-mixer-js`'s
+   convention (the spec subdir itself, i.e. `$WSMIXER_SPEC_DIR/fixtures` exists directly).
+2. `../../.spec/spec`, the checkout `make fetch-spec` populates from `spec.pin`.
 
-Run everything:
+If neither resolves, those suites skip with a reason rather than failing -- `go test ./...` stays
+green without a network fetch.
 
-```sh
-go vet ./...
-go test -race ./...
-gofmt -l .
-```
+## Conformance
+
+`conformance/adapter` is the importable harness library behind this repo's
+[conformance-runner](https://github.com/mcpwarp/ws-mixer-spec) adapter, covering both the `go-client` and
+`go-server` roles behind a `ServerBackend` interface (docs/MIGRATION.md section 2.3). `cmd/conformance-adapter`
+is the thin binary that wires it directly to `AcceptConn` (proving the core — not `ws-mixer-server` — conforms);
+`ws-mixer-server` imports the same library for its own adapter, wired to its production `Listener` instead. Both
+require `-tags conformance` to build. `cmd/testserver` is a stdin/stdout test harness used by `ws-mixer-js`'s
+interop tests; it is not a supported public API.
+
+See [`ws-mixer-spec`](https://github.com/mcpwarp/ws-mixer-spec) for the wire spec, client-SDK
+requirements, and the fixture/conformance-fixture corpus this package is tested against.
+
+## Docs
+
+- [`docs/DECISIONS.md`](./docs/DECISIONS.md) — this repo's implementation decisions (WebSocket library
+  choice, etc.); protocol decisions live in `ws-mixer-spec`'s `docs/DECISIONS.md`.
+- [`docs/METRICS.md`](./docs/METRICS.md) — the `Metrics` callback interface and what each callback means.

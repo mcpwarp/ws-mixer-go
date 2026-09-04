@@ -22,7 +22,7 @@ type frameFixture struct {
 
 func loadFrameFixtures(t *testing.T) []frameFixture {
 	t.Helper()
-	dir := filepath.Join("..", "..", "spec", "fixtures", "frames")
+	dir := filepath.Join(specDir(t), "fixtures", "frames")
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatalf("reading fixtures dir: %v", err)

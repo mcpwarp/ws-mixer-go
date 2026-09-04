@@ -46,7 +46,7 @@ type sequenceFixture struct {
 
 func loadSequenceFixtures(t *testing.T) []sequenceFixture {
 	t.Helper()
-	dir := filepath.Join("..", "..", "spec", "fixtures", "sequences")
+	dir := filepath.Join(specDir(t), "fixtures", "sequences")
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatalf("reading sequences dir: %v", err)

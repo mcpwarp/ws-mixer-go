@@ -1,0 +1,79 @@
+name: conformance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  GOTOOLCHAIN: auto
+
+jobs:
+  checkout-spec:
+    runs-on: ubuntu-latest
+    outputs:
+      pin: ${{ steps.pin.outputs.pin }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: pin
+        run: echo "pin=$(cat spec.pin)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: mcpwarp/ws-mixer-spec
+          ref: ${{ steps.pin.outputs.pin }}
+          path: .spec
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spec-checkout
+          path: .spec
+          retention-days: 1
+
+  fixture-matrix:
+    needs: checkout-spec
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - uses: actions/download-artifact@v4
+        with:
+          name: spec-checkout
+          path: .spec
+      - run: go build -tags conformance -o build/go-adapter ./cmd/conformance-adapter
+      # .spec is a nested Go module (its own go.mod), so `go run ./.spec/...`
+      # cannot be invoked relative to this repo's module -- cd into it first
+      # and pass absolute paths for everything that must resolve back here.
+      - run: |
+          repo="$PWD"
+          (cd .spec && go run ./conformance/runner \
+            --spec-root "$repo/.spec" \
+            --adapter go="$repo/build/go-adapter" \
+            --sdk go --mode fixture \
+            --counts "$repo/conformance/COUNTS.json" \
+            --report "$repo/build/conformance-fixture.xml")
+
+  pair-go-go:
+    needs: checkout-spec
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - uses: actions/download-artifact@v4
+        with:
+          name: spec-checkout
+          path: .spec
+      - run: go build -tags conformance -o build/go-adapter ./cmd/conformance-adapter
+      # .spec is a nested Go module (its own go.mod), so `go run ./.spec/...`
+      # cannot be invoked relative to this repo's module -- cd into it first
+      # and pass absolute paths for everything that must resolve back here.
+      - run: |
+          repo="$PWD"
+          (cd .spec && go run ./conformance/runner \
+            --spec-root "$repo/.spec" \
+            --adapter go="$repo/build/go-adapter" \
+            --sdk go --mode pair \
+            --counts "$repo/conformance/COUNTS.json" \
+            --report "$repo/build/conformance-pair.xml")

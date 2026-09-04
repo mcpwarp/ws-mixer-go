@@ -18,7 +18,7 @@ type controlFixture struct {
 
 func loadControlFixtures(t *testing.T) []controlFixture {
 	t.Helper()
-	root := filepath.Join("..", "..", "spec", "fixtures", "control")
+	root := filepath.Join(specDir(t), "fixtures", "control")
 	var out []controlFixture
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
