@@ -204,7 +204,7 @@ func TestWriteCloseWriteOrderingRace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenStream: %v", err)
 	}
-	st.storeStream(s)
+	st.storeStream(nil, s)
 
 	var peer *wsmixer.Stream
 	select {
@@ -389,7 +389,7 @@ func TestResetUnblocksBlockedWrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenStream: %v", err)
 	}
-	st.storeStream(s)
+	st.storeStream(nil, s)
 
 	var peer *wsmixer.Stream
 	select {
@@ -583,7 +583,7 @@ func TestNoWorkerLeakAfterManyOpenCloseCycles(t *testing.T) {
 		if err != nil {
 			t.Fatalf("cycle %d: OpenStream: %v", i, err)
 		}
-		st.storeStream(s)
+		st.storeStream(nil, s)
 		go autoRead(st, s) // mirrors the "open_stream" command handler
 
 		var peer *wsmixer.Stream
@@ -726,7 +726,7 @@ func TestEnqueueOnStreamQueueFull(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenStream: %v", err)
 	}
-	st.storeStream(s)
+	st.storeStream(nil, s)
 	select {
 	case <-streamOpened:
 	case <-time.After(5 * time.Second):
@@ -789,7 +789,7 @@ func TestWriteAfterTeardownGetsCleanErrorAck(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenStream: %v", err)
 	}
-	st.storeStream(s)
+	st.storeStream(nil, s)
 	select {
 	case <-streamOpened:
 	case <-time.After(5 * time.Second):
@@ -851,7 +851,7 @@ func TestConcurrentTeardownVsWriteRace(t *testing.T) {
 		if err != nil {
 			t.Fatalf("iteration %d: OpenStream: %v", i, err)
 		}
-		st.storeStream(s)
+		st.storeStream(nil, s)
 		select {
 		case <-streamOpened:
 		case <-time.After(5 * time.Second):

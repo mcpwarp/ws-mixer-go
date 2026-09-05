@@ -19,7 +19,8 @@ go get github.com/mcpwarp/ws-mixer-go
 
 | Type | Role |
 |---|---|
-| `Conn` | One handshaken connection, dialed (`Dial`) or accepted (`AcceptConn`). Opens streams, sends `app`, drains. |
+| `Client` | Reconnecting high-level client (`client_reconnect.go`): owns the WIRE.md §2.9 state machine on top of `Dial`, reconnect on by default. `NewClient`/`Connect`/`Close`, `OnConnect`/`OnDisconnect`/`OnStream`/`OnApp`/`OnDrain`, `Stats()`. |
+| `Conn` | One handshaken connection, dialed (`Dial`) or accepted (`AcceptConn`). Opens streams, sends `app`, drains, `Stats()`. |
 | `Stream` | One byte stream. `io.Reader` + `io.Writer` + `Close()` + `CloseWrite()` + `Reset(code, msg)`. |
 | `Options` | `Window`, `MaxStreams`, `PingInterval`, `PingTimeout`, `HelloTimeout`, `ReadLimit`, `Logger`, `Metrics`, plus the stream-0 flood-limit and refused-open-escalation knobs. |
 | `ConnError` / `StreamError` | Carry an `ErrorCode` and message; `errors.As` targets for connection- and stream-scoped failures respectively. |
@@ -65,6 +66,33 @@ checks, `OnConn`, production auth policy) is [`ws-mixer-server`](https://github.
 job, built on top of `AcceptConn` below.
 
 ## Client example
+
+`wsmixer.Client` (`client_reconnect.go`) is the high-level client most callers want: it owns the full
+[WIRE.md §2.9](https://github.com/mcpwarp/ws-mixer-spec/blob/main/docs/WIRE.md#29-sequences) reconnect
+state machine — full-jitter backoff, `drain`/`4012`/`4013`/`4009` handling, a fatal set that never
+retries — on top of the plain `Dial` below, and it is on by default:
+
+```go
+client := wsmixer.NewClient(url, wsmixer.StaticToken("expected-token"), wsmixer.ClientConfig{
+	OnStream:     handleStream, // wired onto every (re)connect automatically -- no need to re-attach from OnConnect
+	OnDisconnect: func(r wsmixer.DisconnectReason) { log.Printf("disconnected: %+v", r) },
+})
+if err := client.Connect(context.Background()); err != nil {
+	log.Fatal(err)
+}
+defer client.Close(context.Background()) // drain{client_requested}, wait <=5s, close
+```
+
+`Token` is a `TokenProvider func(ctx) (string, error)`, called fresh on every dial — `StaticToken` above is
+just a convenience wrapper for a token that never changes. `OnConnect` fires on every successful `welcome`,
+first connection and every reconnect alike (WIRE.md: no resumption, so nothing from the old `*Conn`
+survives); `OnDisconnect` fires for every disconnect, recoverable or fatal, as one `DisconnectReason`
+(`Phase`, `WSCode`, `ErrorCode`/`ErrorName`, `HTTPStatus`, `Fatal`, `Message`, `Cause`). `Stats()` returns
+the "ignore and count" counters (unknown frame types, stale frames, duplicate pongs, refused opens,
+protocol violations, bytes in/out), cumulative across reconnects.
+
+The lower-level, single-attempt `Dial` (used internally by `Client`, and still the right tool for a
+harness or test that wants exactly one connection with no retry policy of its own) is unchanged:
 
 ```go
 conn, err := wsmixer.Dial(context.Background(), "ws://localhost:8080/v1/tunnel", wsmixer.ClientOptions{

@@ -38,6 +38,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mcpwarp/ws-mixer-go/wsmixer"
@@ -83,11 +84,18 @@ type adapterState struct {
 	floorMs    int64
 	allowSubfl bool
 
-	conn     *wsmixer.Conn
-	streams  map[uint32]*wsmixer.Stream
-	listener net.Listener
-	httpSrv  *http.Server
-	backend  ServerBackend
+	conn    *wsmixer.Conn
+	client  *wsmixer.Client // set only by connectReconnecting (S4(b)/(c))
+	streams map[uint32]*wsmixer.Stream
+	// streamOwner records which *wsmixer.Conn each tracked stream id
+	// belongs to, when known (see teardownAllStreams). Only
+	// connectReconnecting's OnStream populates this; the plain Dial and
+	// server-accept paths leave an id unrecorded, which teardownAllStreams
+	// treats as "belongs to whatever conn is tearing down".
+	streamOwner map[uint32]*wsmixer.Conn
+	listener    net.Listener
+	httpSrv     *http.Server
+	backend     ServerBackend
 
 	// sdk/sdkVersion identify the running binary on the "ready" event and
 	// (as sdk+"-conformance", the same sdkVersion) on the client role's
@@ -198,6 +206,7 @@ func newState(be ServerBackend) *adapterState {
 		pingIntMs: 30000, pingTOMs: 90000, helloTOMs: 10000,
 		timeScale: 1, floorMs: 300,
 		streams:       make(map[uint32]*wsmixer.Stream),
+		streamOwner:   make(map[uint32]*wsmixer.Conn),
 		closed:        make(map[uint32]closedDirs),
 		streamWorkers: make(map[uint32]*streamWorker),
 		backend:       be,
@@ -284,6 +293,7 @@ func (s *adapterState) enqueueOnStream(id uint32, seq float64, buildJob func(str
 func (s *adapterState) teardownStream(id uint32) {
 	s.mu.Lock()
 	delete(s.streams, id)
+	delete(s.streamOwner, id)
 	delete(s.closed, id)
 	w, ok := s.streamWorkers[id]
 	delete(s.streamWorkers, id)
@@ -293,21 +303,44 @@ func (s *adapterState) teardownStream(id uint32) {
 	}
 }
 
-// teardownAllStreams tears down every still-tracked stream, used once the
-// connection itself fails (watchDisconnect): none of those streams will
-// ever reach a graceful terminal state on their own once the socket is
-// gone, so their FIFO workers would otherwise leak forever. Iterates the
-// union of streams and streamWorkers -- not just streams -- so a worker
-// whose id has no (or no longer has a) streams entry still gets found and
-// torn down; relying on streams alone would miss it.
-func (s *adapterState) teardownAllStreams() {
+// teardownAllStreams tears down every still-tracked stream owned by conn,
+// used once that connection itself fails (watchDisconnect, and
+// connectReconnecting's per-conn watcher). Passing nil tears down every
+// tracked stream regardless of owner -- used by the plain (non-reconnecting)
+// Dial and server-accept paths, which never have more than one live conn at
+// a time and so never stored an owner in the first place (S4(a):
+// storeStream is only given a *wsmixer.Conn where a wsmixer.Client can
+// legitimately have two live conns during a drain-triggered parallel
+// reconnect -- connectReconnecting).
+//
+// Scoping by owner matters specifically for that Client case: OnConnect for
+// the replacement conn can fire before the superseded conn's own
+// disconnection is even observed (the drain race blockers 1/3 are about),
+// so an unconditional "tear down everything" here used to wipe out the
+// replacement conn's already-open streams along with the old conn's.
+//
+// Iterates the union of streams and streamWorkers -- not just streams -- so
+// a worker whose id has no (or no longer has a) streams entry still gets
+// found and torn down; relying on streams alone would miss it.
+func (s *adapterState) teardownAllStreams(conn *wsmixer.Conn) {
+	owns := func(id uint32) bool {
+		if conn == nil {
+			return true
+		}
+		owner, tracked := s.streamOwner[id]
+		return !tracked || owner == conn
+	}
 	s.mu.Lock()
 	idSet := make(map[uint32]struct{}, len(s.streams)+len(s.streamWorkers))
 	for id := range s.streams {
-		idSet[id] = struct{}{}
+		if owns(id) {
+			idSet[id] = struct{}{}
+		}
 	}
 	for id := range s.streamWorkers {
-		idSet[id] = struct{}{}
+		if owns(id) {
+			idSet[id] = struct{}{}
+		}
 	}
 	ids := make([]uint32, 0, len(idSet))
 	for id := range idSet {
@@ -448,9 +481,15 @@ func (s *adapterState) noteHalfClosed(id uint32, direction string) bool {
 	return c.read && c.write
 }
 
-func (s *adapterState) storeStream(st *wsmixer.Stream) {
+// storeStream tracks st, owned by conn when known (nil for the plain Dial
+// and server-accept paths, which never need the distinction -- see
+// teardownAllStreams).
+func (s *adapterState) storeStream(conn *wsmixer.Conn, st *wsmixer.Stream) {
 	s.mu.Lock()
 	s.streams[st.ID()] = st
+	if conn != nil {
+		s.streamOwner[st.ID()] = conn
+	}
 	s.mu.Unlock()
 }
 
@@ -476,6 +515,23 @@ func (s *adapterState) getConn() *wsmixer.Conn {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.conn
+}
+
+// setClient/getClient guard st.client, set only by connectReconnecting
+// (S4(b)/(c)): the "close" and "shutdown" commands need to know whether a
+// wsmixer.Client is driving the connection so they can act on it directly
+// instead of on its current *wsmixer.Conn, which a live Client would just
+// reconnect out from under them.
+func (s *adapterState) setClient(cl *wsmixer.Client) {
+	s.mu.Lock()
+	s.client = cl
+	s.mu.Unlock()
+}
+
+func (s *adapterState) getClient() *wsmixer.Client {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.client
 }
 
 func (s *adapterState) setListener(ln net.Listener) {
@@ -651,25 +707,18 @@ func handleCommand(st *adapterState, name string, seq float64, cmd map[string]an
 		emit(map[string]any{"event": "listening", "seq": seq, "url": "ws://" + ln.Addr().String() + "/v1/tunnel"})
 
 	case "connect":
-		// wsmixer.Dial is a minimal client with no reconnect/backoff loop of
-		// its own (client.go: "that is the JS SDK's job") -- a scenario that
-		// asks for reconnect (docs/CONFORMANCE.md section 1.1's
-		// connect.reconnect.enabled, only drain_reconnect) is structurally
-		// inapplicable to a Go client peer, the same way listen/open_stream
-		// are inapplicable to the JS adapter. Reply unsupported so the
-		// runner SKIPs this cell instead of timing out waiting for a
-		// `reconnected` event the Go SDK can never emit.
-		if rc, ok := cmd["reconnect"].(map[string]any); ok {
-			if enabled, _ := rc["enabled"].(bool); enabled {
-				emit(map[string]any{
-					"event": "error", "seq": seq, "ok": false, "unsupported": true,
-					"error": "unsupported", "message": "connect.reconnect.enabled: the Go SDK client has no reconnect loop",
-				})
-				return
-			}
-		}
 		url, _ := cmd["url"].(string)
 		token, _ := cmd["token"].(string)
+		reconnectEnabled := false
+		if rc, ok := cmd["reconnect"].(map[string]any); ok {
+			if enabled, _ := rc["enabled"].(bool); enabled {
+				reconnectEnabled = true
+			}
+		}
+		if reconnectEnabled {
+			go connectReconnecting(st, seq, url, token)
+			return
+		}
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
@@ -678,7 +727,7 @@ func handleCommand(st *adapterState, name string, seq float64, cmd map[string]an
 				Token:   token,
 				Agent:   wsmixer.AgentInfo{SDK: st.sdk + "-conformance", SDKVersion: st.sdkVersion},
 				OnStream: func(s *wsmixer.Stream) {
-					st.storeStream(s)
+					st.storeStream(nil, s)
 					emit(map[string]any{"event": "stream_opened", "id": s.ID()})
 					go autoRead(st, s)
 				},
@@ -717,7 +766,7 @@ func handleCommand(st *adapterState, name string, seq float64, cmd map[string]an
 				cmdErr(seq, "open_stream: "+err.Error())
 				return
 			}
-			st.storeStream(s)
+			st.storeStream(conn, s)
 			ack(seq)
 			emit(map[string]any{"event": "stream_opened", "seq": seq, "id": s.ID()})
 			go autoRead(st, s)
@@ -810,6 +859,18 @@ func handleCommand(st *adapterState, name string, seq float64, cmd map[string]an
 		}()
 
 	case "close":
+		// S4(c): under a live wsmixer.Client, closing st.getConn() directly
+		// just looks like an ordinary disconnect to the Client's own
+		// reconnect state machine -- it reconnects instead of actually
+		// closing. Route through the Client when one is driving this
+		// connection; code/message are moot there (Client.Close always
+		// finishes its own WIRE.md section 2.10 rule-14 sequence), so only
+		// the plain (non-reconnecting) path still honours them.
+		if cl := st.getClient(); cl != nil {
+			ack(seq)
+			go func() { _ = cl.Close(context.Background()) }()
+			return
+		}
 		conn := st.getConn()
 		if conn == nil {
 			cmdErr(seq, "close before connection established")
@@ -821,6 +882,18 @@ func handleCommand(st *adapterState, name string, seq float64, cmd map[string]an
 		go func() { _ = conn.Close(uint32(code), msg) }()
 
 	case "shutdown":
+		// S4(b): connectReconnecting's wsmixer.Client owns background
+		// goroutines (attemptLoop/watchConn/its callback loop) that outlive
+		// the conn it happens to be holding at any moment -- closing just
+		// st.conn would leave them running. Close the Client here so
+		// nothing leaks past this command, matching Run()'s promise that
+		// "shutdown" ends the adapter's own state cleanly (important for
+		// in-process callers like race_test.go, which reuse the process
+		// across many Run() calls; a real standalone binary's os.Exit would
+		// mask the leak).
+		if cl := st.getClient(); cl != nil {
+			_ = cl.Close(context.Background())
+		}
 		ack(seq)
 
 	default:
@@ -924,12 +997,118 @@ func waitForLateStreamReset(st *adapterState, s *wsmixer.Stream) {
 	}
 }
 
+// connectReconnecting runs the "connect" command's connect.reconnect.enabled
+// path (docs/CONFORMANCE.md section 1.1, only the drain_reconnect scenario
+// sets this): built on wsmixer.Client, the Go SDK's own reconnecting client
+// (client_reconnect.go), instead of the single-attempt wsmixer.Dial the
+// plain "connect" path above uses. OnConnect fires on every successful
+// welcome, including reconnects; the first one is reported as the ordinary
+// "connected" ack/event (matching the plain path's shape), and every one
+// after that as `reconnected` (coordination contract (b), mirrors the JS
+// adapter's own onConnect handling in adapter.mjs).
+func connectReconnecting(st *adapterState, seq float64, url, token string) {
+	var connectedOnce atomic.Bool
+	// cl is referenced from inside its own ClientConfig (OnStream), so it
+	// has to be declared before the wsmixer.NewClient call that assigns it.
+	var cl *wsmixer.Client
+
+	// N4: cl.Conn() read right after a successful Connect() can already be
+	// nil -- Connect only waits for the first welcome, not for OnConnect's
+	// enqueued callback to have actually run, and an instant post-welcome
+	// disconnect can also race cl.conn back to nil before this goroutine
+	// gets to read it. firstConnCh instead captures the exact *wsmixer.Conn
+	// OnConnect handed us for the first (and, since it's only ever
+	// buffer-1'd on a successful non-blocking send, only the first) welcome
+	// -- safe to read fields like Session() off even after that conn has
+	// since ended, since those are fixed at construction.
+	firstConnCh := make(chan *wsmixer.Conn, 1)
+
+	cl = wsmixer.NewClient(url, wsmixer.StaticToken(token), wsmixer.ClientConfig{
+		Options: st.options(),
+		Agent:   wsmixer.AgentInfo{SDK: st.sdk + "-conformance", SDKVersion: st.sdkVersion},
+		OnStream: func(s *wsmixer.Stream) {
+			// nit 4: s.Conn() is the conn this specific stream was opened
+			// on, fixed at construction -- unlike cl.Conn(), which reads
+			// whatever the client's *current* active conn happens to be and
+			// races the window between a new conn's dispatch loop starting
+			// (and delivering this very OnStream) and onAttemptSucceeded
+			// actually assigning it to cl.conn. Recording the right owner is
+			// what lets teardownAllStreams (S4(a)) scope a disconnect's
+			// cleanup to its own streams instead of also sweeping up
+			// streams that already belong to a reconnect's replacement conn.
+			st.storeStream(s.Conn(), s)
+			emit(map[string]any{"event": "stream_opened", "id": s.ID()})
+			go autoRead(st, s)
+		},
+		OnApp: func(body json.RawMessage) {
+			var v any
+			_ = json.Unmarshal(body, &v)
+			emit(map[string]any{"event": "app", "body": v})
+		},
+		OnDrain: func(d *wsmixer.DrainMsg) { emit(drainEvent(d)) },
+		OnConnect: func(c *wsmixer.Conn, _ *wsmixer.WelcomeMsg) {
+			st.setConn(c)
+			// S4(a): tear down only c's own streams once it ends, in a
+			// watcher bound to this specific conn -- not from OnDisconnect,
+			// which carries no *wsmixer.Conn to scope by and used to call
+			// the unscoped teardownAllStreams() unconditionally. That could
+			// (and did) run after a drain-triggered parallel reconnect's
+			// OnConnect had already fired for the replacement conn, wiping
+			// out streams that belong to the new connection, not the one
+			// that actually disconnected.
+			go func(c *wsmixer.Conn) {
+				<-c.Done()
+				st.teardownAllStreams(c)
+			}(c)
+			if connectedOnce.Swap(true) {
+				emit(map[string]any{"event": "reconnected", "session": c.Session()})
+			} else {
+				select {
+				case firstConnCh <- c:
+				default:
+				}
+			}
+		},
+		OnDisconnect: func(r wsmixer.DisconnectReason) {
+			e := map[string]any{"event": "disconnected", "message": r.Message, "fatal": r.Fatal}
+			if r.WSCode != 0 {
+				e["ws_code"] = r.WSCode
+			}
+			if r.HasErrorCode {
+				e["error_code"] = uint32(r.ErrorCode)
+				e["error_name"] = r.ErrorName
+			}
+			emit(e)
+		},
+	})
+	st.setClient(cl)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := cl.Connect(ctx); err != nil {
+		cmdErr(seq, "connect: "+err.Error())
+		return
+	}
+	// N4: block for the conn OnConnect actually handed us rather than
+	// racing cl.Conn() -- Connect() returning nil only guarantees OnConnect
+	// was enqueued, not that callbackLoop has run it yet, and the
+	// conn may have already disconnected by the time this goroutine gets
+	// scheduled either way. See firstConnCh's declaration above.
+	c := <-firstConnCh
+	ack(seq)
+	emit(map[string]any{
+		"event": "connected", "seq": seq,
+		"session": c.Session(),
+		"welcome": map[string]any{"session": c.Session()},
+	})
+}
+
 func watchDisconnect(st *adapterState, c *wsmixer.Conn) {
 	<-c.Done()
 	// The connection itself is gone: none of its still-open streams will
 	// ever reach a graceful terminal state on their own, so tear them all
 	// down here rather than leaking their FIFO worker goroutines forever.
-	st.teardownAllStreams()
+	st.teardownAllStreams(c)
 	err := c.Err()
 	e := map[string]any{"fatal": false}
 	if ce, ok := err.(*wsmixer.ConnError); ok {

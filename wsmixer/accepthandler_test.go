@@ -20,6 +20,12 @@ type testAcceptHandler struct {
 	ServerInfo   *ServerInfo
 	Authenticate func(ctx context.Context, h *Hello) (WelcomeMeta, error)
 	OnConn       func(*Conn)
+	// OnRawConn, if set, is called with the raw upgraded WebSocket
+	// connection before AcceptConn wraps it in a *Conn -- for tests that
+	// need to poke the wire directly below what *Conn's own API can
+	// express, e.g. a raw non-ws-mixer close code like 1001 (nit 6:
+	// client_reconnect_test.go's 1001-classification test).
+	OnRawConn func(*websocket.Conn)
 }
 
 // newTestListener builds a *testAcceptHandler, applying Options.SetDefaults
@@ -53,6 +59,9 @@ func (h *testAcceptHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer ws.CloseNow()
 	ws.SetReadLimit(h.ReadLimit)
+	if h.OnRawConn != nil {
+		h.OnRawConn(ws)
+	}
 
 	bearer := testBearerToken(r.Header.Get("Authorization"))
 	c, err := AcceptConn(r.Context(), ws, bearer, AcceptOptions{

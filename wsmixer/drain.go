@@ -13,11 +13,36 @@ type DrainOptions struct {
 	Deadline   time.Duration // grace for in-flight streams; 0 = immediately
 	RetryAfter time.Duration // reconnect hint
 	Message    string
+
+	// CloseCode overrides the WS close code/error this Drain finishes with.
+	// The default (HasCloseCode false) is GOING_AWAY (4012), matching the
+	// server-initiated drain sequence in WIRE.md section 2.9. Client's own
+	// graceful-shutdown path (WIRE.md section 2.10 rule 14: "drain{reason:
+	// client_requested}, wait up to 5s, error{NO_ERROR}, close 1000") sets
+	// this to NoError instead.
+	CloseCode    ErrorCode
+	HasCloseCode bool
+}
+
+// isDraining reports whether this side has already initiated its own
+// Drain() sequence, or (client-side) already received the peer's drain --
+// i.e. whether a further Drain() call would just no-op below. Client.Close
+// (blocker 3) uses this to skip straight to closing the socket instead of
+// calling Drain and getting exactly that no-op, which would otherwise leave
+// it parked on the peer's own drain deadline (or forever).
+func (c *Conn) isDraining() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.draining
 }
 
 // Drain stops opening new streams, tells the peer, waits up to opts.Deadline
 // for in-flight streams to finish, then RESETs every survivor with CANCEL and
-// closes with GOING_AWAY (OVERVIEW.md section 2.9). Server-only.
+// closes with GOING_AWAY (OVERVIEW.md section 2.9). Role-agnostic: WIRE.md
+// section 2.9/2.10 has the server send drain for its own policy reasons
+// (rollout, idle eviction, load shedding, id exhaustion) and the client send
+// it with reason "client_requested" on graceful shutdown (rule 14) -- both
+// go through this same method on any live *Conn.
 func (c *Conn) Drain(ctx context.Context, reason string, opts DrainOptions) error {
 	c.mu.Lock()
 	if c.draining {
@@ -79,7 +104,11 @@ func (c *Conn) Drain(ctx context.Context, reason string, opts DrainOptions) erro
 	}
 
 	c.opts.Metrics.DrainCompleted(c.session, reason)
-	return c.Close(uint32(GoingAwayCode), fmt.Sprintf("draining: %s", reason))
+	closeCode := GoingAwayCode
+	if opts.HasCloseCode {
+		closeCode = opts.CloseCode
+	}
+	return c.Close(uint32(closeCode), fmt.Sprintf("draining: %s", reason))
 }
 
 // waitForDrainedOrEmpty returns a channel closed once the stream table is

@@ -171,6 +171,7 @@ type Conn struct {
 	declaredMaxStreams int64
 	helloMeta          json.RawMessage
 	welcomeMeta        json.RawMessage
+	welcomeMsg         *WelcomeMsg // client-side only: the full welcome, for Client's OnConnect
 	peerAgent          AgentInfo
 	pingInterval       time.Duration
 	pingTimeout        time.Duration
@@ -240,6 +241,21 @@ type Conn struct {
 	// read loop calls), so they need no lock of their own.
 	refusedOpenCount       int
 	refusedOpenWindowStart time.Time
+
+	// stats backs Stats(): the "ignore and count" counters CLIENT-SDK.md
+	// requires (see stats.go).
+	stats connStats
+
+	// observedCloseCode is the raw WebSocket close code this side actually
+	// saw when the transport ended (websocket.CloseStatus(err) from
+	// handleReadError), independent of whether a ws-mixer *ConnError was
+	// also involved. -1 (its zero-value replacement, set in newConn) means
+	// none was observed: an abnormal closure -- TCP reset, timeout, EOF --
+	// per RFC 6455's 1006 sentinel, which is never actually sent as a frame.
+	// Client (client_reconnect.go) needs this to tell "1006/TCP
+	// reset/DNS failure" (WIRE.md section 2.9: normal backoff) apart from a
+	// clean-looking close that carries no ws-mixer error either.
+	observedCloseCode int
 }
 
 // handlers holds the current OnStream/OnApp/OnDrain callbacks as one
@@ -308,20 +324,31 @@ func newConn(ws WSConn, role Role, opts Options) *Conn {
 		burst = 100
 	}
 	return &Conn{
-		ws:               ws,
-		role:             role,
-		opts:             opts,
-		streams:          make(map[uint32]*Stream),
-		outstandingPings: make(map[int64]time.Time),
-		lastPongAt:       time.Now(),
-		closed:           make(chan struct{}),
-		controlQueue:     make(chan []byte, 256),
-		sched:            dataSched{inReady: make(map[uint32]bool), workCh: make(chan struct{}, 1)},
-		deliveryQueue:    make(chan deliveryEvent, deliveryQueueCapacity(opts.MaxStreams)),
-		connNotifyCh:     make(chan struct{}),
-		handshakeCh:      make(chan struct{}),
-		stream0Bucket:    newTokenBucket(burst, rate),
+		ws:                ws,
+		role:              role,
+		opts:              opts,
+		streams:           make(map[uint32]*Stream),
+		outstandingPings:  make(map[int64]time.Time),
+		lastPongAt:        time.Now(),
+		closed:            make(chan struct{}),
+		controlQueue:      make(chan []byte, 256),
+		sched:             dataSched{inReady: make(map[uint32]bool), workCh: make(chan struct{}, 1)},
+		deliveryQueue:     make(chan deliveryEvent, deliveryQueueCapacity(opts.MaxStreams)),
+		connNotifyCh:      make(chan struct{}),
+		handshakeCh:       make(chan struct{}),
+		stream0Bucket:     newTokenBucket(burst, rate),
+		observedCloseCode: -1,
 	}
+}
+
+// PeerCloseCode returns the raw WebSocket close code this side actually
+// observed when the transport ended, or -1 if none was observed (an
+// abnormal closure, per RFC 6455's 1006 sentinel). See the field comment on
+// Conn.observedCloseCode.
+func (c *Conn) PeerCloseCode() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.observedCloseCode
 }
 
 // Run starts the connection's background goroutines. Must be called exactly
@@ -385,7 +412,7 @@ func (c *Conn) enqueueDelivery(ev deliveryEvent) (ok bool) {
 	case c.deliveryQueue <- ev:
 		return true
 	default:
-		c.fail(newConnErrorf(EnhanceYourCalm, "application delivery queue full (>%d pending stream/app/drain callbacks)", cap(c.deliveryQueue)))
+		c.failProtocol(newConnErrorf(EnhanceYourCalm, "application delivery queue full (>%d pending stream/app/drain callbacks)", cap(c.deliveryQueue)))
 		return false
 	}
 }
@@ -401,6 +428,12 @@ func (c *Conn) Meta() json.RawMessage {
 	}
 	return c.welcomeMeta
 }
+
+// Welcome returns the full welcome message this client-side connection
+// received, or nil on the server side (which never receives one). Client
+// (client_reconnect.go) passes this to OnConnect on every successful
+// handshake, including reconnects.
+func (c *Conn) Welcome() *WelcomeMsg { return c.welcomeMsg }
 
 // Done returns a channel closed once the connection has finished shutting
 // down.
@@ -512,7 +545,11 @@ func (c *Conn) writeMessage(b []byte) error {
 	// Gate the write loop on the socket send buffer: coder/websocket's Write
 	// is synchronous and context-bounded, so this blocking call *is* rule 2 of
 	// OVERVIEW.md section 2.6.
-	return c.ws.Write(ctx, websocket.MessageBinary, b)
+	err := c.ws.Write(ctx, websocket.MessageBinary, b)
+	if err == nil {
+		c.stats.bytesOut.Add(int64(len(b)))
+	}
+	return err
 }
 
 // --- connection-fatal shutdown -----------------------------------------------

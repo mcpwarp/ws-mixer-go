@@ -22,11 +22,12 @@ func (c *Conn) readerLoop() {
 			c.handleReadError(err)
 			return
 		}
+		c.stats.bytesIn.Add(int64(len(data)))
 		frame, ferr := DecodeFrame(data)
 		if ferr != nil {
 			switch e := ferr.(type) {
 			case *ConnError:
-				c.fail(e)
+				c.failProtocol(e)
 				return
 			case *StreamError:
 				c.resetStream(e.StreamID, e.Code, e.Message)
@@ -35,6 +36,7 @@ func (c *Conn) readerLoop() {
 		}
 		if !frame.Type.Known() {
 			c.opts.Metrics.UnknownFrameType(c.session, uint8(frame.Type))
+			c.stats.unknownFrameTypes.Add(1)
 			continue
 		}
 		if c.dispatch(frame) {
@@ -44,13 +46,13 @@ func (c *Conn) readerLoop() {
 }
 
 func (c *Conn) handleReadError(err error) {
-	if code := websocket.CloseStatus(err); code != -1 {
-		c.mu.Lock()
-		if c.err == nil {
-			c.err = fmt.Errorf("ws-mixer: peer closed with code %d", code)
-		}
-		c.mu.Unlock()
+	code := websocket.CloseStatus(err)
+	c.mu.Lock()
+	c.observedCloseCode = int(code)
+	if code != -1 && c.err == nil {
+		c.err = fmt.Errorf("ws-mixer: peer closed with code %d", code)
 	}
+	c.mu.Unlock()
 	c.closeOnce.Do(func() {
 		// Guarantee the transport is actually released here: a Read error
 		// (peer TCP reset, timeout, malformed close frame) does not always
@@ -68,13 +70,13 @@ func (c *Conn) handleReadError(err error) {
 func (c *Conn) dispatch(f *Frame) bool {
 	if f.StreamID == 0 {
 		if f.Type != FrameData {
-			c.fail(newConnErrorf(ProtocolErrorCode, "%s is not legal on stream 0 (control channel)", f.Type))
+			c.failProtocol(newConnErrorf(ProtocolErrorCode, "%s is not legal on stream 0 (control channel)", f.Type))
 			return true
 		}
 		return c.handleControlData(f.Payload)
 	}
 	if !c.handshakeDone {
-		c.fail(newConnErrorf(ProtocolErrorCode, "%s frame received before hello/welcome completed the handshake", f.Type))
+		c.failProtocol(newConnErrorf(ProtocolErrorCode, "%s frame received before hello/welcome completed the handshake", f.Type))
 		return true
 	}
 	switch f.Type {
@@ -94,13 +96,13 @@ func (c *Conn) dispatch(f *Frame) bool {
 
 func (c *Conn) handleRemoteOpen(id uint32) bool {
 	if c.role == RoleServer {
-		c.fail(newConnErrorf(ProtocolErrorCode, "OPEN received from the client; only the server opens streams"))
+		c.failProtocol(newConnErrorf(ProtocolErrorCode, "OPEN received from the client; only the server opens streams"))
 		return true
 	}
 	c.mu.Lock()
 	if id <= c.highestOpened {
 		c.mu.Unlock()
-		c.fail(newConnErrorf(ProtocolErrorCode, "OPEN for id %d is not greater than highest_opened %d", id, c.highestOpened))
+		c.failProtocol(newConnErrorf(ProtocolErrorCode, "OPEN for id %d is not greater than highest_opened %d", id, c.highestOpened))
 		return true
 	}
 	// OVERVIEW.md section 2.7 Drain: an OPEN with id > last_stream_id after
@@ -111,7 +113,7 @@ func (c *Conn) handleRemoteOpen(id uint32) bool {
 	if c.draining && id > c.peerLastStreamID {
 		lastStreamID := c.peerLastStreamID
 		c.mu.Unlock()
-		c.fail(newConnErrorf(ProtocolErrorCode, "OPEN for id %d exceeds drain last_stream_id %d", id, lastStreamID))
+		c.failProtocol(newConnErrorf(ProtocolErrorCode, "OPEN for id %d exceeds drain last_stream_id %d", id, lastStreamID))
 		return true
 	}
 	c.highestOpened = id
@@ -130,6 +132,7 @@ func (c *Conn) handleRemoteOpen(id uint32) bool {
 
 	if overLimit {
 		c.sendControlFrame(EncodeReset(id, StreamLimitCode, fmt.Sprintf("max_streams=%d exceeded by stream %d", c.maxStreams, id)))
+		c.stats.refusedOpens.Add(1)
 		// Only an OPEN that also exceeds the max_streams ceiling this side
 		// actually declared to the peer (welcome.max_streams / hello) counts
 		// as peer misbehavior. A refusal caused purely by this side
@@ -137,7 +140,7 @@ func (c *Conn) handleRemoteOpen(id uint32) bool {
 		// self-inflicted behavior (OVERVIEW.md section 2.7: the client "MAY
 		// lower it further to its own ceiling") and must never escalate.
 		if streamCount >= declared && c.repeatRefusedOpen() {
-			c.fail(newConnErrorf(EnhanceYourCalm, "%d refused OPENs (STREAM_LIMIT) within %s", c.refusedOpenLimit(), c.refusedOpenWindowDuration()))
+			c.failProtocol(newConnErrorf(EnhanceYourCalm, "%d refused OPENs (STREAM_LIMIT) within %s", c.refusedOpenLimit(), c.refusedOpenWindowDuration()))
 			return true
 		}
 		return false
@@ -173,7 +176,7 @@ func (c *Conn) lookupLiveStream(id uint32) (st *Stream, neverOpened bool) {
 func (c *Conn) handleStreamData(id uint32, payload []byte) bool {
 	st, neverOpened := c.lookupLiveStream(id)
 	if neverOpened {
-		c.fail(newConnErrorf(ProtocolErrorCode, "DATA for stream %d, which was never opened", id))
+		c.failProtocol(newConnErrorf(ProtocolErrorCode, "DATA for stream %d, which was never opened", id))
 		return true
 	}
 	if st == nil {
@@ -191,7 +194,7 @@ func (c *Conn) handleStreamData(id uint32, payload []byte) bool {
 func (c *Conn) handleStreamWindow(id uint32, inc uint32) bool {
 	st, neverOpened := c.lookupLiveStream(id)
 	if neverOpened {
-		c.fail(newConnErrorf(ProtocolErrorCode, "WINDOW for stream %d, which was never opened", id))
+		c.failProtocol(newConnErrorf(ProtocolErrorCode, "WINDOW for stream %d, which was never opened", id))
 		return true
 	}
 	if st == nil {
@@ -208,7 +211,7 @@ func (c *Conn) handleStreamWindow(id uint32, inc uint32) bool {
 func (c *Conn) handleStreamClose(id uint32) bool {
 	st, neverOpened := c.lookupLiveStream(id)
 	if neverOpened {
-		c.fail(newConnErrorf(ProtocolErrorCode, "CLOSE for stream %d, which was never opened", id))
+		c.failProtocol(newConnErrorf(ProtocolErrorCode, "CLOSE for stream %d, which was never opened", id))
 		return true
 	}
 	if st == nil {
@@ -227,7 +230,7 @@ func (c *Conn) handleStreamClose(id uint32) bool {
 func (c *Conn) handleStreamReset(id uint32, code ErrorCode, msg string) bool {
 	st, neverOpened := c.lookupLiveStream(id)
 	if neverOpened {
-		c.fail(newConnErrorf(ProtocolErrorCode, "RESET for stream %d, which was never opened", id))
+		c.failProtocol(newConnErrorf(ProtocolErrorCode, "RESET for stream %d, which was never opened", id))
 		return true
 	}
 	if st == nil {
@@ -245,7 +248,7 @@ func (c *Conn) handleStreamReset(id uint32, code ErrorCode, msg string) bool {
 func (c *Conn) handleStreamErr(id uint32, err error) bool {
 	switch e := err.(type) {
 	case *ConnError:
-		c.fail(e)
+		c.failProtocol(e)
 		return true
 	case *StreamError:
 		c.resetStream(id, e.Code, e.Message)
@@ -269,6 +272,7 @@ func (c *Conn) resetStream(id uint32, code ErrorCode, msg string) {
 
 func (c *Conn) discardStale(id uint32, frameType string) {
 	c.opts.Metrics.StaleFrameDiscarded(c.session, id)
+	c.stats.staleFrames.Add(1)
 	c.opts.Logger.Debug("discarding frame for a stream that is no longer live", "stream_id", id, "frame_type", frameType)
 }
 
@@ -293,12 +297,12 @@ func (c *Conn) handleControlData(payload []byte) bool {
 	// else"). Checked before parsing so a flood of junk can't burn CPU on top
 	// of exhausting the bucket.
 	if !c.stream0Bucket.Allow() {
-		c.fail(newConnErrorf(EnhanceYourCalm, "stream-0 message rate exceeded %.0f/s (burst %.0f)", c.stream0Bucket.rate, c.stream0Bucket.capacity))
+		c.failProtocol(newConnErrorf(EnhanceYourCalm, "stream-0 message rate exceeded %.0f/s (burst %.0f)", c.stream0Bucket.rate, c.stream0Bucket.capacity))
 		return true
 	}
 	msg, err := ParseControl(payload)
 	if err != nil {
-		c.fail(err.(*ConnError))
+		c.failProtocol(err.(*ConnError))
 		return true
 	}
 
@@ -308,16 +312,16 @@ func (c *Conn) handleControlData(payload []byte) bool {
 	// dispatch loop already running, so any stream-0 message seen here in
 	// that state is itself a protocol violation, not a handshake step.
 	if !c.handshakeDone {
-		c.fail(newConnErrorf(ProtocolErrorCode, "frame received before hello/welcome completed the handshake"))
+		c.failProtocol(newConnErrorf(ProtocolErrorCode, "frame received before hello/welcome completed the handshake"))
 		return true
 	}
 
 	switch m := msg.(type) {
 	case *HelloMsg:
-		c.fail(newConnErrorf(ProtocolErrorCode, "second hello received after the handshake already completed"))
+		c.failProtocol(newConnErrorf(ProtocolErrorCode, "second hello received after the handshake already completed"))
 		return true
 	case *WelcomeMsg:
-		c.fail(newConnErrorf(ProtocolErrorCode, "unexpected welcome after the handshake already completed"))
+		c.failProtocol(newConnErrorf(ProtocolErrorCode, "unexpected welcome after the handshake already completed"))
 		return true
 	case *PingMsg:
 		c.opts.Metrics.ControlMessage(c.session, "ping", "recv")
@@ -354,12 +358,13 @@ func (c *Conn) handlePong(m *PongMsg) (fatal bool) {
 	c.mu.Lock()
 	if m.ID >= c.nextPingID {
 		c.mu.Unlock()
-		c.fail(newConnErrorf(ProtocolErrorCode, "pong for id %d was never sent", m.ID))
+		c.failProtocol(newConnErrorf(ProtocolErrorCode, "pong for id %d was never sent", m.ID))
 		return true
 	}
 	if m.ID < c.lowestUnacked {
 		c.mu.Unlock()
 		c.opts.Metrics.DuplicatePong(c.session, m.ID)
+		c.stats.duplicatePongs.Add(1)
 		return false
 	}
 	sentAt, wasSent := c.outstandingPings[m.ID]
@@ -368,6 +373,7 @@ func (c *Conn) handlePong(m *PongMsg) (fatal bool) {
 		// pruned as stale by the watchdog) once before.
 		c.mu.Unlock()
 		c.opts.Metrics.DuplicatePong(c.session, m.ID)
+		c.stats.duplicatePongs.Add(1)
 		return false
 	}
 	delete(c.outstandingPings, m.ID)
@@ -388,7 +394,7 @@ func (c *Conn) handlePong(m *PongMsg) (fatal bool) {
 
 func (c *Conn) handleDrainMsg(m *DrainMsg) (fatal bool) {
 	if c.role == RoleServer && m.Reason != "client_requested" {
-		c.fail(newConnErrorf(ProtocolErrorCode, "drain from the client must use reason=client_requested, got %q", m.Reason))
+		c.failProtocol(newConnErrorf(ProtocolErrorCode, "drain from the client must use reason=client_requested, got %q", m.Reason))
 		return true
 	}
 	reason := m.Reason

@@ -111,6 +111,16 @@ func newStream(conn *Conn, id uint32, initialWindow int64, sendWindow int64) *St
 // ID returns the stream's id.
 func (s *Stream) ID() uint32 { return s.id }
 
+// Conn returns the *Conn this stream belongs to. s.conn is set once, at
+// construction, and never changes -- a reconnect never migrates a stream
+// onto a new *Conn (WIRE.md section 2.9: a reconnect is a brand new
+// connection with no resumption) -- so this needs no locking. Lets a caller
+// that only gets handed a *Stream (e.g. wsmixer.ClientConfig.OnStream, whose
+// signature carries no *Conn) recover the specific conn that delivered it,
+// instead of re-reading Client.Conn() -- which, mid-reconnect, can already
+// point at a different conn than the one this particular Stream arrived on.
+func (s *Stream) Conn() *Conn { return s.conn }
+
 // State reports the stream's current state, mainly for tests and diagnostics.
 func (s *Stream) State() string {
 	s.mu.Lock()

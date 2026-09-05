@@ -12,11 +12,13 @@ import (
 
 // defaultSDKVersion is reported as Agent.SDKVersion in the hello message
 // when the caller doesn't set one. Single source for this package.
-const defaultSDKVersion = "0.2.0"
+const defaultSDKVersion = "0.4.0"
 
-// ClientOptions configures Dial. This is a minimal Go client sufficient for
-// tests and a future Go SDK; it does not implement reconnect/backoff (that is
-// the JS SDK's job, per OVERVIEW.md section 2.9's reconnect table).
+// ClientOptions configures Dial: one dial attempt, one handshake, no
+// reconnect/backoff of its own. It is the low-level building block Client
+// (client_reconnect.go) is built on top of -- most callers should use Client
+// instead, which adds the full WIRE.md section 2.9 reconnect state machine on
+// top of exactly this same Dial.
 type ClientOptions struct {
 	Options
 
@@ -46,13 +48,13 @@ func Dial(ctx context.Context, url string, opts ClientOptions) (*Conn, error) {
 	}
 	header.Set("Authorization", "Bearer "+opts.Token)
 
-	ws, _, err := websocket.Dial(ctx, url, &websocket.DialOptions{
+	ws, resp, err := websocket.Dial(ctx, url, &websocket.DialOptions{
 		Subprotocols:    []string{Subprotocol},
 		HTTPHeader:      header,
 		CompressionMode: websocket.CompressionDisabled,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("wsmixer: dial: %w", err)
+		return nil, fmt.Errorf("wsmixer: dial: %w", newDialError(err, resp))
 	}
 	// Mirrors Listener.ServeHTTP's `defer ws.CloseNow()`: guarantee the socket
 	// is released on every exit path from here down, success included (the
@@ -65,7 +67,11 @@ func Dial(ctx context.Context, url string, opts ClientOptions) (*Conn, error) {
 	}()
 
 	if ws.Subprotocol() != Subprotocol {
-		return nil, fmt.Errorf("wsmixer: server did not echo the %s subprotocol; failing fatally, do not retry", Subprotocol)
+		return nil, &DialError{
+			Err:      fmt.Errorf("wsmixer: server did not echo the %s subprotocol; failing fatally, do not retry", Subprotocol),
+			Fatal:    true,
+			Mismatch: true,
+		}
 	}
 	ws.SetReadLimit(opts.ReadLimit)
 
@@ -178,6 +184,7 @@ func (c *Conn) applyWelcome(helloWindow int64, welcome *WelcomeMsg) error {
 	c.pingInterval = time.Duration(welcome.PingInterval) * time.Millisecond
 	c.pingTimeout = time.Duration(welcome.PingTimeout) * time.Millisecond
 	c.welcomeMeta = welcome.Meta
+	c.welcomeMsg = welcome
 	c.finishHandshake()
 	return nil
 }
