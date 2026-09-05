@@ -590,9 +590,10 @@ func (cl *Client) Stats() Stats {
 //   - A fatal path (goFatal, onAttemptFailed's fatal branch,
 //     reportAndSchedule's exhaustion/disabled branch) closes whatever it
 //     owns itself, under cl.mu, as part of going fatal: it takes cl.conn/
-//     cl.retiringConn, nils both fields (so watchConn's own eventual
-//     wasActive check comes back false and does not also report the same
-//     disconnect), then closes them asynchronously.
+//     cl.retiringConn, nils both fields -- nil-ing cl.conn alone is what
+//     makes watchConn's own eventual wasActive check come back false and
+//     so not also report the same disconnect; nil-ing retiringConn is
+//     separate ownership bookkeeping -- then closes them asynchronously.
 //   - onAttemptSucceeded publishes a freshly dialed conn to cl.conn only
 //     under the same cl.mu it re-checks cl.closing with. A conn that lands
 //     after Close (or a fatal path) has already started is never published
@@ -606,10 +607,19 @@ func (cl *Client) Stats() Stats {
 // the new dial actually lands), closeLiveConns closes that predecessor
 // silently and its termination is subsumed into the single fatal report for
 // the failed attempt rather than getting an OnDisconnect of its own --
-// deliberate, since OnConnect/OnDisconnect are meant to stay paired per conn
-// the caller actually saw come up, and the predecessor's own watchConn goes
-// silent (wasActive false) the moment cl.conn/cl.retiringConn stop pointing
-// at it.
+// deliberate: a fatal termination collapses to exactly one report (the
+// fatal reason subsumes the predecessor's), mirroring the JS reference
+// SDK's own goFatal path, which swallows the retiring conn's report the
+// same way; the two differ only in how the close happens -- Go closes it
+// asynchronously here via closeLiveConns because Conn.Close blocks on the
+// close-frame round trip, while JS's fail() closes it synchronously. This
+// differs from nit 3's
+// drain-race-won case below (onAttemptSucceeded), which is not fatal and so
+// still owes CLIENT-SDK.md's unconditional one-report-per-disconnect
+// promise -- there, the superseded predecessor gets its own report even
+// though its watchConn call also goes silent. Either way, the predecessor's
+// own watchConn goes silent (wasActive false) purely because cl.conn no
+// longer points at it -- nil-ing cl.retiringConn plays no part in that.
 //
 // The failure mode this prevents: a conn that is live, but that nothing
 // currently tracks as cl.conn/cl.retiringConn/cl.gracefulConn, is an
@@ -700,22 +710,29 @@ func (cl *Client) Close(ctx context.Context) error {
 }
 
 // tryTrack registers one more goroutine with cl.wg, guarded by the same
-// cl.mu that Close (and every fatal path: goFatal, onAttemptFailed,
-// reportAndSchedule) sets cl.closing under BEFORE ever calling wg.Wait --
-// either directly (Close) or via a spawned goroutine (scheduleCbChClose),
-// which is just as good: the go statement's own happens-before means
-// closing=true is still visible before that goroutine's wg.Wait() call.
-// Because cl.mu totally orders tryTrack's critical section against
-// whichever one of those sets closing, exactly two outcomes are possible,
-// never a third:
-//   - tryTrack's critical section runs entirely before the closing-setting
-//     one: it observes closing==false, calls wg.Add(1), and returns true --
-//     that Add happens-before cl.mu's unlock here, which happens-before the
-//     other side's lock, which happens-before its own wg.Wait() call
-//     (program order). Add-before-Wait: safe.
-//   - the closing-setting critical section runs entirely first: tryTrack
-//     observes closing==true and returns false without ever calling
-//     wg.Add. No Add call exists to race Wait at all.
+// cl.mu used elsewhere to synchronize with cl.closing. Every Wait call is
+// preceded (happens-before) by a cl.mu critical section in which cl.closing
+// is already true -- either the Wait caller's own critical section (Close's
+// main branch, which sets closing, or its early-return branch, which
+// merely observes closing already true), or its spawner's critical section
+// (goFatal, onAttemptFailed, reportAndSchedule, each of which sets closing
+// under cl.mu and then calls scheduleCbChClose), with the go statement's
+// own happens-before carrying that true reading forward: scheduleCbChClose's
+// spawned goroutine never touches cl.mu itself but still calls wg.Wait()
+// only after closing is already true. closing is monotone: it
+// only ever moves false->true, always under cl.mu. Because cl.mu totally
+// orders tryTrack's critical section against every closing-true critical
+// section, setting or observing, exactly two outcomes are possible for
+// tryTrack, never a third:
+//   - tryTrack observes closing==false: by monotonicity, its critical
+//     section precedes every closing-true critical section in cl.mu's
+//     total order, so it calls wg.Add(1) and returns true, and that Add
+//     happens-before cl.mu's unlock here, which happens-before every such
+//     later critical section's lock, which happens-before that critical
+//     section's own Wait call (program order, or the go statement's
+//     happens-before for scheduleCbChClose). Add-before-Wait: safe.
+//   - tryTrack observes closing==true: it returns false without ever
+//     calling wg.Add. No Add call exists to race any Wait at all.
 //
 // Either way, wg.Add can never run concurrently with a wg.Wait() call on a
 // counter that could be zero (sync.WaitGroup's documented misuse case).
