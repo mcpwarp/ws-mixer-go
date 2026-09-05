@@ -510,11 +510,19 @@ func (cl *Client) scheduleCbChClose() {
 // is done first (the background loop keeps running regardless of ctx).
 func (cl *Client) Connect(ctx context.Context) error {
 	cl.startOnce.Do(func() {
-		cl.wg.Add(1)
-		go func() {
-			defer cl.wg.Done()
-			cl.attemptLoop(0, "initial")
-		}()
+		// tryTrack, not a bare wg.Add: this runs on the caller's own
+		// goroutine, which cl.wg is not already tracking, so an unguarded
+		// Add here could race a concurrent Close()'s wg.Wait() (see
+		// tryTrack's doc comment). If it returns false, the client is
+		// already closing -- Close's own finishFirstResult call (guaranteed
+		// on every path that sets closing) resolves firstResultCh below
+		// without any attemptLoop ever needing to run.
+		if cl.tryTrack() {
+			go func() {
+				defer cl.wg.Done()
+				cl.attemptLoop(0, "initial")
+			}()
+		}
 	})
 	select {
 	case <-cl.firstResultCh:
@@ -591,6 +599,17 @@ func (cl *Client) Stats() Stats {
 //     at all -- it is closed and discarded directly, exactly like
 //     attemptLoop's own closingNow check handles the same race a few lines
 //     earlier in the dial.
+//
+// One accepted asymmetry, not a bug: when a fatal dial failure lands while a
+// still-live predecessor conn exists (the drain-reconnect window above,
+// where cl.conn and cl.retiringConn point at the very same live conn until
+// the new dial actually lands), closeLiveConns closes that predecessor
+// silently and its termination is subsumed into the single fatal report for
+// the failed attempt rather than getting an OnDisconnect of its own --
+// deliberate, since OnConnect/OnDisconnect are meant to stay paired per conn
+// the caller actually saw come up, and the predecessor's own watchConn goes
+// silent (wasActive false) the moment cl.conn/cl.retiringConn stop pointing
+// at it.
 //
 // The failure mode this prevents: a conn that is live, but that nothing
 // currently tracks as cl.conn/cl.retiringConn/cl.gracefulConn, is an
@@ -678,6 +697,45 @@ func (cl *Client) Close(ctx context.Context) error {
 	// other, concurrent shutdown path got there first.
 	cl.closeCbCh()
 	return err
+}
+
+// tryTrack registers one more goroutine with cl.wg, guarded by the same
+// cl.mu that Close (and every fatal path: goFatal, onAttemptFailed,
+// reportAndSchedule) sets cl.closing under BEFORE ever calling wg.Wait --
+// either directly (Close) or via a spawned goroutine (scheduleCbChClose),
+// which is just as good: the go statement's own happens-before means
+// closing=true is still visible before that goroutine's wg.Wait() call.
+// Because cl.mu totally orders tryTrack's critical section against
+// whichever one of those sets closing, exactly two outcomes are possible,
+// never a third:
+//   - tryTrack's critical section runs entirely before the closing-setting
+//     one: it observes closing==false, calls wg.Add(1), and returns true --
+//     that Add happens-before cl.mu's unlock here, which happens-before the
+//     other side's lock, which happens-before its own wg.Wait() call
+//     (program order). Add-before-Wait: safe.
+//   - the closing-setting critical section runs entirely first: tryTrack
+//     observes closing==true and returns false without ever calling
+//     wg.Add. No Add call exists to race Wait at all.
+//
+// Either way, wg.Add can never run concurrently with a wg.Wait() call on a
+// counter that could be zero (sync.WaitGroup's documented misuse case).
+// Callers reachable from a goroutine cl.wg is not already tracking (Connect,
+// handleServerDrain -- both run on a goroutine with no outstanding,
+// not-yet-Done wg count of its own) must go through tryTrack instead of
+// calling cl.wg.Add directly, and must not proceed (spawn nothing, assume
+// nothing) when it returns false. A wg.Add called from within a goroutine
+// wg is already tracking (onAttemptSucceeded, reportAndSchedule) does not
+// need this: that goroutine's own outstanding Add guarantees the counter is
+// >=1 at the time, so it can never be the Add-when-zero case Wait cares
+// about, no matter how cl.closing is racing.
+func (cl *Client) tryTrack() bool {
+	cl.mu.Lock()
+	defer cl.mu.Unlock()
+	if cl.closing {
+		return false
+	}
+	cl.wg.Add(1)
+	return true
 }
 
 func (cl *Client) stopBackoff() { cl.closeChOnce.Do(func() { close(cl.closeCh) }) }
@@ -1196,7 +1254,20 @@ func (cl *Client) handleServerDrain(conn *Conn, d *DrainMsg) {
 	if d.RetryAfterMS != nil {
 		delay = time.Duration(*d.RetryAfterMS) * time.Millisecond
 	}
-	cl.wg.Add(1)
+	// tryTrack, not a bare wg.Add: this runs on the conn's own
+	// delivery-loop goroutine, which cl.wg is not already tracking, so an
+	// unguarded Add here could race a concurrent Close()'s wg.Wait() (see
+	// tryTrack's doc comment). If it returns false, the client is already
+	// closing and no reconnect is wanted -- bail without spawning. conn
+	// itself is not orphaned: it is exactly the cl.conn/cl.retiringConn this
+	// function just set a few lines up (both point at the same live conn in
+	// this window -- see the ownership invariant above Close), so Close (or
+	// whichever fatal path won the race to set closing) already has it as
+	// either its gracefulConn or its retiring snapshot and will close it
+	// itself.
+	if !cl.tryTrack() {
+		return
+	}
 	go func() {
 		defer cl.wg.Done()
 		cl.attemptLoop(delay, "drain")
