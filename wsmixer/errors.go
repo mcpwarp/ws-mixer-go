@@ -25,33 +25,35 @@ const (
 	UnauthorizedCode  ErrorCode = 0x0b
 	GoingAwayCode     ErrorCode = 0x0c
 	KeepaliveTimeout  ErrorCode = 0x0d
-	// 0x0e is reserved (left free for an application-level close reason, see
-	// OVERVIEW.md section 2.8's error code table) and intentionally has no
-	// constant here: it is unrecognized like any other unassigned code, and
-	// String() below already renders every unrecognized code as INTERNAL_ERROR.
+	// ApplicationCloseCode: the application layer above ws-mixer closed the
+	// connection for a reason ws-mixer does not interpret (OVERVIEW.md
+	// section 2.8's error code table). This package never produces it itself
+	// -- it is sent only by an application, on either side, via Conn.Close.
+	ApplicationCloseCode ErrorCode = 0x0e
 )
 
 var errorCodeNames = map[ErrorCode]string{
-	NoError:           "NO_ERROR",
-	ProtocolErrorCode: "PROTOCOL_ERROR",
-	InternalErrorCode: "INTERNAL_ERROR",
-	FlowControlError:  "FLOW_CONTROL_ERROR",
-	FrameSizeError:    "FRAME_SIZE_ERROR",
-	StreamClosedCode:  "STREAM_CLOSED",
-	RefusedStreamCode: "REFUSED_STREAM",
-	CancelCode:        "CANCEL",
-	StreamLimitCode:   "STREAM_LIMIT",
-	EnhanceYourCalm:   "ENHANCE_YOUR_CALM",
-	UnsupportedCode:   "UNSUPPORTED",
-	UnauthorizedCode:  "UNAUTHORIZED",
-	GoingAwayCode:     "GOING_AWAY",
-	KeepaliveTimeout:  "KEEPALIVE_TIMEOUT",
+	NoError:              "NO_ERROR",
+	ProtocolErrorCode:    "PROTOCOL_ERROR",
+	InternalErrorCode:    "INTERNAL_ERROR",
+	FlowControlError:     "FLOW_CONTROL_ERROR",
+	FrameSizeError:       "FRAME_SIZE_ERROR",
+	StreamClosedCode:     "STREAM_CLOSED",
+	RefusedStreamCode:    "REFUSED_STREAM",
+	CancelCode:           "CANCEL",
+	StreamLimitCode:      "STREAM_LIMIT",
+	EnhanceYourCalm:      "ENHANCE_YOUR_CALM",
+	UnsupportedCode:      "UNSUPPORTED",
+	UnauthorizedCode:     "UNAUTHORIZED",
+	GoingAwayCode:        "GOING_AWAY",
+	KeepaliveTimeout:     "KEEPALIVE_TIMEOUT",
+	ApplicationCloseCode: "APPLICATION_CLOSE",
 }
 
 // String renders the error code's wire name, e.g. "FLOW_CONTROL_ERROR".
-// An unrecognized code (including the reserved 0x0e and anything >= 0x1000_0000)
-// renders as "INTERNAL_ERROR", matching the "unknown codes MUST NOT trigger
-// special behaviour" rule.
+// An unrecognized code (anything not in the table above, including any code
+// >= 0x1000_0000) renders as "INTERNAL_ERROR", matching the "unknown codes
+// MUST NOT trigger special behaviour" rule.
 func (c ErrorCode) String() string {
 	if name, ok := errorCodeNames[c]; ok {
 		return name

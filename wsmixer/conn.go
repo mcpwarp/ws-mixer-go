@@ -209,6 +209,15 @@ type Conn struct {
 	lastPongAt         time.Time
 	err                error
 	running            bool // true once Run() has started the writer loop
+	// preRunClosed is set, in the same c.mu section that decides running's
+	// pre-Run branch, by whichever of fail/Close gets there first while
+	// running is still false. Run() checks it under the same lock as its own
+	// running=true write, so "decide running and claim the conn" is one
+	// atomic step both sides agree on: a Close that observes running==false
+	// is guaranteed a Run() racing it will see preRunClosed and start no
+	// loops at all, rather than the two of them draining/writing the same
+	// controlQueue at once.
+	preRunClosed bool
 
 	closeOnce sync.Once
 	closed    chan struct{}
@@ -256,6 +265,29 @@ type Conn struct {
 	// reset/DNS failure" (WIRE.md section 2.9: normal backoff) apart from a
 	// clean-looking close that carries no ws-mixer error either.
 	observedCloseCode int
+
+	// observedCloseReason is the raw WebSocket close-frame reason string that
+	// came with observedCloseCode (websocket.CloseError's Reason, extracted
+	// alongside the code in handleReadError), independent of whether a
+	// ws-mixer *ConnError was also involved. "" when no close frame was
+	// observed, when the peer sent an empty reason, or when this side
+	// initiated the close itself (localCloseInitiated) -- when this side
+	// calls c.ws.Close, the peer's own coder/websocket echoes the exact
+	// code/reason it just received back to us verbatim, and the readerLoop's
+	// own blocked Read (already holding coder/websocket's read lock) parses
+	// that echo in its normal control-frame handling (read.go's
+	// handleControl, not anything close.go does) and returns it as a
+	// CloseError -- this side's own outgoing text, which must never be
+	// mistaken for something the peer said.
+	observedCloseReason string
+
+	// localCloseInitiated records that THIS side called c.ws.Close with a
+	// reason (fail, Close, handlePeerError -- every site that passes a
+	// non-empty reason to c.ws.Close), set under c.mu in the same critical
+	// section that decides the rest of the shutdown. handleReadError checks
+	// it before recording observedCloseReason: PeerCloseReason must only
+	// ever be a reason the peer actually sent, never an echo of our own.
+	localCloseInitiated bool
 }
 
 // handlers holds the current OnStream/OnApp/OnDrain callbacks as one
@@ -351,10 +383,31 @@ func (c *Conn) PeerCloseCode() int {
 	return c.observedCloseCode
 }
 
+// PeerCloseReason returns the raw WebSocket close-frame reason string this
+// side actually observed when the transport ended, or "" if none was
+// observed (an abnormal closure), the peer sent an empty reason, or this
+// side initiated the close itself. See the field comment on
+// Conn.observedCloseReason.
+func (c *Conn) PeerCloseReason() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.observedCloseReason
+}
+
 // Run starts the connection's background goroutines. Must be called exactly
-// once, after the handshake has completed.
+// once, after the handshake has completed. A Conn already closed by a
+// pre-Run fail/Close (preRunClosed) starts nothing at all: the goroutine
+// that closed it has already run the WS close handshake itself (coder/
+// websocket's Close does its own internal read for the peer's close-frame
+// reply, with no reader loop required -- see close.go's waitCloseHandshake),
+// c.closed will still close exactly as it would have, and Done() still
+// fires -- Run just has no work left to start.
 func (c *Conn) Run() {
 	c.mu.Lock()
+	if c.preRunClosed {
+		c.mu.Unlock()
+		return
+	}
 	c.running = true
 	c.mu.Unlock()
 	go c.writerLoop()
@@ -555,14 +608,37 @@ func (c *Conn) writeMessage(b []byte) error {
 // --- connection-fatal shutdown -----------------------------------------------
 
 // writeControlNow writes a pre-encoded stream-0 frame synchronously on the
-// caller's goroutine. It exists for the window before run() has started the
-// writer loop: a handshake failure in that window has nobody reading
-// controlQueue, so enqueueing there silently drops the error{} frame. Once
-// running, all writes must go through the writer loop's queues instead.
-func (c *Conn) writeControlNow(b []byte) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	_ = c.ws.Write(ctx, websocket.MessageBinary, b)
+// caller's goroutine, bounded by ctx, and reports any write error so the
+// caller can stop after the first one instead of hammering a dead socket.
+// It exists for the window before Run has started the writer loop: a
+// pre-run fail() or Close() in that window has nobody reading controlQueue,
+// so enqueueing there would silently drop the frame. The single-writer
+// invariant this depends on -- exactly one of {this synchronous path, the
+// writer loop} ever writes to c.ws for a given Conn -- is guaranteed by
+// fail/Close and Run agreeing, under the same c.mu critical section, on
+// which one it is: fail/Close set preRunClosed when they observe running
+// still false, and Run checks preRunClosed before it ever sets running or
+// starts the writer loop, so the two can never both decide they own the
+// socket.
+func (c *Conn) writeControlNow(ctx context.Context, b []byte) error {
+	return c.ws.Write(ctx, websocket.MessageBinary, b)
+}
+
+// wsCloseCode maps an ErrorCode's CloseCode() to the code actually sent on
+// the wire: legal WS close codes (1000, or 4000-4999) pass through
+// unchanged. Anything else -- an application error code >= 0x1000_0000,
+// which stays valid for a stream RESET (errors.go) but was never a legal
+// connection-close code to begin with -- is clamped to InternalErrorCode's
+// mapped code (4002) instead, since coder/websocket's Close sends no close
+// frame at all for an invalid code and just aborts the transport (verified
+// in its close.go): the peer would otherwise see a bare abnormal closure
+// and nothing else, exactly the failure this whole file exists to prevent.
+// error{} carries the caller's real code independently either way.
+func wsCloseCode(code int) websocket.StatusCode {
+	if code == 1000 || (code >= 4000 && code <= 4999) {
+		return websocket.StatusCode(code)
+	}
+	return websocket.StatusCode(InternalErrorCode.CloseCode())
 }
 
 // fail is the connection-error path: send error{} on stream 0, then close the
@@ -571,7 +647,11 @@ func (c *Conn) fail(e *ConnError) {
 	c.closeOnce.Do(func() {
 		c.mu.Lock()
 		c.err = e
+		c.localCloseInitiated = true
 		running := c.running
+		if !running {
+			c.preRunClosed = true
+		}
 		c.mu.Unlock()
 		c.opts.Metrics.ProtocolViolation(c.session, e.Code.String())
 
@@ -593,7 +673,9 @@ func (c *Conn) fail(e *ConnError) {
 			} else {
 				// No writer loop yet (a pre-run handshake failure): write the
 				// error{} frame synchronously, right here, or it is lost.
-				c.writeControlNow(EncodeData(0, b))
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				_ = c.writeControlNow(ctx, EncodeData(0, b))
+				cancel()
 			}
 		}
 		go func() {
@@ -604,29 +686,91 @@ func (c *Conn) fail(e *ConnError) {
 				// (OVERVIEW.md section 2.8).
 				time.Sleep(50 * time.Millisecond)
 			}
-			_ = c.ws.Close(websocket.StatusCode(e.CloseCode()), truncateCloseReason(e.Message))
+			_ = c.ws.Close(wsCloseCode(e.CloseCode()), truncateCloseReason(e.Message))
 			close(c.closed)
 		}()
 	})
 }
 
-// Close ends the connection gracefully with the given error code and message.
+// Close ends the connection gracefully with the given error code and
+// message: error{} on stream 0, then WS close at 4000+code, mirroring fail's
+// three steps. Before Run has started the writer loop (e.g. inside a
+// server's OnConn callback, refusing a connection before it is ever run),
+// there is nobody to drain controlQueue: this drains the CONTROL frames
+// already queued there synchronously instead, in order, then writes error{}
+// last, all against one shared deadline so a dead socket can't block the
+// caller far longer than that; a write failure stops the flush and goes
+// straight to the WS close below. After Run, error{} is just handed to the
+// writer loop's queue with the same best-effort 50ms flush window fail()
+// uses. Stream DATA queued before Run (a server's OnConn can legally
+// OpenStream+Write on its own not-yet-running Conn) is not silently lost
+// either, just for a different reason: Stream.WriteContext blocks on the
+// chunk being sent or the conn closing, so a write interrupted by this Close
+// returns the conn's own error, never a false success.
+//
+// An application closing for a reason ws-mixer itself does not interpret
+// should use ApplicationCloseCode. Any code > 999 (including every
+// application code >= 0x1000_0000, which stays valid for a stream RESET --
+// errors.go) maps outside the legal WS close-code range (1000, or
+// 4000-4999) and so cannot be expressed as one: the WS close this method
+// sends is clamped to InternalErrorCode's code (4002) in that case, while
+// error{} still carries the caller's real code.
 func (c *Conn) Close(code uint32, msg string) error {
 	c.closeOnce.Do(func() {
 		ec := ErrorCode(code)
 		c.mu.Lock()
 		c.err = &ConnError{Code: ec, Message: msg}
+		c.localCloseInitiated = true
+		running := c.running
+		if !running {
+			c.preRunClosed = true
+		}
 		c.mu.Unlock()
 		errMsg := &ErrorMsg{T: "error", Code: code, Message: msg}
-		if b, merr := json.Marshal(errMsg); merr == nil {
-			select {
-			case c.controlQueue <- EncodeData(0, b):
-			default:
+		b, merr := json.Marshal(errMsg)
+		if running {
+			if merr == nil {
+				select {
+				case c.controlQueue <- EncodeData(0, b):
+				default:
+				}
 			}
+		} else {
+			// No writer loop yet: flush at most the n control frames already
+			// queued when Close was called (e.g. SendApp called right before
+			// it) -- not whatever a racing producer keeps adding -- in
+			// order, then write error{} last, or it is lost. One 2s deadline
+			// covers the whole flush, not 2s per frame, and the first write
+			// failure ends it immediately: there is nothing useful left to
+			// attempt on a socket that just failed to write.
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			ok := true
+		drain:
+			for n := len(c.controlQueue); n > 0; n-- {
+				select {
+				case queued := <-c.controlQueue:
+					if c.writeControlNow(ctx, queued) != nil {
+						ok = false
+						break drain
+					}
+				default:
+					// Queue emptied early (a concurrent producer may still add
+					// more; the snapshot above deliberately doesn't wait for
+					// it) -- not a write failure, so error{} below must still
+					// be sent.
+					break drain
+				}
+			}
+			if ok && merr == nil {
+				_ = c.writeControlNow(ctx, EncodeData(0, b))
+			}
+			cancel()
 		}
 		go func() {
-			time.Sleep(50 * time.Millisecond)
-			_ = c.ws.Close(websocket.StatusCode(ec.CloseCode()), truncateCloseReason(msg))
+			if running {
+				time.Sleep(50 * time.Millisecond)
+			}
+			_ = c.ws.Close(wsCloseCode(ec.CloseCode()), truncateCloseReason(msg))
 			close(c.closed)
 		}()
 	})

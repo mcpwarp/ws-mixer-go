@@ -695,7 +695,7 @@ func handleCommand(st *adapterState, name string, seq float64, cmd map[string]an
 				c.OnDrain(func(d *wsmixer.DrainMsg) {
 					emit(drainEvent(d))
 				})
-				go watchDisconnect(st, c)
+				go watchDisconnect(st, c, false)
 			},
 		})
 		mux := http.NewServeMux()
@@ -710,13 +710,28 @@ func handleCommand(st *adapterState, name string, seq float64, cmd map[string]an
 		url, _ := cmd["url"].(string)
 		token, _ := cmd["token"].(string)
 		reconnectEnabled := false
+		var reconnectBase, reconnectCap time.Duration
 		if rc, ok := cmd["reconnect"].(map[string]any); ok {
 			if enabled, _ := rc["enabled"].(bool); enabled {
 				reconnectEnabled = true
 			}
+			// baseMs/capMs (CONFORMANCE.md's connect command, alongside the
+			// existing enabled/maxAttempts): optional ms overrides for the
+			// pair scenarios that need the backoff ladder fast (e.g.
+			// application_close's 4014 now starts at cap -- see
+			// client_reconnect.go's watchConn -- and the SDK default cap is
+			// 60s, far past the runner's fixed 20s await timeout). Absent or
+			// <=0 leaves the SDK's own defaults (setDefaults in
+			// client_reconnect.go) alone.
+			if ms, ok := rc["baseMs"].(float64); ok && ms > 0 {
+				reconnectBase = time.Duration(ms) * time.Millisecond
+			}
+			if ms, ok := rc["capMs"].(float64); ok && ms > 0 {
+				reconnectCap = time.Duration(ms) * time.Millisecond
+			}
 		}
 		if reconnectEnabled {
-			go connectReconnecting(st, seq, url, token)
+			go connectReconnecting(st, seq, url, token, reconnectBase, reconnectCap)
 			return
 		}
 		go func() {
@@ -749,7 +764,7 @@ func handleCommand(st *adapterState, name string, seq float64, cmd map[string]an
 				"session": c.Session(),
 				"welcome": map[string]any{"session": c.Session()},
 			})
-			go watchDisconnect(st, c)
+			go watchDisconnect(st, c, true)
 		}()
 
 	case "open_stream":
@@ -998,15 +1013,18 @@ func waitForLateStreamReset(st *adapterState, s *wsmixer.Stream) {
 }
 
 // connectReconnecting runs the "connect" command's connect.reconnect.enabled
-// path (docs/CONFORMANCE.md section 1.1, only the drain_reconnect scenario
-// sets this): built on wsmixer.Client, the Go SDK's own reconnecting client
-// (client_reconnect.go), instead of the single-attempt wsmixer.Dial the
-// plain "connect" path above uses. OnConnect fires on every successful
-// welcome, including reconnects; the first one is reported as the ordinary
-// "connected" ack/event (matching the plain path's shape), and every one
-// after that as `reconnected` (coordination contract (b), mirrors the JS
-// adapter's own onConnect handling in adapter.mjs).
-func connectReconnecting(st *adapterState, seq float64, url, token string) {
+// path (docs/CONFORMANCE.md section 1.1, only the drain_reconnect and
+// application_close scenarios set this): built on wsmixer.Client, the Go
+// SDK's own reconnecting client (client_reconnect.go), instead of the
+// single-attempt wsmixer.Dial the plain "connect" path above uses. OnConnect
+// fires on every successful welcome, including reconnects; the first one is
+// reported as the ordinary "connected" ack/event (matching the plain path's
+// shape), and every one after that as `reconnected` (coordination contract
+// (b), mirrors the JS adapter's own onConnect handling in adapter.mjs).
+// reconnectBase/reconnectCap, when non-zero, override wsmixer.Client's
+// ReconnectOptions.Base/Cap defaults (see the "connect" case's baseMs/capMs
+// parsing) -- zero leaves the SDK's own defaults alone.
+func connectReconnecting(st *adapterState, seq float64, url, token string, reconnectBase, reconnectCap time.Duration) {
 	var connectedOnce atomic.Bool
 	// cl is referenced from inside its own ClientConfig (OnStream), so it
 	// has to be declared before the wsmixer.NewClient call that assigns it.
@@ -1024,8 +1042,9 @@ func connectReconnecting(st *adapterState, seq float64, url, token string) {
 	firstConnCh := make(chan *wsmixer.Conn, 1)
 
 	cl = wsmixer.NewClient(url, wsmixer.StaticToken(token), wsmixer.ClientConfig{
-		Options: st.options(),
-		Agent:   wsmixer.AgentInfo{SDK: st.sdk + "-conformance", SDKVersion: st.sdkVersion},
+		Options:   st.options(),
+		Agent:     wsmixer.AgentInfo{SDK: st.sdk + "-conformance", SDKVersion: st.sdkVersion},
+		Reconnect: wsmixer.ReconnectOptions{Base: reconnectBase, Cap: reconnectCap},
 		OnStream: func(s *wsmixer.Stream) {
 			// nit 4: s.Conn() is the conn this specific stream was opened
 			// on, fixed at construction -- unlike cl.Conn(), which reads
@@ -1070,13 +1089,16 @@ func connectReconnecting(st *adapterState, seq float64, url, token string) {
 			}
 		},
 		OnDisconnect: func(r wsmixer.DisconnectReason) {
-			e := map[string]any{"event": "disconnected", "message": r.Message, "fatal": r.Fatal}
+			e := map[string]any{"event": "disconnected", "message": r.Message, "fatal": r.Fatal, "phase": string(r.Phase)}
 			if r.WSCode != 0 {
 				e["ws_code"] = r.WSCode
 			}
 			if r.HasErrorCode {
 				e["error_code"] = uint32(r.ErrorCode)
 				e["error_name"] = r.ErrorName
+			}
+			if r.CloseReason != "" {
+				e["close_reason"] = r.CloseReason
 			}
 			emit(e)
 		},
@@ -1103,24 +1125,48 @@ func connectReconnecting(st *adapterState, seq float64, url, token string) {
 	})
 }
 
-func watchDisconnect(st *adapterState, c *wsmixer.Conn) {
+// watchDisconnect is spawned for both roles -- the server's own OnConn (~line
+// 698) and a plain, non-reconnecting client Dial (~line 752) -- which need
+// different "fatal" rules: CONFORMANCE.md section 6 step 5 requires a
+// client-role adapter's fatal to match CLIENT-SDK.md's fatal set (4012/4013/
+// 4014 are all fatal:false), where a bare "error code != NO_ERROR" would
+// wrongly mark them fatal; a server-role adapter has no reconnect policy to
+// be fatal *to*, so its looser rule (any non-NO_ERROR code) is correct as
+// documented in the same section. clientRole picks between them.
+func watchDisconnect(st *adapterState, c *wsmixer.Conn, clientRole bool) {
 	<-c.Done()
 	// The connection itself is gone: none of its still-open streams will
 	// ever reach a graceful terminal state on their own, so tear them all
 	// down here rather than leaking their FIFO worker goroutines forever.
 	st.teardownAllStreams(c)
 	err := c.Err()
-	e := map[string]any{"fatal": false}
+	// watchDisconnect only ever watches a plain-Dial'd Conn that already
+	// completed its handshake (both call sites start it once Dial itself
+	// returned successfully), so phase is always "connected" here -- there
+	// is no reconnect state machine to have observed a dial/handshake
+	// failure instead.
+	e := map[string]any{"fatal": false, "phase": string(wsmixer.PhaseConnected)}
 	if ce, ok := err.(*wsmixer.ConnError); ok {
 		e["error_code"] = uint32(ce.Code)
 		e["error_name"] = ce.Code.String()
 		e["ws_code"] = ce.CloseCode()
 		e["message"] = ce.Message
-		e["fatal"] = ce.Code != wsmixer.NoError
+		if clientRole {
+			// CLIENT-SDK.md's fatal set, close-code form: 4010/4011 (the
+			// latter only after the one refresh-retry has already failed --
+			// irrelevant here, this Conn has no retry of its own). 4012/
+			// 4013/4014 are explicitly fatal:false.
+			e["fatal"] = ce.CloseCode() == 4010 || ce.CloseCode() == 4011
+		} else {
+			e["fatal"] = ce.Code != wsmixer.NoError
+		}
 	} else if err != nil {
 		e["message"] = err.Error()
 	} else {
 		e["message"] = "closed"
+	}
+	if reason := c.PeerCloseReason(); reason != "" {
+		e["close_reason"] = reason
 	}
 	e["event"] = "disconnected"
 	emit(e)

@@ -243,9 +243,13 @@ func newSessionID() string {
 	return strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(buf[:]))
 }
 
-// CloseCode returns the WebSocket close code the connection ended (or will
-// end) with, derived from Err(), or 1000 (normal closure) if there is no
-// *ConnError to derive it from.
+// CloseCode returns the WebSocket close code derived from Err() --
+// 4000+error_code, or 1000 when there is no *ConnError. For an error code
+// that maps outside the legal WS close-code range (errors.go, WIRE.md
+// section 2.8), this is the code error{} actually carried, not the clamped
+// code the WS close frame itself used (wsCloseCode, conn.go) -- both peers
+// derive this same semantic code from error{}, so it is the right number to
+// report even when the close frame on the wire said something else.
 func (c *Conn) CloseCode() int {
 	if ce, ok := c.Err().(*ConnError); ok {
 		return ce.CloseCode()

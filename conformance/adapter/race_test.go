@@ -885,3 +885,72 @@ func TestConcurrentTeardownVsWriteRace(t *testing.T) {
 		}
 	}
 }
+
+// TestConnectHonoursReconnectBaseCapMs is a regression test for the
+// "connect" command's optional reconnect.baseMs/reconnect.capMs fields
+// (docs/CONFORMANCE.md's connect command, alongside the existing enabled):
+// they exist because 4014 (APPLICATION_CLOSE) now starts its backoff at cap
+// (client_reconnect.go's watchConn), and the SDK's default cap is 60s --
+// the application_close pair scenario pins baseMs:50/capMs:300 so its
+// `reconnected` await doesn't routinely exceed the runner's fixed 20s
+// per-step timeout. Drives the real "connect" command against a real
+// server that refuses every connection with APPLICATION_CLOSE, and asserts
+// a second connection is accepted within a few seconds -- with the SDK's
+// unoverridden 60s default cap, random(0,60s) landing that fast would be
+// exceedingly unlikely, so this is effectively asserting the override took
+// effect, not just that reconnect happened at all.
+func TestConnectHonoursReconnectBaseCapMs(t *testing.T) {
+	st := newState(testAcceptBackend{})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	connCh := make(chan *wsmixer.Conn, 8)
+	listener := testAcceptBackend{}.Handler(ServerConfig{
+		Options: st.options(),
+		Authenticate: func(_ context.Context, h *wsmixer.Hello) (wsmixer.WelcomeMeta, error) {
+			return wsmixer.WelcomeMeta{}, nil
+		},
+		OnConn: func(c *wsmixer.Conn) {
+			select {
+			case connCh <- c:
+			default:
+			}
+			go func() { _ = c.Close(uint32(wsmixer.ApplicationCloseCode), "over cap") }()
+		},
+	})
+	mux := http.NewServeMux()
+	mux.Handle("/v1/tunnel", listener)
+	srv := &http.Server{Handler: mux}
+	go func() { _ = srv.Serve(ln) }()
+	defer srv.Close()
+
+	handleCommand(st, "connect", 1, map[string]any{
+		"url":   "ws://" + ln.Addr().String() + "/v1/tunnel",
+		"token": "tok",
+		"reconnect": map[string]any{
+			"enabled": true,
+			"baseMs":  float64(50),
+			"capMs":   float64(300),
+		},
+	})
+	defer func() {
+		if cl := st.getClient(); cl != nil {
+			_ = cl.Close(context.Background())
+		}
+	}()
+
+	deadline := time.After(3 * time.Second)
+	seen := 0
+	for seen < 2 {
+		select {
+		case <-connCh:
+			seen++
+		case <-deadline:
+			t.Fatalf("only %d connection(s) accepted within 3s; reconnect.baseMs/capMs was not honoured", seen)
+		}
+	}
+}

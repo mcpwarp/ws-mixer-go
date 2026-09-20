@@ -7,6 +7,7 @@ package wsmixer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -47,8 +48,22 @@ func (c *Conn) readerLoop() {
 
 func (c *Conn) handleReadError(err error) {
 	code := websocket.CloseStatus(err)
+	var ce websocket.CloseError
+	reason := ""
+	if errors.As(err, &ce) {
+		reason = ce.Reason
+	}
 	c.mu.Lock()
 	c.observedCloseCode = int(code)
+	// A self-initiated close (fail/Close/handlePeerError) can hand this read
+	// back a CloseError carrying this side's own outgoing code/reason: the
+	// peer echoes the code/reason it just received verbatim, and this
+	// blocked Read (which already holds coder/websocket's read lock) parses
+	// that echo the normal way and returns it here -- so only ever record it
+	// as the peer's reason when this side did not initiate the close itself.
+	if !c.localCloseInitiated {
+		c.observedCloseReason = reason
+	}
 	if code != -1 && c.err == nil {
 		c.err = fmt.Errorf("ws-mixer: peer closed with code %d", code)
 	}
@@ -423,12 +438,19 @@ func (c *Conn) handlePeerError(m *ErrorMsg) {
 	if c.err == nil {
 		c.err = &ConnError{Code: ErrorCode(m.Code), Message: m.Message}
 	}
+	// This side is about to call c.ws.Close itself below, with a reason
+	// derived from the peer's error{} rather than anything the peer's own
+	// close frame carries -- see handleReadError's localCloseInitiated check.
+	c.localCloseInitiated = true
 	c.mu.Unlock()
 	// A peer that receives error MUST NOT reply with another error; just
-	// close (OVERVIEW.md section 2.7).
+	// close (OVERVIEW.md section 2.7). m.Code is peer-controlled and only
+	// bounded to uint32 by the wire format (control.go), so it can map
+	// outside the legal WS close-code range just like a caller's own code
+	// to fail/Close -- wsCloseCode clamps it the same way.
 	c.closeOnce.Do(func() {
 		go func() {
-			_ = c.ws.Close(websocket.StatusCode(ErrorCode(m.Code).CloseCode()), truncateCloseReason(m.Message))
+			_ = c.ws.Close(wsCloseCode(ErrorCode(m.Code).CloseCode()), truncateCloseReason(m.Message))
 			close(c.closed)
 		}()
 	})

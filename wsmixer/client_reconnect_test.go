@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/coder/websocket"
 )
 
 // --- pure unit tests: jitter math and error classification -----------------
@@ -328,6 +330,97 @@ func TestClientSecond401Fatal(t *testing.T) {
 	}
 }
 
+// TestClientHandshakePhaseBareClose4010Fatal: a peer that closes 4010
+// (UNSUPPORTED) before ever sending welcome, with no preceding ws-mixer
+// error{} frame -- an SDK bug on the peer's part, but WIRE.md section 2.9's
+// fatal set is keyed on the close code, not on whether error{} happened to
+// precede it. No retry mechanism applies to 4010 (unlike 4011's one-time
+// refresh-retry below): the very first attempt is fatal.
+func TestClientHandshakePhaseBareClose4010Fatal(t *testing.T) {
+	_, url := startTestServer(t, testAcceptHandler{OnRawConn: func(ws *websocket.Conn) {
+		_ = ws.Close(4010, "unsupported protocol version")
+	}})
+
+	rec := newDisconnectRecorder()
+	fa := &fakeAfter{}
+	cl := NewClient(url, StaticToken("tok"), ClientConfig{
+		Reconnect:    testReconnectOptions(fa, 0),
+		OnDisconnect: rec.onDisconnect,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := cl.Connect(ctx); err == nil {
+		t.Fatal("Connect should have failed on a fatal 4010 close")
+	}
+
+	r := rec.waitNext(t)
+	if r.Phase != PhaseHandshake {
+		t.Errorf("Phase = %v, want handshake", r.Phase)
+	}
+	if r.WSCode != 4010 {
+		t.Errorf("WSCode = %d, want 4010", r.WSCode)
+	}
+	if !r.Fatal {
+		t.Error("Fatal = false, want true")
+	}
+	if cl.State() != "closed" {
+		t.Errorf("State() = %s, want closed", cl.State())
+	}
+}
+
+// TestClientHandshakePhaseBareClose4011OneRetryThenFatal: a peer that closes
+// 4011 (UNAUTHORIZED) before ever sending welcome joins the same one-time
+// immediate refresh-retry as an HTTP 401 or a *ConnError{UnauthorizedCode}
+// (isUnauthorized) -- the first failure is silent (no report, no backoff,
+// straight to a second attempt with a freshly re-fetched token), and only a
+// second 4011 is fatal. Mirrors TestClientSecond401Fatal exactly, one layer
+// lower on the wire.
+func TestClientHandshakePhaseBareClose4011OneRetryThenFatal(t *testing.T) {
+	var accepts atomic.Int32
+	_, url := startTestServer(t, testAcceptHandler{OnRawConn: func(ws *websocket.Conn) {
+		accepts.Add(1)
+		_ = ws.Close(4011, "reauth required")
+	}})
+
+	rec := newDisconnectRecorder()
+	fa := &fakeAfter{}
+	var tokenCalls atomic.Int32
+	// A real TokenProvider, not StaticToken: nit 2 gates the one-time
+	// immediate refresh-retry on isRealProvider, exactly like
+	// TestClientSecond401Fatal.
+	token := TokenProvider(func(context.Context) (string, error) {
+		tokenCalls.Add(1)
+		return "tok", nil
+	})
+	cl := NewClient(url, token, ClientConfig{
+		Reconnect:    testReconnectOptions(fa, 0),
+		OnDisconnect: rec.onDisconnect,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := cl.Connect(ctx); err == nil {
+		t.Fatal("Connect should have failed after the one-time 4011 refresh-retry also failed")
+	}
+
+	if got := accepts.Load(); got != 2 {
+		t.Errorf("server accepted %d connections, want 2 (initial + one refresh retry)", got)
+	}
+	if got := tokenCalls.Load(); got != 2 {
+		t.Errorf("token provider called %d times, want 2", got)
+	}
+
+	r := rec.waitNext(t)
+	if r.Phase != PhaseHandshake {
+		t.Errorf("Phase = %v, want handshake", r.Phase)
+	}
+	if r.WSCode != 4011 {
+		t.Errorf("WSCode = %d, want 4011", r.WSCode)
+	}
+	if !r.Fatal {
+		t.Error("Fatal = false, want true")
+	}
+}
+
 func TestClientProviderErrorFatal(t *testing.T) {
 	url, _ := newFlakyServer(t, nil, testAcceptHandler{})
 	boom := errors.New("provider exploded")
@@ -489,6 +582,93 @@ func TestClientEnhanceYourCalmStartsAtCap(t *testing.T) {
 	want := time.Duration(0.5 * float64(time.Second)) // rand=0.5, cap=1s
 	if calls[0] != want {
 		t.Errorf("4009 delay = %v, want exactly %v (jitter(cap), no retry_after_ms present)", calls[0], want)
+	}
+}
+
+// TestClientApplicationCloseStartsAtCap: WIRE.md section 2.9 gives 4014
+// (APPLICATION_CLOSE) the same "start at cap" treatment as 4009 -- both are
+// deliberate post-welcome refusals (the app accepted, then refused, e.g. a
+// per-account connection cap) made right after onAttemptSucceeded reset
+// attempt to 0, so ordinary fullJitter(attempt) would never climb past its
+// lowest rung and a refused client would redial about once a second
+// forever. This variant is the error{14}+close shape (Conn.Close).
+func TestClientApplicationCloseStartsAtCap(t *testing.T) {
+	_, url := startTestServer(t, testAcceptHandler{OnConn: func(c *Conn) {
+		go func() { _ = c.Close(uint32(ApplicationCloseCode), "CONNECTION_LIMIT: test") }()
+	}})
+	rec := newDisconnectRecorder()
+	fa := &fakeAfter{}
+	rc := testReconnectOptions(fa, 0.5)
+	rc.MaxAttempts = 1 // one failure is all this test needs; non-fatal codes would otherwise reconnect forever
+	cl := NewClient(url, StaticToken("tok"), ClientConfig{
+		Reconnect:    rc,
+		OnDisconnect: rec.onDisconnect,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := cl.Connect(ctx); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer cl.Close(context.Background())
+
+	r := rec.waitNext(t)
+	if r.WSCode != 4014 {
+		t.Fatalf("reason.WSCode = %d, want 4014", r.WSCode)
+	}
+	if r.Fatal {
+		t.Errorf("reason.Fatal = true, want false")
+	}
+	calls := waitForCalls(t, fa, 1)
+	want := time.Duration(0.5 * float64(time.Second)) // rand=0.5, cap=1s
+	if calls[0] != want {
+		t.Errorf("4014 delay = %v, want exactly %v (jitter(cap), not fullJitter)", calls[0], want)
+	}
+}
+
+// TestClientApplicationCloseBareStartsAtCap: the bare-close variant of the
+// same case -- a peer that sends a raw WS close 4014 with no preceding
+// error{} (effectiveWSCode falls back to conn.PeerCloseCode() and reaches
+// the same switch case) must schedule the same jitter(cap) delay, not
+// fullJitter.
+func TestClientApplicationCloseBareStartsAtCap(t *testing.T) {
+	var raw atomic.Pointer[websocket.Conn]
+	_, url := startTestServer(t, testAcceptHandler{OnRawConn: func(ws *websocket.Conn) { raw.Store(ws) }})
+
+	rec := newDisconnectRecorder()
+	fa := &fakeAfter{}
+	rc := testReconnectOptions(fa, 0.5)
+	rc.MaxAttempts = 1
+	cl := NewClient(url, StaticToken("tok"), ClientConfig{
+		Reconnect:    rc,
+		OnDisconnect: rec.onDisconnect,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := cl.Connect(ctx); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer cl.Close(context.Background())
+
+	ws := raw.Load()
+	if ws == nil {
+		t.Fatal("server never captured the raw *websocket.Conn")
+	}
+	go func() { _ = ws.Close(4014, "CONNECTION_LIMIT: test") }()
+
+	r := rec.waitNext(t)
+	if r.WSCode != 4014 {
+		t.Fatalf("reason.WSCode = %d, want 4014", r.WSCode)
+	}
+	if r.HasErrorCode {
+		t.Errorf("reason.HasErrorCode = true, want false: no error{} frame preceded the close")
+	}
+	if r.Fatal {
+		t.Errorf("reason.Fatal = true, want false")
+	}
+	calls := waitForCalls(t, fa, 1)
+	want := time.Duration(0.5 * float64(time.Second)) // rand=0.5, cap=1s
+	if calls[0] != want {
+		t.Errorf("bare 4014 delay = %v, want exactly %v (jitter(cap), not fullJitter)", calls[0], want)
 	}
 }
 

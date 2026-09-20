@@ -1,8 +1,8 @@
 {
-  "comment": "Per-repo floor for ws-mixer-go's own conformance run (docs/MIGRATION.md section 2.4/2.5): go-server via cmd/conformance-adapter's acceptBackend (wsmixer.AcceptConn), go-client via wsmixer.Dial, go->go via the pair-go-go CI job (.github/workflows/conformance.yml), client role wired to wsmixer.Client (client_reconnect.go) since drain_reconnect started passing. go-server/go-client values carried over from the monorepo's conformance/COUNTS.json floors at the pre-split base SHA; go->go added once drain_reconnect went from SKIP to PASS (2026-09-05). Other SDKs' keys (js-server, js-client, go->js) are not exercised by this repo's runner invocation and are intentionally omitted -- checkCounts only enforces keys present here and actually exercised by the run.",
+  "comment": "Per-repo floor for ws-mixer-go's own conformance run (docs/MIGRATION.md section 2.4/2.5): go-server via cmd/conformance-adapter's acceptBackend (wsmixer.AcceptConn), go-client via wsmixer.Dial, go->go via the pair-go-go CI job (.github/workflows/conformance.yml), client role wired to wsmixer.Client (client_reconnect.go) since drain_reconnect started passing. go-server/go-client values carried over from the monorepo's conformance/COUNTS.json floors at the pre-split base SHA; go->go added once drain_reconnect went from SKIP to PASS (2026-09-05). go->go raised to 9 with spec.pin v0.3.1, which added the application_close pair scenario (9 pair scenarios exist at that tag). Other SDKs' keys (js-server, js-client, go->js) are not exercised by this repo's runner invocation and are intentionally omitted -- checkCounts only enforces keys present here and actually exercised by the run.",
   "floors": {
     "go-server": 19,
     "go-client": 24,
-    "go->go": 8
+    "go->go": 9
   }
 }

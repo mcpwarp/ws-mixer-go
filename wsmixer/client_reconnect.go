@@ -29,6 +29,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/coder/websocket"
 )
 
 // TokenProvider returns a fresh bearer token for one dial attempt. Client
@@ -83,7 +85,13 @@ const (
 type DisconnectReason struct {
 	Phase DisconnectPhase
 	// WSCode is the WebSocket close code, when a close occurred; 0 if none
-	// (e.g. a dial failure that never reached a socket).
+	// (e.g. a dial failure that never reached a socket). When derived from a
+	// *ConnError (HasErrorCode true), this is the semantic 4000+error_code
+	// value (see Conn.CloseCode()'s doc), which for an error code that maps
+	// outside the legal WS close-code range can differ from the close frame
+	// actually observed on the wire (wsCloseCode, conn.go); when this side
+	// instead only ever saw a raw close frame with no preceding error{}, it
+	// is exactly what was on the wire.
 	WSCode int
 	// ErrorCode/HasErrorCode/ErrorName are set when a ws-mixer wire error
 	// (a *ConnError) preceded this disconnect.
@@ -95,6 +103,16 @@ type DisconnectReason struct {
 	HTTPStatus int
 	Fatal      bool
 	Message    string
+	// CloseReason is the peer's WebSocket close-frame reason string,
+	// verbatim, whenever this side actually observed a close frame --
+	// independent of whether a ws-mixer *ConnError (HasErrorCode) also
+	// preceded it. "" when no close frame was observed (an abnormal
+	// closure, or a dial failure that never reached a socket) or the peer
+	// sent an empty reason. Also "" when the peer sent a stream-0 error{}
+	// message and then closed: the handshake and connected-phase read paths
+	// both stop reading as soon as they've parsed that error{}, so the
+	// close frame behind it is never actually observed.
+	CloseReason string
 	// Cause is set only when a token provider threw/rejected: its error,
 	// verbatim.
 	Cause error
@@ -108,9 +126,20 @@ func (r DisconnectReason) Error() string { return r.Message }
 // machine: full-jitter backoff (delay = random(0, min(cap, base*2^attempt))),
 // attempt reset only on welcome.
 type ReconnectOptions struct {
-	Base           time.Duration // default 1s
-	Cap            time.Duration // default 60s
-	ConnectTimeout time.Duration // per-attempt dial timeout; default 10s
+	Base time.Duration // default 1s
+	Cap  time.Duration // default 60s
+	// ConnectTimeout bounds the dial itself (WIRE.md section 2.9's "connect
+	// timeout 10s"), not the welcome wait that follows it -- that gets
+	// Options.HelloTimeout (WIRE.md section 2.10 step 2's separate,
+	// sequential 10s budget) on top, since dialAndHandshake's single
+	// per-attempt ctx has to cover both dialOnce's websocket.Dial and,
+	// inside it, clientHandshake's welcome read (see dialAndHandshake's own
+	// comment for why they can't race on one ctx sized for only one of
+	// them). Default 10s. A timed-out handshake against a peer that no
+	// longer reads can also take up to ~5s more for coder/websocket's own
+	// close handshake before the attempt actually returns, so a single
+	// attempt's worst case is roughly ConnectTimeout + HelloTimeout + 5s.
+	ConnectTimeout time.Duration
 	// MaxAttempts bounds reconnect attempts after a recoverable disconnect.
 	// Zero (the Go zero value, so reconnect is ON by default with no
 	// configuration at all) means unlimited.
@@ -190,9 +219,11 @@ func (e *fatalOverride) Unwrap() error { return e.err }
 
 func markFatal(err error) error { return &fatalOverride{err: err} }
 
-// isUnauthorized reports whether err is an HTTP 401 dial failure or a
-// UNAUTHORIZED (4011) handshake ConnError -- the two failures eligible for
-// CLIENT-SDK.md's one-time immediate refresh-retry.
+// isUnauthorized reports whether err is an HTTP 401 dial failure, a
+// UNAUTHORIZED (4011) handshake ConnError, or a bare pre-welcome
+// websocket.CloseError{Code: 4011} (a peer that closed 4011 without ever
+// sending error{} -- still UNAUTHORIZED by code) -- the failures eligible
+// for CLIENT-SDK.md's one-time immediate refresh-retry.
 func isUnauthorized(err error) bool {
 	var de *DialError
 	if errors.As(err, &de) && de.HTTPStatus == http.StatusUnauthorized {
@@ -200,6 +231,10 @@ func isUnauthorized(err error) bool {
 	}
 	var ce *ConnError
 	if errors.As(err, &ce) && ce.Code == UnauthorizedCode {
+		return true
+	}
+	var wsce websocket.CloseError
+	if errors.As(err, &wsce) && wsce.Code == 4011 {
 		return true
 	}
 	return false
@@ -218,6 +253,7 @@ type failureInfo struct {
 	retryAfter    time.Duration
 	hasRetryAfter bool
 	message       string
+	closeReason   string
 	cause         error
 }
 
@@ -234,17 +270,32 @@ func (fi failureInfo) toReason() DisconnectReason {
 		ErrorName:    name,
 		HTTPStatus:   fi.httpStatus,
 		Message:      fi.message,
+		CloseReason:  fi.closeReason,
 		Cause:        fi.cause,
 	}
 }
 
 // phaseFor classifies which phase a dial/handshake failure belongs to: a
 // *ConnError only ever comes from the post-101 hello/welcome exchange
-// (client.go's clientHandshake), everything else (a *DialError, a plain
-// network error, a *providerError) is phase "dial".
+// (client.go's clientHandshake), and so does a websocket.CloseError (the
+// peer closed the socket, with or without a preceding ws-mixer error{},
+// before welcome) -- everything else (a *DialError, a plain network error, a
+// *providerError) is phase "dial". Checked first and unconditionally: a
+// *providerError wraps whatever the caller's own TokenProvider returned,
+// which could coincidentally be or wrap a *ConnError or a
+// websocket.CloseError of its own -- that must never be misread as this
+// side's own handshake phase.
 func phaseFor(err error) DisconnectPhase {
+	var pe *providerError
+	if errors.As(err, &pe) {
+		return PhaseDial
+	}
 	var ce *ConnError
 	if errors.As(err, &ce) {
+		return PhaseHandshake
+	}
+	var wsce websocket.CloseError
+	if errors.As(err, &wsce) {
 		return PhaseHandshake
 	}
 	return PhaseDial
@@ -255,21 +306,34 @@ func phaseFor(err error) DisconnectPhase {
 // extracts everything needed for both the retry decision and the final
 // DisconnectReason.
 func classifyFailureErr(err error) failureInfo {
+	// Checked first and unconditionally, before phaseFor or the wsCode
+	// extraction below: a *providerError wraps whatever the caller's own
+	// TokenProvider returned, which could coincidentally be or wrap a
+	// *ConnError or a websocket.CloseError of its own -- none of that is
+	// this side's own handshake phase/close code, so it must never reach
+	// the extraction below.
+	var pe *providerError
+	if errors.As(err, &pe) {
+		return failureInfo{phase: PhaseDial, fatal: true, cause: pe.cause, message: pe.cause.Error()}
+	}
+
 	phase := phaseFor(err)
 	fi := failureInfo{phase: phase, message: err.Error()}
+
+	// A websocket.CloseError observed anywhere in the chain (clientHandshake's
+	// bare-close case, client.go) carries the peer's actual close code/reason
+	// -- extract both up front so every branch below inherits them unless it
+	// has a more specific wsCode of its own (the *ConnError branch does).
+	var wsce websocket.CloseError
+	if errors.As(err, &wsce) {
+		fi.wsCode = int(wsce.Code)
+		fi.closeReason = wsce.Reason
+	}
 
 	forced := false
 	var fo *fatalOverride
 	if errors.As(err, &fo) {
 		forced = true
-	}
-
-	var pe *providerError
-	if errors.As(err, &pe) {
-		fi.fatal = true
-		fi.cause = pe.cause
-		fi.message = pe.cause.Error()
-		return fi
 	}
 
 	var de *DialError
@@ -291,7 +355,15 @@ func classifyFailureErr(err error) failureInfo {
 		return fi
 	}
 
-	fi.fatal = forced
+	// Neither *DialError nor *ConnError matched: this is either an ordinary
+	// non-ws-mixer dial failure, or the bare-CloseError case above (a peer
+	// that closed 4010/4011 without ever sending error{} -- an SDK bug on
+	// its part, but WIRE.md section 2.9's fatal set is keyed on the close
+	// code, not on whether error{} happened to precede it). 4011 has no
+	// fatal-by-itself rule here: it joins isUnauthorized's one-time
+	// refresh-retry instead, and only a forced second failure is fatal,
+	// exactly like the *ConnError{UnauthorizedCode} case.
+	fi.fatal = forced || fi.wsCode == 4010
 	return fi
 }
 
@@ -599,7 +671,7 @@ func (cl *Client) Stats() Stats {
 //     after Close (or a fatal path) has already started is never published
 //     at all -- it is closed and discarded directly, exactly like
 //     attemptLoop's own closingNow check handles the same race a few lines
-//     earlier in the dial.
+//     earlier in the same dial.
 //
 // One accepted asymmetry, not a bug: when a fatal dial failure lands while a
 // still-live predecessor conn exists (the drain-reconnect window above,
@@ -851,7 +923,23 @@ func (cl *Client) waitBackoff(delay time.Duration) bool {
 // second failure of that kind is forced fatal. A provider error, on the
 // first call or the retry's, is always fatal, surfaced verbatim.
 func (cl *Client) dialAndHandshake() (*Conn, *WelcomeMsg, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), cl.rc.ConnectTimeout)
+	// One ctx covers both dialOnce's websocket.Dial (the actual TCP+upgrade)
+	// and, inside it, clientHandshake's welcome wait -- client.go's
+	// clientHandshake reads with this same ctx, undecorated, precisely so
+	// coder/websocket's own context-expiry-tears-down-the-transport
+	// behavior (see client.go's clientHandshake doc) never fires ahead of
+	// the HelloTimeout-driven time.AfterFunc that's supposed to deliver a
+	// graceful 4001. WIRE.md section 2.9's ConnectTimeout and section
+	// 2.10's welcome-wait timeout are two separate, sequential budgets (the
+	// dial completes, *then* the hello wait starts) -- so the one ctx this
+	// whole attempt gets has to cover both in sum, or the two race and
+	// ConnectTimeout firing first silently steals the handshake-phase 4001
+	// every time it happens to win. cl.opts.HelloTimeout, not
+	// c.opts.HelloTimeout on some not-yet-existing Conn: this is the
+	// already-SetDefaults()'d value NewClient stored on cl.opts, the same
+	// one dialOnce's ClientOptions.Options (and so eventually c.opts) is
+	// built from a few lines down.
+	ctx, cancel := context.WithTimeout(context.Background(), cl.rc.ConnectTimeout+cl.opts.HelloTimeout)
 	defer cancel()
 	// Tie this attempt's timeout to closeCh too (blocker/S1): otherwise
 	// Close() has to wait out the full ConnectTimeout before wg.Wait() can
@@ -1411,15 +1499,22 @@ func (cl *Client) watchConn(conn *Conn) {
 			cl.mu.Unlock()
 			cl.reportAndSchedule(reason, func(next int) time.Duration { return cl.rc.fullJitter(next) })
 		}
-	case 4009:
-		// WIRE.md section 2.9: "start at cap". retry_after_ms is a field of
-		// the drain message, not error{} -- and any drain the client
-		// observes already triggers its own immediate parallel reconnect
-		// above (the drainSched branch, which now honours retry_after_ms
-		// itself -- see handleServerDrain), which takes priority over this
-		// close-code classification for that same connection. Mirrors the
-		// JS SDK's scheduleReconnectAtCap, which does not look for a hint
-		// here either.
+	case 4009, 4014:
+		// WIRE.md section 2.9: "start at cap" for both -- 4009 (drain at
+		// max_streams) and 4014 (APPLICATION_CLOSE) are both deliberate
+		// post-welcome refusals, not failures: the app accepted the
+		// connection, then refused it (e.g. a per-account connection cap),
+		// so onAttemptSucceeded just reset attempt to 0 and ordinary
+		// fullJitter(attempt) would never climb past its lowest rung --
+		// scheduleReconnectAtCap starts the backoff where a real failure
+		// ladder would already be, instead of redialing once a second
+		// forever. retry_after_ms is a field of the drain message, not
+		// error{} -- and any drain the client observes already triggers its
+		// own immediate parallel reconnect above (the drainSched branch,
+		// which now honours retry_after_ms itself -- see handleServerDrain),
+		// which takes priority over this close-code classification for that
+		// same connection. Mirrors the JS SDK's scheduleReconnectAtCap,
+		// which does not look for a hint here either.
 		cl.reportAndSchedule(reason, func(int) time.Duration { return cl.rc.jitter(cl.rc.Cap) })
 	default:
 		// Everything else: 4001/4003/4004 (an SDK bug -- still just normal
@@ -1448,6 +1543,10 @@ func (cl *Client) effectiveWSCode(conn *Conn) int {
 
 func (cl *Client) buildConnectedDisconnectReason(conn *Conn) DisconnectReason {
 	r := DisconnectReason{Phase: PhaseConnected}
+	// CloseReason is independent of whether a ws-mixer *ConnError preceded
+	// the close (see the field comment on DisconnectReason): set it before
+	// the *ConnError branch's early return, not just in the fallback below.
+	r.CloseReason = conn.PeerCloseReason()
 	if ce, ok := conn.Err().(*ConnError); ok {
 		r.WSCode = ce.CloseCode()
 		r.ErrorCode = ce.Code

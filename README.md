@@ -41,6 +41,7 @@ func (c *Conn) Drain(ctx context.Context, reason string, opts DrainOptions) erro
 func (c *Conn) Close(code uint32, msg string) error
 func (c *Conn) Done() <-chan struct{}
 func (c *Conn) Err() error
+func (c *Conn) PeerCloseReason() string                     // "" if this side initiated the close, or none was observed
 func (c *Conn) Run()                                        // starts the read/write/keepalive loops
 
 type Stream struct{ /* … */ }
@@ -69,7 +70,7 @@ job, built on top of `AcceptConn` below.
 
 `wsmixer.Client` (`client_reconnect.go`) is the high-level client most callers want: it owns the full
 [WIRE.md §2.9](https://github.com/mcpwarp/ws-mixer-spec/blob/main/docs/WIRE.md#29-sequences) reconnect
-state machine — full-jitter backoff, `drain`/`4012`/`4013`/`4009` handling, a fatal set that never
+state machine — full-jitter backoff, `drain`/`4012`/`4013`/`4009`/`4014` handling, a fatal set that never
 retries — on top of the plain `Dial` below, and it is on by default:
 
 ```go
@@ -87,9 +88,23 @@ defer client.Close(context.Background()) // drain{client_requested}, wait <=5s, 
 just a convenience wrapper for a token that never changes. `OnConnect` fires on every successful `welcome`,
 first connection and every reconnect alike (WIRE.md: no resumption, so nothing from the old `*Conn`
 survives); `OnDisconnect` fires for every disconnect, recoverable or fatal, as one `DisconnectReason`
-(`Phase`, `WSCode`, `ErrorCode`/`ErrorName`, `HTTPStatus`, `Fatal`, `Message`, `Cause`). `Stats()` returns
-the "ignore and count" counters (unknown frame types, stale frames, duplicate pongs, refused opens,
-protocol violations, bytes in/out), cumulative across reconnects.
+(`Phase`, `WSCode`, `ErrorCode`/`ErrorName`, `HTTPStatus`, `Fatal`, `Message`, `CloseReason`, `Cause`).
+`CloseReason` is the *peer's* WebSocket close-frame reason string, verbatim, whenever one was actually
+observed — including when no ws-mixer `error{}` message preceded it (e.g. it was lost); "" when no close
+frame was observed, this side initiated the close itself (`Close`/`Client.Close`/a protocol violation), or
+one arrived right behind an `error{}` this side had already stopped reading for. A consumer generally wants
+`CloseReason` first, falling back to `Message` when it's empty. An application closing a connection for a
+reason ws-mixer itself does not interpret (e.g. an over-capacity refusal) should use
+`wsmixer.ApplicationCloseCode` with `Conn.Close` (`Client.Close(ctx)` takes no code/message -- there is no
+Client-level application close in this release; calling `Conn.Close` on a connection `Client` is managing
+just looks like an ordinary disconnect to it, and it will reconnect as usual), so the peer's `OnDisconnect`
+sees `ErrorName: "APPLICATION_CLOSE"` rather than `INTERNAL_ERROR` for an unrecognized code; application
+codes `>= 0x1000_0000` remain stream-`Reset`-only, never valid for a connection close. `Client` reconnects
+after an `APPLICATION_CLOSE` (WS 4014) starting at `Cap`, not from the bottom of the backoff ladder: it is a
+deliberate post-`welcome` refusal, and the attempt counter has just been reset by that same `welcome`.
+`Stats()` returns the
+"ignore and count" counters (unknown frame types, stale frames, duplicate pongs, refused opens, protocol
+violations, bytes in/out), cumulative across reconnects.
 
 The lower-level, single-attempt `Dial` (used internally by `Client`, and still the right tool for a
 harness or test that wants exactly one connection with no retry policy of its own) is unchanged:
