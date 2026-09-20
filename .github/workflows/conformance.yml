@@ -9,37 +9,15 @@ env:
   GOTOOLCHAIN: auto
 
 jobs:
-  checkout-spec:
-    runs-on: ubuntu-latest
-    outputs:
-      pin: ${{ steps.pin.outputs.pin }}
-    steps:
-      - uses: actions/checkout@v4
-      - id: pin
-        run: echo "pin=$(cat spec.pin)" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@v4
-        with:
-          repository: mcpwarp/ws-mixer-spec
-          ref: ${{ steps.pin.outputs.pin }}
-          path: .spec
-      - uses: actions/upload-artifact@v4
-        with:
-          name: spec-checkout
-          path: .spec
-          retention-days: 1
-
   fixture-matrix:
-    needs: checkout-spec
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: "1.24"
-      - uses: actions/download-artifact@v4
-        with:
-          name: spec-checkout
-          path: .spec
+      - name: Checkout ws-mixer-spec @ pin
+        run: git clone --depth 1 --branch "$(cat spec.pin)" https://github.com/mcpwarp/ws-mixer-spec.git .spec
       - run: go build -tags conformance -o build/go-adapter ./cmd/conformance-adapter
       # .spec is a nested Go module (its own go.mod), so `go run ./.spec/...`
       # cannot be invoked relative to this repo's module -- cd into it first
@@ -52,19 +30,22 @@ jobs:
             --sdk go --mode fixture \
             --counts "$repo/conformance/COUNTS.json" \
             --report "$repo/build/conformance-fixture.xml")
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: conformance-fixture
+          path: build/*.xml
+          if-no-files-found: warn
 
   pair-go-go:
-    needs: checkout-spec
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: "1.24"
-      - uses: actions/download-artifact@v4
-        with:
-          name: spec-checkout
-          path: .spec
+      - name: Checkout ws-mixer-spec @ pin
+        run: git clone --depth 1 --branch "$(cat spec.pin)" https://github.com/mcpwarp/ws-mixer-spec.git .spec
       - run: go build -tags conformance -o build/go-adapter ./cmd/conformance-adapter
       # .spec is a nested Go module (its own go.mod), so `go run ./.spec/...`
       # cannot be invoked relative to this repo's module -- cd into it first
@@ -77,3 +58,9 @@ jobs:
             --sdk go --mode pair \
             --counts "$repo/conformance/COUNTS.json" \
             --report "$repo/build/conformance-pair.xml")
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: conformance-pair
+          path: build/*.xml
+          if-no-files-found: warn

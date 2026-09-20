@@ -1,0 +1,8 @@
+# Populated by `make fetch-spec` / CI's per-job spec checkout -- ws-mixer-spec
+# at the tag pinned in spec.pin, read by wsmixer/specdir_test.go's specDir
+# helper and by the conformance runner. Never committed.
+/.spec/
+
+# go build -o build/... output (cmd/conformance-adapter binary, conformance
+# runner XML reports).
+/build/

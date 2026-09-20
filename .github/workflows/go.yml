@@ -9,26 +9,6 @@ env:
   GOTOOLCHAIN: auto
 
 jobs:
-  fetch-spec:
-    runs-on: ubuntu-latest
-    outputs:
-      pin: ${{ steps.pin.outputs.pin }}
-    steps:
-      - uses: actions/checkout@v4
-      - id: pin
-        run: echo "pin=$(cat spec.pin)" >> "$GITHUB_OUTPUT"
-      - name: Checkout ws-mixer-spec @ pin
-        uses: actions/checkout@v4
-        with:
-          repository: mcpwarp/ws-mixer-spec
-          ref: ${{ steps.pin.outputs.pin }}
-          path: .spec
-      - uses: actions/upload-artifact@v4
-        with:
-          name: spec-checkout
-          path: .spec
-          retention-days: 1
-
   vet:
     runs-on: ubuntu-latest
     steps:
@@ -40,23 +20,19 @@ jobs:
       - run: go vet -tags conformance ./...
 
   test:
-    needs: fetch-spec
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: "1.24"
-      - uses: actions/download-artifact@v4
-        with:
-          name: spec-checkout
-          path: .spec
+      - name: Checkout ws-mixer-spec @ pin
+        run: git clone --depth 1 --branch "$(cat spec.pin)" https://github.com/mcpwarp/ws-mixer-spec.git .spec
       - run: go test -count=1 ./...
         env:
           WSMIXER_SPEC_DIR: ${{ github.workspace }}/.spec
 
   race:
-    needs: fetch-spec
     runs-on: ubuntu-latest
     env:
       GOMAXPROCS: 1
@@ -65,10 +41,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.24"
-      - uses: actions/download-artifact@v4
-        with:
-          name: spec-checkout
-          path: .spec
+      - name: Checkout ws-mixer-spec @ pin
+        run: git clone --depth 1 --branch "$(cat spec.pin)" https://github.com/mcpwarp/ws-mixer-spec.git .spec
       - run: go test -race -count=1 ./...
         env:
           WSMIXER_SPEC_DIR: ${{ github.workspace }}/.spec

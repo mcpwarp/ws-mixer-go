@@ -20,11 +20,15 @@ import (
 //     but ws-mixer-js's test/helpers/spec-dir.ts convention is the spec
 //     subdir itself (`$WSMIXER_SPEC_DIR/fixtures`) — both are tolerated so
 //     the same env var works against either kind of checkout.
-//  2. ../../.spec/spec, the checkout `make fetch-spec` populates from spec.pin.
+//  2. <repo-root>/.spec/spec, the checkout `make fetch-spec` populates from
+//     spec.pin (this is also what CI's WSMIXER_SPEC_DIR points at, and
+//     matches ws-mixer-js's own `.spec/spec at repo root` convention
+//     exactly). This test file lives in wsmixer/, one level below the repo
+//     root, so it's one ".." from here, not two.
 //
 // If neither exists, the fixture is not fetched yet: skip rather than fail,
 // so `go test ./...` stays green without a network fetch (CI always runs
-// fetch-spec first; docs/MIGRATION.md section 2.5).
+// `make fetch-spec` first; docs/MIGRATION.md section 2.5).
 func specDir(t *testing.T) string {
 	t.Helper()
 	if d := os.Getenv("WSMIXER_SPEC_DIR"); d != "" {
@@ -39,7 +43,7 @@ func specDir(t *testing.T) string {
 		}
 		t.Fatalf("WSMIXER_SPEC_DIR=%s: found neither spec/fixtures nor fixtures under it", d)
 	}
-	d := filepath.Join("..", "..", ".spec", "spec")
+	d := filepath.Join("..", ".spec", "spec")
 	if _, err := os.Stat(d); err != nil {
 		t.Skipf("no spec checkout found (set WSMIXER_SPEC_DIR or run `make fetch-spec`): %v", err)
 	}

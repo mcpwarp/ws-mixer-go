@@ -145,7 +145,7 @@ resolved by `wsmixer/specdir_test.go`'s `specDir` helper:
 1. `$WSMIXER_SPEC_DIR`, if set -- must exist. Accepts either directory shape: this repo's own
    convention (repo-root, i.e. `$WSMIXER_SPEC_DIR/spec/fixtures` exists) or `ws-mixer-js`'s
    convention (the spec subdir itself, i.e. `$WSMIXER_SPEC_DIR/fixtures` exists directly).
-2. `../../.spec/spec`, the checkout `make fetch-spec` populates from `spec.pin`.
+2. `.spec/spec` at the repo root, the checkout `make fetch-spec` populates from `spec.pin` (also what CI's `WSMIXER_SPEC_DIR` points at).
 
 If neither resolves, those suites skip with a reason rather than failing -- `go test ./...` stays
 green without a network fetch.
