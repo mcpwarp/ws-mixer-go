@@ -24,9 +24,15 @@ func TestClientMaxAttemptsExhaustion(t *testing.T) {
 	// exhaustion is observable purely as a later OnDisconnect, matching the
 	// gap this pins: "MaxAttempts exhaustion (final OnDisconnect Fatal)").
 	// The server then drops that connection and refuses every dial after
-	// it, so every subsequent attempt fails at the dial/handshake layer
-	// (never reaching a welcome, which would otherwise reset cl.attempt to
-	// 0 per WIRE.md section 2.9 and prevent exhaustion from ever happening).
+	// it, so every subsequent attempt fails at the dial/handshake layer,
+	// never reaching a welcome again. That single first welcome doesn't
+	// itself save cl.attempt from exhausting under today's rule either way
+	// (docs/DECISIONS.md 2026-09-20: attempt resets only once a connection
+	// has stayed up ReconnectOptions.StableAfter, not at welcome) -- this
+	// test's own short lifetime never gives armStability's real-clock
+	// StableAfter wait a chance to fire regardless of which rule is in
+	// effect, so the only thing that actually matters here is that no
+	// SECOND welcome ever happens to even attempt resetting anything.
 	var accepted atomic.Int32
 	inner := newTestListener(testAcceptHandler{
 		Options: Options{Logger: discardLogger()},
@@ -153,7 +159,7 @@ func TestClientReconnectDisabled(t *testing.T) {
 	if got := cl.State(); got != "closed" {
 		t.Errorf("State() = %s, want closed", got)
 	}
-	if calls := fa.snapshot(); len(calls) != 0 {
+	if calls := nonStabilityCalls(fa.snapshot(), stableAfterOf(rc)); len(calls) != 0 {
 		t.Errorf("backoff delays recorded = %v, want none (Disabled never reconnects)", calls)
 	}
 }

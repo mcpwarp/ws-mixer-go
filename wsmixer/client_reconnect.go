@@ -4,10 +4,16 @@ package wsmixer
 // requires: it owns the WIRE.md section 2.9 reconnect state machine on top
 // of the plain, single-attempt Dial (client.go), which keeps working
 // unchanged underneath it. Mirrors ws-mixer-js's MixerClient
-// (src/client.ts) behaviorally -- full-jitter backoff, attempt reset only on
-// welcome, drain/4012/4013/4009 special-cased, a fatal set that never
-// retries -- translated into Go's goroutine/channel idiom rather than
-// JS's async/await + EventEmitter one.
+// (src/client.ts) behaviorally -- full-jitter backoff,
+// drain/4012/4013/4009 special-cased, a fatal set that never retries --
+// translated into Go's goroutine/channel idiom rather than JS's
+// async/await + EventEmitter one. One deliberate divergence, added
+// D-2026-09-20: the backoff attempt counter (and the once-only budgets
+// alongside it) resets only once a connection has stayed up
+// ReconnectOptions.StableAfter past its own welcome (armStability), not at
+// welcome itself -- WIRE.md section 2.9's `stable` state -- so a server
+// that welcomes and immediately closes can't make the client redial once a
+// second forever.
 //
 // State machine (single source of truth for "what Client is doing right
 // now"): idle -> dialing -> connected -> backoff -> dialing -> ... ending in
@@ -22,6 +28,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
 	"net/http"
@@ -38,8 +45,32 @@ import (
 // the result (CLIENT-SDK.md's "token provider" rule). A provider that
 // returns an error is fatal: never retried (except the one HTTP-401/4011
 // refresh below), and the error is surfaced verbatim on
-// DisconnectReason.Cause.
+// DisconnectReason.Cause -- unless the error wraps ErrTokenUnavailable, in
+// which case it is treated like an ordinary failed dial instead (see that
+// sentinel's own doc comment).
 type TokenProvider func(ctx context.Context) (string, error)
+
+// ErrTokenUnavailable is the sentinel a TokenProvider's error wraps (e.g.
+// fmt.Errorf("%w: auth server unreachable", wsmixer.ErrTokenUnavailable), or
+// a custom error type whose Is method matches it) to mark a failure to
+// OBTAIN a token as temporary -- the token itself isn't the problem, the
+// provider just couldn't reach it right now (the network is briefly down, or
+// the auth server is unreachable while refreshing an expired token) --
+// rather than fatal. Client then treats the attempt like a failed dial
+// instead of ending the client: phase "dial", non-fatal, normal backoff, no
+// immediate retry (classifyFailureErr) -- it still counts as a failed
+// attempt (attempt increments, MaxAttempts still applies) and still spends
+// the one-time 401/4011 refresh-retry budget when hit on that call
+// (dialAndHandshake), exactly like any other failure there.
+//
+// Detection is errors.Is only (CLIENT-SDK.md's "Provider failure" row): a
+// provider's error either wraps this sentinel or it doesn't. Client never
+// infers "temporary" from an error's shape -- no Retryable()/Temporary()
+// duck-typing -- since an accidental match on an otherwise-fatal provider
+// error would silently turn it into an endless retry loop instead of ever
+// surfacing to the caller. An unmarked provider error stays fatal exactly as
+// before.
+var ErrTokenUnavailable = errors.New("wsmixer: token temporarily unavailable")
 
 // StaticToken returns a TokenProvider for the common case of a token that
 // never changes.
@@ -63,8 +94,10 @@ func (s *staticTokenProvider) provide(context.Context) (string, error) { return 
 // StaticToken-built provider is a method value of the same underlying
 // method regardless of receiver, so reflect.Value.Pointer() (the entry
 // point of the underlying code, not the receiver) recognizes it. Used to
-// skip the one-time HTTP-401 refresh-retry (nit 2): retrying with the exact
-// same static token can never fix an auth failure.
+// skip the one-time HTTP-401 refresh-retry: retrying with the exact same
+// static token can never fix an auth failure -- dialAndHandshake goes fatal
+// at once for that case instead (docs/DECISIONS.md 2026-09-20), rather than
+// retrying the refresh a real TokenProvider gets a shot at.
 func isRealProvider(tp TokenProvider) bool {
 	return reflect.ValueOf(tp).Pointer() != reflect.ValueOf(StaticToken("")).Pointer()
 }
@@ -93,8 +126,37 @@ type DisconnectReason struct {
 	// instead only ever saw a raw close frame with no preceding error{}, it
 	// is exactly what was on the wire.
 	WSCode int
-	// ErrorCode/HasErrorCode/ErrorName are set when a ws-mixer wire error
-	// (a *ConnError) preceded this disconnect.
+	// ErrorCode/HasErrorCode/ErrorName are set whenever this disconnect
+	// carries a ws-mixer error code, from any of three sources
+	// (CLIENT-SDK.md's "Disconnect reason shape" row):
+	//  1. a peer's wire error{} message preceded the close -- ErrorCode is
+	//     exactly that message's code;
+	//  2. a close frame carrying a WS close code in ws-mixer's own reserved
+	//     range (4001-4999) was observed with no preceding error{} ("bare"),
+	//     in which case ErrorCode is derived mechanically as
+	//     ErrorCode(wsCode-4000) (deriveBareCloseErrorCode, WIRE.md section
+	//     2.8's ws_close = 4000 + error_code rule, which the derivation
+	//     simply runs in reverse -- never wrong, so this is never guessed);
+	//  3. a ws-mixer error the SDK itself raises LOCALLY, with no close
+	//     frame from the peer involved at all: a missing/mismatched
+	//     subprotocol echo on the upgrade (classifyFailureErr's *DialError
+	//     branch, UNSUPPORTED, no close frame or HTTP status either), the
+	//     welcome timeout (client.go's own locally generated
+	//     PROTOCOL_ERROR/4001), and any other local fail() protocol
+	//     violation of an already-connected conn. Go specifics: both of
+	//     those last two happen to reach classifyFailureErr/
+	//     buildConnectedDisconnectReason as a *ConnError -- this side's own
+	//     fail() produces exactly the same type a peer's error{} does -- so
+	//     they are handled by the SAME code as source 1 above, not a
+	//     separate branch; they are still source 3 by the spec's own
+	//     definition (no close frame from the PEER preceded them), the code
+	//     path is just shared.
+	// ErrorName is that code's String() in every case (unknown ->
+	// "INTERNAL_ERROR", as always). Never synthesized for anything that
+	// isn't a ws-mixer code: an HTTP upgrade rejection (401/403/404/429/5xx)
+	// leaves this unset -- HTTPStatus carries that instead -- and so does an
+	// abnormal closure, no close frame at all, or an ordinary non-ws-mixer
+	// WS close code (1000, 1001, 1006, 1007, 1009, 1011, ...).
 	ErrorCode    ErrorCode
 	HasErrorCode bool
 	ErrorName    string
@@ -124,7 +186,9 @@ func (r DisconnectReason) Error() string { return r.Message }
 
 // ReconnectOptions configures Client's WIRE.md section 2.9 reconnect state
 // machine: full-jitter backoff (delay = random(0, min(cap, base*2^attempt))),
-// attempt reset only on welcome.
+// the attempt counter (and every once-only reconnect budget alongside it)
+// reset only once a connection has stayed up StableAfter past its own
+// welcome -- not at welcome itself (see StableAfter's own doc comment).
 type ReconnectOptions struct {
 	Base time.Duration // default 1s
 	Cap  time.Duration // default 60s
@@ -140,9 +204,14 @@ type ReconnectOptions struct {
 	// close handshake before the attempt actually returns, so a single
 	// attempt's worst case is roughly ConnectTimeout + HelloTimeout + 5s.
 	ConnectTimeout time.Duration
-	// MaxAttempts bounds reconnect attempts after a recoverable disconnect.
-	// Zero (the Go zero value, so reconnect is ON by default with no
-	// configuration at all) means unlimited.
+	// MaxAttempts bounds consecutive reconnect attempts that never reach a
+	// stable connection (StableAfter). It is not simply "reconnects since
+	// the client started": a connection that stays up StableAfter re-arms
+	// this budget from zero (armStability), so a healthy client that drops
+	// and recovers occasionally is never at risk of exhausting it -- only a
+	// server that keeps failing every attempt before any of them can ever
+	// stabilize does. Zero (the Go zero value, so reconnect is ON by
+	// default with no configuration at all) means unlimited.
 	MaxAttempts int
 	// Disabled turns reconnect off entirely (nit 7: this used to be
 	// overloaded onto a negative MaxAttempts; an explicit bool reads better
@@ -152,6 +221,28 @@ type ReconnectOptions struct {
 	// deadline), but the eventual close is reported as one fatal disconnect
 	// instead of triggering a redial.
 	Disabled bool
+
+	// StableAfter is how long a connection has to stay up, past welcome,
+	// before it counts as genuinely stable: the backoff attempt counter, and
+	// the once-only budgets below it (keepaliveRetryUsed, refreshRetryUsed --
+	// see armStability), are re-armed only once a connection has stayed up
+	// this long after its own welcome, not at welcome itself. Without this,
+	// a server that welcomes a connection and then immediately closes it
+	// resets the counter every single cycle and the client redials about
+	// once a second forever instead of ever backing off (spec WIRE.md
+	// section 2.9's `stable` state). Zero (the Go zero value) means the 10s
+	// default, same as every other field here -- there is no way to opt out
+	// of a stability window entirely, only to make it effectively
+	// instantaneous with a tiny nonzero value (e.g. time.Nanosecond), which
+	// approximates the old reset-at-welcome behavior. A drain-triggered
+	// parallel reconnect (handleServerDrain) does not itself increment
+	// attempt, so a server that drains faster than StableAfter, repeatedly,
+	// never lets a connection stabilize either -- attempt simply stays
+	// frozen wherever it last was (not climbing, since a drain reconnect
+	// isn't a failure), until either a connection finally does stay up this
+	// long, or an unrelated ordinary failure starts climbing it from there.
+	// Default 10s.
+	StableAfter time.Duration
 
 	// now/after/randFloat64 are unexported test-only seams: a white-box
 	// table test in this package can inject a fake clock and a deterministic
@@ -171,6 +262,9 @@ func (r *ReconnectOptions) setDefaults() {
 	}
 	if r.ConnectTimeout <= 0 {
 		r.ConnectTimeout = 10 * time.Second
+	}
+	if r.StableAfter <= 0 {
+		r.StableAfter = 10 * time.Second
 	}
 	if r.now == nil {
 		r.now = time.Now
@@ -200,9 +294,11 @@ func (r *ReconnectOptions) fullJitter(attempt int) time.Duration {
 	return time.Duration(r.randFloat64() * exp)
 }
 
-// providerError marks a TokenProvider failure: fatal, no retry, the
-// underlying error surfaced verbatim (CLIENT-SDK.md's "provider failure"
-// rule).
+// providerError marks a TokenProvider failure, its underlying error
+// surfaced verbatim on DisconnectReason.Cause either way (CLIENT-SDK.md's
+// "Provider failure" rule): fatal, no retry -- unless cause wraps
+// ErrTokenUnavailable (that sentinel's own doc comment), in which case it is
+// treated like an ordinary failed dial instead, with normal backoff.
 type providerError struct{ cause error }
 
 func (e *providerError) Error() string { return e.cause.Error() }
@@ -279,12 +375,16 @@ func (fi failureInfo) toReason() DisconnectReason {
 // *ConnError only ever comes from the post-101 hello/welcome exchange
 // (client.go's clientHandshake), and so does a websocket.CloseError (the
 // peer closed the socket, with or without a preceding ws-mixer error{},
-// before welcome) -- everything else (a *DialError, a plain network error, a
-// *providerError) is phase "dial". Checked first and unconditionally: a
-// *providerError wraps whatever the caller's own TokenProvider returned,
-// which could coincidentally be or wrap a *ConnError or a
-// websocket.CloseError of its own -- that must never be misread as this
-// side's own handshake phase.
+// before welcome). A *postUpgradeError marks every OTHER clientHandshake
+// failure the same way -- a transport death/EOF/unreadable frame that
+// happened strictly after websocket.Dial's own upgrade already succeeded
+// (the 101) is phase handshake too, by construction (where the failure
+// happened), not by guessing from the error's type -- everything else (a
+// *DialError, a plain pre-101 dial error, a *providerError) is phase
+// "dial". Checked first and unconditionally: a *providerError wraps
+// whatever the caller's own TokenProvider returned, which could
+// coincidentally be or wrap a *ConnError or a websocket.CloseError of its
+// own -- that must never be misread as this side's own handshake phase.
 func phaseFor(err error) DisconnectPhase {
 	var pe *providerError
 	if errors.As(err, &pe) {
@@ -298,7 +398,35 @@ func phaseFor(err error) DisconnectPhase {
 	if errors.As(err, &wsce) {
 		return PhaseHandshake
 	}
+	var pue *postUpgradeError
+	if errors.As(err, &pue) {
+		return PhaseHandshake
+	}
 	return PhaseDial
+}
+
+// deriveBareCloseErrorCode maps a bare WS close code -- one observed with no
+// preceding ws-mixer error{} message -- back to its semantic ErrorCode, per
+// the mechanical ws_close = 4000 + error_code rule (WIRE.md section 2.8):
+// that arithmetic is never wrong, so a bare close still carries a usable
+// ErrorCode/ErrorName instead of leaving every caller to redo it themselves
+// (the JS SDK already does this same derivation). Only ws-mixer's own
+// reserved close-code range, 4001-4999, counts -- 4000 (NoError) is
+// deliberately excluded, since this package's own Conn.Close always sends
+// error{NoError,...} ahead of a graceful close, so a genuinely bare 4000
+// would itself be a peer bug this derivation has no basis to paper over. An
+// ordinary WS close outside that range (1000, 1001, 1006 abnormal closure,
+// 1007, 1009, 1011, ...), or no close observed at all (wsCode 0), is never a
+// ws-mixer error code and yields has=false. Shared by classifyFailureErr's
+// (handshake-phase) bare-websocket.CloseError case and
+// buildConnectedDisconnectReason's (connected-phase) non-*ConnError case, so
+// both derive it identically -- implements ws-mixer-spec's D-2026-09-20-09
+// (docs/DECISIONS.md).
+func deriveBareCloseErrorCode(wsCode int) (code ErrorCode, has bool) {
+	if wsCode < 4001 || wsCode > 4999 {
+		return 0, false
+	}
+	return ErrorCode(wsCode - 4000), true
 }
 
 // classifyFailureErr inspects a dialAndHandshake failure (via errors.As, so
@@ -311,9 +439,20 @@ func classifyFailureErr(err error) failureInfo {
 	// TokenProvider returned, which could coincidentally be or wrap a
 	// *ConnError or a websocket.CloseError of its own -- none of that is
 	// this side's own handshake phase/close code, so it must never reach
-	// the extraction below.
+	// the extraction below. This also means a *fatalOverride is never
+	// consulted for a *providerError (dialAndHandshake never wraps one in
+	// markFatal anyway -- see ErrTokenUnavailable's own doc comment) --
+	// this branch always returns before the fatalOverride check further
+	// down ever runs.
 	var pe *providerError
 	if errors.As(err, &pe) {
+		if errors.Is(pe.cause, ErrTokenUnavailable) {
+			// Marked temporary (CLIENT-SDK.md's "Provider failure" row):
+			// treated exactly like a failed dial -- non-fatal, normal
+			// backoff, no immediate retry -- with the provider's error
+			// still surfaced verbatim on Cause.
+			return failureInfo{phase: PhaseDial, fatal: false, cause: pe.cause, message: pe.cause.Error()}
+		}
 		return failureInfo{phase: PhaseDial, fatal: true, cause: pe.cause, message: pe.cause.Error()}
 	}
 
@@ -342,6 +481,19 @@ func classifyFailureErr(err error) failureInfo {
 		fi.fatal = de.Fatal || forced
 		fi.retryAfter = de.RetryAfter
 		fi.hasRetryAfter = de.HasRetryAfter
+		if de.Mismatch {
+			// The third errorCode source (CLIENT-SDK.md's "Disconnect
+			// reason shape" row, D-2026-09-20-09): not every ErrorCode
+			// comes off the wire -- a missing/mismatched subprotocol echo
+			// is a ws-mixer error the SDK itself raised locally, with no
+			// close frame and no HTTP status behind it, but UNSUPPORTED is
+			// exactly what it means (the same code welcome.v mismatch maps
+			// to). Report-only: fatality already comes from de.Fatal above,
+			// set unconditionally for Mismatch regardless of this. The JS
+			// SDK reports the same code for this case.
+			fi.errCode = UnsupportedCode
+			fi.hasErrorCode = true
+		}
 		return fi
 	}
 
@@ -364,6 +516,14 @@ func classifyFailureErr(err error) failureInfo {
 	// refresh-retry instead, and only a forced second failure is fatal,
 	// exactly like the *ConnError{UnauthorizedCode} case.
 	fi.fatal = forced || fi.wsCode == 4010
+	// Report-only: a bare close still gets a derived ErrorCode/ErrorName
+	// (deriveBareCloseErrorCode) -- this never changes fi.fatal/fi.phase/
+	// fi.wsCode, all already decided above, only what the final
+	// DisconnectReason carries alongside them.
+	if ec, has := deriveBareCloseErrorCode(fi.wsCode); has {
+		fi.errCode = ec
+		fi.hasErrorCode = true
+	}
 	return fi
 }
 
@@ -396,7 +556,11 @@ type ClientConfig struct {
 	// the just-auto-wired handler on that one *Conn, exactly like calling
 	// them on any other *Conn; the *next* reconnect gets a brand new *Conn
 	// wired fresh from these fields again, so nothing carries over and
-	// nothing here is silently doubled up).
+	// nothing here is silently doubled up). Each runs on that *Conn's own
+	// deliveryLoop goroutine (conn.go), which Client's wg does not track: a
+	// callback for an event that had already arrived before Client.Close/
+	// CloseWith ended the underlying conn can still fire shortly after
+	// Close/CloseWith itself returns (deliveryLoop's doc comment).
 	OnStream func(*Stream)
 	OnApp    func(json.RawMessage)
 	OnDrain  func(*DrainMsg)
@@ -440,7 +604,12 @@ type Client struct {
 	drainReconnectScheduled bool
 	drainedNoReconnect      bool
 	keepaliveRetryUsed      bool
-	cumulative              Stats
+	// refreshRetryUsed is dialAndHandshake's one-time 401/4011
+	// refresh-retry budget: a once-only flag like keepaliveRetryUsed,
+	// re-armed only at stability (armStability), not per dial attempt and
+	// not on welcome alone (docs/DECISIONS.md 2026-09-20).
+	refreshRetryUsed bool
+	cumulative       Stats
 
 	// firstResultCh/firstResultErr/firstResultOnce implement Connect's
 	// idempotency (nit 6): firstResultCh is closed exactly once, by
@@ -702,53 +871,99 @@ func (cl *Client) Stats() Stats {
 // closed by it directly or still traceable to cl.conn/cl.retiringConn/
 // cl.gracefulConn for someone else (watchConn's escape, ultimately) to close.
 
+// closeStart is Close/CloseWith's shared entry: it makes exactly the state
+// transitions Close itself used to make inline -- cl.closing=true,
+// cl.state=clientClosed, cl.drainedNoReconnect cleared, claiming conn as
+// cl.gracefulConn (B2/ownership invariant above Close: watchConn's closeCh
+// escape must not also force-close it out from under whatever the caller is
+// about to do to it itself) -- then stops the backoff loop and resolves
+// Connect's first result, exactly as before. ok is false if something else
+// (a concurrent Close/CloseWith, or a fatal path that set cl.closing
+// directly) already started closing; the caller must fall back to
+// closeAlreadyClosing instead of touching conn/retiring itself, since
+// whichever path got here first already owns them (see the ownership
+// invariant). retiring is deliberately not claimed here, matching Close's
+// original comment on why that's fine: it gets a bare forced NoError close,
+// not whatever the caller is doing to conn, so it's harmless for the
+// closeCh escape to also force-close it if it gets there first (Conn.Close
+// is idempotent).
+func (cl *Client) closeStart() (conn, retiring *Conn, ok bool) {
+	cl.mu.Lock()
+	if cl.closing {
+		cl.mu.Unlock()
+		return nil, nil, false
+	}
+	cl.closing = true
+	cl.state = clientClosed
+	cl.drainedNoReconnect = false
+	conn = cl.conn
+	retiring = cl.retiringConn
+	cl.retiringConn = nil
+	cl.gracefulConn = conn
+	cl.mu.Unlock()
+
+	cl.stopBackoff()
+	cl.finishFirstResult(errors.New("wsmixer: closed before the first connection completed"))
+	return conn, retiring, true
+}
+
+// closeAlreadyClosing is Close/CloseWith's shared "someone else already
+// started shutting down" fallback (F1): still reap resources here rather
+// than returning immediately -- wg.Wait() bounds on whichever path called
+// stopBackoff, which every closeStart-derived path does.
+func (cl *Client) closeAlreadyClosing() {
+	cl.wg.Wait()
+	cl.closeCbCh()
+}
+
 // Close performs a graceful client shutdown (WIRE.md section 2.10 rule 14):
 // stops reconnecting for good, sends drain{reason:"client_requested"} on the
 // active connection, waits up to 5s for in-flight streams to finish, then
 // closes with NO_ERROR/1000 instead of the server-drain sequence's GOING_AWAY.
 // Safe to call at any time, including before the first connection completes
 // (in which case Connect, if still waiting, returns an error) or more than
-// once (idempotent) -- including when something else (a fatal disconnect,
-// MaxAttempts exhaustion, Disabled) already ended the client first: Close is
-// always resource-final regardless of who initiated closing, reaping every
-// wg-tracked goroutine and the callback queue before it returns (F1). The
-// very last OnDisconnect can still run after Close returns, though: draining
-// the callback queue happens on callbackLoop's own goroutine, which Close
-// does not wait on (see the cbMu field comment) -- only on the wg-tracked
-// goroutines that feed it.
+// once (idempotent, including racing a concurrent CloseWith -- closeStart's
+// cl.closing check picks exactly one winner) -- including when something
+// else (a fatal disconnect, MaxAttempts exhaustion, Disabled) already ended
+// the client first: Close is always resource-final regardless of who
+// initiated closing, reaping every wg-tracked goroutine and the callback
+// queue before it returns (F1). The very last OnDisconnect can still run
+// after Close returns, though: draining the callback queue happens on
+// callbackLoop's own goroutine, which Close does not wait on (see the cbMu
+// field comment) -- only on the wg-tracked goroutines that feed it. Also
+// safe to call synchronously from inside OnConnect/OnDisconnect themselves
+// (blocker 2): those callbacks run on callbackLoop, a goroutine deliberately
+// never added to cl.wg (see the cbMu field comment), so Close's own
+// cl.wg.Wait() never waits on the very goroutine calling it.
+//
+// Separately, ClientConfig.OnStream/OnApp/OnDrain can also still run shortly
+// after Close returns: each runs on its underlying *Conn's own deliveryLoop
+// goroutine (conn.go), which -- like callbackLoop above -- cl.wg does not
+// track either, and which still delivers an event that had already arrived
+// before this Close call ended that conn (deliveryLoop's doc comment).
+//
+// For an application closing the connection for its own reasons (not a
+// graceful shutdown), use CloseWith instead.
 func (cl *Client) Close(ctx context.Context) error {
-	cl.mu.Lock()
-	if cl.closing {
-		cl.mu.Unlock()
-		// Someone else already started shutting down (Close, or a fatal
-		// path that set cl.closing directly: goFatal, onAttemptFailed,
-		// reportAndSchedule). Still reap resources here rather than
-		// returning immediately (F1) -- wg.Wait() bounds on whichever of
-		// them called stopBackoff, which every such path does.
-		cl.wg.Wait()
-		cl.closeCbCh()
+	conn, retiring, ok := cl.closeStart()
+	if !ok {
+		// Someone else already started shutting down (Close, CloseWith, or a
+		// fatal path that set cl.closing directly: goFatal, onAttemptFailed,
+		// reportAndSchedule).
+		cl.closeAlreadyClosing()
 		return nil
 	}
-	cl.closing = true
-	cl.state = clientClosed
-	cl.drainedNoReconnect = false
-	conn := cl.conn
-	retiring := cl.retiringConn
-	cl.retiringConn = nil
-	// B2/ownership invariant: claim conn as the one Close() is gracefully
-	// draining/closing itself, below -- watchConn's closeCh escape must not
-	// also force-close it out from under that graceful teardown. retiring
-	// is deliberately NOT claimed: it gets a bare forced NoError close (the
-	// goroutine right below), not a graceful drain, so it's fine -- harmless,
-	// even -- for the escape to also force-close it if it gets there first
-	// (Conn.Close is idempotent).
-	cl.gracefulConn = conn
-	cl.mu.Unlock()
 
-	cl.stopBackoff()
-	cl.finishFirstResult(errors.New("wsmixer: closed before the first connection completed"))
-
-	if retiring != nil {
+	// retiring != conn (review item 5): during a drain hand-over's window,
+	// cl.conn and cl.retiringConn can point at the very same live conn (see
+	// the ownership invariant above Close) -- closeStart hands both back
+	// as-is. Without this guard, this goroutine's bare NoError close below
+	// would race the graceful conn.Drain/conn.Close a few lines down on the
+	// same conn's closeOnce, and losing that race would send NO_ERROR/1000
+	// on the wire instead of the graceful close this method is actually
+	// trying to perform. closeLiveConns (the fatal-path equivalent) already
+	// guards the same way.
+	if retiring != nil && retiring != conn {
 		go func() { _ = retiring.Close(uint32(NoError), "client closing") }()
 	}
 	var err error
@@ -769,6 +984,20 @@ func (cl *Client) Close(ctx context.Context) error {
 			err = conn.Drain(ctx, "client_requested", DrainOptions{
 				Deadline: 5 * time.Second, HasCloseCode: true, CloseCode: NoError,
 			})
+			// Drain stays truthful and can now return connClosedErr's
+			// io.ErrUnexpectedEOF (conn.go) when the peer's transport dies
+			// abnormally -- no close frame -- while this side is still
+			// waiting out the drain (Drain's own `case <-c.closed: return
+			// c.connClosedErr()`). That is an ORDINARY outcome for Close,
+			// though, not a failure of it: Close's contract is that the
+			// client ends up closed, not that the peer completed the close
+			// handshake -- a peer that simply drops the connection mid-drain
+			// is exactly as "closed" as one that finishes it gracefully.
+			// Filter it here, at the one call site whose result Close
+			// actually returns to its own caller.
+			if errors.Is(err, io.ErrUnexpectedEOF) {
+				err = nil
+			}
 		}
 	}
 	cl.wg.Wait()
@@ -777,6 +1006,90 @@ func (cl *Client) Close(ctx context.Context) error {
 	// comment and callbackLoop's doc comment). closeCbCh is idempotent, so
 	// this races harmlessly with scheduleCbChClose's own call to it if some
 	// other, concurrent shutdown path got there first.
+	cl.closeCbCh()
+	return err
+}
+
+// CloseWith closes the client immediately with a ws-mixer application error
+// code and message (CLIENT-SDK.md's "Application close" row): unlike Close,
+// there is no drain{client_requested}/grace period -- the live connection,
+// if any, is closed at once with error{code,message} then WS close
+// 4000+code (Conn.Close's own three steps; codes > 999, including every
+// application code >= 0x1000_0000, are clamped on the wire to
+// InternalErrorCode's 4002, exactly as for any Conn.Close -- see its doc).
+// For an application closing a connection for its own reasons ws-mixer
+// itself does not interpret, use ApplicationCloseCode.
+//
+// Takes an ErrorCode, not the uint32 Conn.Close does: CloseWith's whole
+// point is being the Client-level counterpart to Conn.Close for exactly the
+// ApplicationCloseCode use case ApplicationCloseCode's own doc comment
+// already describes, so a call site reads naturally as
+// `cl.CloseWith(ctx, wsmixer.ApplicationCloseCode, "bye")` rather than
+// forcing a uint32 conversion at the call site for the common case; CloseWith
+// converts internally where Conn.Close's own signature requires it.
+//
+// Like Close, this marks the client closing FIRST (closeStart, shared with
+// Close -- see its own doc comment for exactly which state transitions that
+// makes), so no reconnect is ever scheduled after this call, and it is
+// idempotent and safe to race against a concurrent Close/CloseWith (exactly
+// one of them wins closeStart's cl.closing check; every other caller falls
+// back to closeAlreadyClosing and still blocks until the winner has
+// finished). Ends any retiring conn (during a drain hand-over) and any
+// in-flight dial the same way Close does (closeStart/stopBackoff) -- except
+// the retiring conn itself is closed with CloseWith's own code/message too,
+// not Close's NO_ERROR, matching the JS SDK's close({code,message})
+// (cross-SDK alignment: JS closes every conn it still owns with the
+// caller's code, not just the active one). Reports exactly one non-fatal
+// DisconnectReason, with code's ErrorCode/ErrorName/WSCode, the same way
+// Close does: not synthesized here directly, but via watchConn observing
+// the conn.Close call below end the connection, exactly the same mechanism
+// that produces Close's own one report -- see watchConn's closingNow
+// branch. When there is no live connection yet (still dialing/backing off,
+// or CloseWith is called before the first connection ever completed), there
+// is nothing for watchConn to observe and so nothing to report, exactly
+// like Close in that same situation.
+//
+// ctx is accepted for signature symmetry with Close and honoured the same
+// way Close honours it for its own immediate-conn.Close branch (conn
+// already draining): not at all -- Conn.Close has no ctx parameter of its
+// own to forward one to, and is already internally bounded (a ~2s flush
+// deadline pre-Run, a 50ms best-effort flush window post-Run).
+//
+// Also safe to call synchronously from inside OnConnect/OnDisconnect
+// themselves, exactly like Close (blocker 2, see Close's own doc comment):
+// those callbacks run on callbackLoop, a goroutine deliberately never added
+// to cl.wg, so CloseWith's own cl.wg.Wait() (shared with Close via
+// closeStart) never waits on the very goroutine calling it.
+//
+// Like Close, ClientConfig.OnStream/OnApp/OnDrain can still run shortly
+// after CloseWith returns: each runs on its underlying *Conn's own
+// deliveryLoop goroutine, untracked by cl.wg, which still delivers an event
+// that had already arrived before this call ended that conn (see Close's
+// own doc comment and deliveryLoop's, conn.go).
+func (cl *Client) CloseWith(ctx context.Context, code ErrorCode, message string) error {
+	conn, retiring, ok := cl.closeStart()
+	if !ok {
+		cl.closeAlreadyClosing()
+		return nil
+	}
+
+	// retiring != conn: see Close's own identical guard/comment above --
+	// the same drain-hand-over window applies here, and losing this race
+	// would send NO_ERROR/1000 instead of the application code/message this
+	// call is specifically trying to send. The retiring conn itself gets
+	// the SAME code/message CloseWith was called with, not NoError -- cross-
+	// SDK alignment with the JS SDK's close({code,message}), which closes
+	// every conn it still owns with the caller's own code, not just the
+	// active one. Plain Close keeps NO_ERROR for both (its own graceful
+	// shutdown is never conditional on which conn happens to be retiring).
+	if retiring != nil && retiring != conn {
+		go func() { _ = retiring.Close(uint32(code), message) }()
+	}
+	var err error
+	if conn != nil {
+		err = conn.Close(uint32(code), message)
+	}
+	cl.wg.Wait()
 	cl.closeCbCh()
 	return err
 }
@@ -920,8 +1233,28 @@ func (cl *Client) waitBackoff(delay time.Duration) bool {
 // CLIENT-SDK.md's "401 on upgrade" rule: an HTTP 401 (or a handshake
 // UNAUTHORIZED/4011) gets exactly one immediate refresh-retry -- the
 // provider is called again and the dial retried right away, no backoff. A
-// second failure of that kind is forced fatal. A provider error, on the
-// first call or the retry's, is always fatal, surfaced verbatim.
+// second REJECTION of that kind (isUnauthorized again), within this one
+// dialAndHandshake call, is always forced fatal, exactly as before -- but a
+// non-rejection failure of the retry's own dial (a DNS blip, TCP reset,
+// HTTP 503, ...) is not a second "no" from the auth server, so it takes the
+// ordinary recoverable path with normal backoff instead (CLIENT-SDK.md says
+// "a second rejection is fatal", not "any second failure is fatal"); the
+// budget stays spent either way, since it was claimed unconditionally
+// before this retry ever dialed. What changed (docs/DECISIONS.md
+// 2026-09-20): "one" is now a once-only budget across dialAndHandshake
+// calls, not per-call -- cl.refreshRetryUsed, re-armed only at stability
+// (armStability), the same as keepaliveRetryUsed. A rejection that arrives
+// while the budget is already spent (a previous cycle used its one
+// refresh-retry and the resulting connection never reached StableAfter
+// before failing again) goes straight to fatal without ever calling the
+// provider a second time -- otherwise a server that welcomes, then closes
+// again before stability, then rejects the redial makes every single cycle
+// mint a fresh auth-service hit. A provider error, on the first call or the
+// retry's, is surfaced verbatim and fatal unless it wraps ErrTokenUnavailable
+// (that sentinel's own doc comment), in which case it takes the ordinary
+// recoverable path instead -- either way the refresh-retry budget itself
+// stays spent once claimed, exactly like a non-rejection failure of the
+// retry's own dial above.
 func (cl *Client) dialAndHandshake() (*Conn, *WelcomeMsg, error) {
 	// One ctx covers both dialOnce's websocket.Dial (the actual TCP+upgrade)
 	// and, inside it, clientHandshake's welcome wait -- client.go's
@@ -967,11 +1300,34 @@ func (cl *Client) dialAndHandshake() (*Conn, *WelcomeMsg, error) {
 		return nil, nil, err
 	}
 	if !isRealProvider(cl.token) {
-		// nit 2: cl.token is StaticToken's own wrapper, so calling it again
-		// can only ever hand back the exact same (already-rejected) token.
-		// Skip the pointless immediate retry and let this 401 go through
-		// the normal recoverable-failure path instead of forcing fatal.
-		return nil, nil, err
+		// A rejected StaticToken is fatal at once (reverses nit 2's earlier
+		// call, docs/DECISIONS.md 2026-09-20): cl.token is StaticToken's own
+		// wrapper, so calling it again can only ever hand back the exact
+		// same (already-rejected) token -- the refresh-retry below would be
+		// pointless. Unlike a real TokenProvider, though, there is also no
+		// point letting this ride the normal recoverable path: the same
+		// token can never start working, so retrying it forever with
+		// backoff only hammers the auth service and hides the problem from
+		// the caller. Force fatal immediately instead, via the same
+		// fatalOverride/forced mechanism the real-provider path's second
+		// failure already uses.
+		return nil, nil, markFatal(err)
+	}
+
+	// The refresh-retry itself is a once-only budget (cl.refreshRetryUsed),
+	// re-armed only at stability -- see this function's own doc comment.
+	// Claim it now, before ever calling the provider again: if a previous,
+	// not-yet-stable cycle already spent it, this rejection is fatal at
+	// once, exactly like the StaticToken case just above (for the same
+	// reason -- calling the provider again here would just mint another
+	// avoidable auth-service hit for a client that keeps failing to
+	// stabilize).
+	cl.mu.Lock()
+	budgetAlreadySpent := cl.refreshRetryUsed
+	cl.refreshRetryUsed = true
+	cl.mu.Unlock()
+	if budgetAlreadySpent {
+		return nil, nil, markFatal(err)
 	}
 
 	tok2, err2 := cl.token(ctx)
@@ -981,6 +1337,21 @@ func (cl *Client) dialAndHandshake() (*Conn, *WelcomeMsg, error) {
 	conn2, welcome2, err2 := cl.dialOnce(ctx, tok2)
 	if err2 == nil {
 		return conn2, welcome2, nil
+	}
+	if !isUnauthorized(err2) {
+		// The refresh-retry's own dial failed, but not with another
+		// rejection -- a DNS blip, TCP reset, or HTTP 503 landing on this
+		// particular redial is an ordinary transient failure, not a second
+		// "no" from the auth server, and CLIENT-SDK.md's fatal rule is
+		// specifically "a second rejection is fatal", not "any second
+		// failure of any kind is fatal". The budget still stays spent
+		// (refreshRetryUsed was already claimed above, unconditionally,
+		// before this dial ever ran) -- only a genuine second rejection, or
+		// this cycle reaching StableAfter, changes that -- but this
+		// particular failure takes the normal recoverable path with normal
+		// backoff instead of ending the client permanently over what may
+		// be nothing more than a dropped packet.
+		return nil, nil, err2
 	}
 	return nil, nil, markFatal(err2)
 }
@@ -1051,8 +1422,10 @@ func (cl *Client) onAttemptSucceeded(conn *Conn, welcome *WelcomeMsg) {
 		go func() { _ = conn.Close(uint32(NoError), "client closing") }()
 		return
 	}
-	cl.attempt = 0
-	cl.keepaliveRetryUsed = false
+	// attempt and keepaliveRetryUsed are deliberately NOT reset here anymore
+	// (D-2026-09-20, StableAfter): armStability below re-arms them only once
+	// this conn has stayed up StableAfter past this same welcome, not at
+	// welcome itself -- see its own doc comment for why.
 	cl.everConnected = true
 	cl.state = clientConnected
 	cl.conn = conn
@@ -1126,7 +1499,55 @@ func (cl *Client) onAttemptSucceeded(conn *Conn, welcome *WelcomeMsg) {
 		cl.watchConn(conn)
 	}()
 
+	cl.wg.Add(1)
+	go func() {
+		defer cl.wg.Done()
+		cl.armStability(conn)
+	}()
+
 	cl.finishFirstResult(nil)
+}
+
+// armStability re-arms the backoff attempt counter and every once-only
+// reconnect budget -- keepaliveRetryUsed (WIRE.md section 2.9's 4013 row,
+// "one immediate attempt, then normal backoff") and refreshRetryUsed
+// (dialAndHandshake's one-time 401/4011 refresh-retry) -- once, and only
+// once, conn has stayed up cl.rc.StableAfter past its own welcome -- not at
+// welcome itself (onAttemptSucceeded, above). A server that welcomes a
+// connection and then immediately closes it must not be able to reset any
+// of them: without this, such a server makes the client redial about once
+// a second forever instead of ever backing off, and mints a fresh
+// auth-service hit on every single cycle if its rejections are 401/4011
+// (spec WIRE.md section 2.9's `stable` state).
+//
+// Uses the same cl.rc.after seam the backoff delay itself uses (not a bare
+// time.AfterFunc/time.Timer), so a white-box test can hold this
+// deterministic exactly like every other clock-driven wait in this file.
+// Bounded to conn's own lifetime, with no leak: conn.Done() ends this
+// goroutine the instant conn itself ends (an ordinary reconnect, a drain
+// replacement, ...) instead of it idling out the rest of StableAfter for
+// nothing, and closeCh (Close, or any fatal path) unblocks it immediately
+// too, same as every other wg-tracked goroutine in this file.
+func (cl *Client) armStability(conn *Conn) {
+	select {
+	case <-cl.rc.after(cl.rc.StableAfter):
+	case <-conn.Done():
+		return
+	case <-cl.closeCh:
+		return
+	}
+	cl.mu.Lock()
+	if cl.conn == conn {
+		// Still the active connection StableAfter later: genuinely stable.
+		// A conn that has since ended (an ordinary reconnect, a drain
+		// replacement, ...) leaves cl.conn pointing elsewhere by the time
+		// this fires, and this is deliberately a no-op then -- exactly the
+		// case this whole mechanism exists to not reset for.
+		cl.attempt = 0
+		cl.keepaliveRetryUsed = false
+		cl.refreshRetryUsed = false
+	}
+	cl.mu.Unlock()
 }
 
 // closeLiveConns is the fatal-path half of the ownership invariant above
@@ -1220,7 +1641,7 @@ func (cl *Client) reportAndSchedule(reason DisconnectReason, computeDelay func(n
 		cl.mu.Unlock()
 		reason.Fatal = true
 		if exhausted {
-			reason.Message = fmt.Sprintf("max reconnect attempts (%d) exhausted: %s", maxAttempts, reason.Message)
+			reason.Message = fmt.Sprintf("max consecutive reconnects without a stable connection (%d) exhausted: %s", maxAttempts, reason.Message)
 		} else {
 			reason.Message = "reconnect disabled: " + reason.Message
 		}
@@ -1300,6 +1721,19 @@ func (cl *Client) handleServerDrain(conn *Conn, d *DrainMsg) {
 	}
 
 	cl.mu.Lock()
+	select {
+	case <-conn.Done():
+		// A flushed drain from conn.go's post-close delivery flush: conn is
+		// already dead, so watchConn (or whatever already reacted to its
+		// close) has this disconnect covered. Starting a reconnect from here
+		// too would set drainReconnectScheduled after the fact and make
+		// watchConn's drainSched branch report a fatal close as a silent,
+		// non-fatal one instead -- a flushed drain must never reconnect for
+		// a conn that is no longer live.
+		cl.mu.Unlock()
+		return
+	default:
+	}
 	if cl.closing || cl.state == clientClosed {
 		cl.mu.Unlock()
 		return
@@ -1430,7 +1864,21 @@ func (cl *Client) watchConn(conn *Conn) {
 		// its last value (still "connected") for however long it takes
 		// whatever runs next -- attemptLoop's own dialing/backoff, or
 		// goFatal/reportAndSchedule's closed -- to actually get scheduled.
-		cl.state = clientDisconnected
+		// Guarded on cl.state != clientClosed (review item 4): every fatal
+		// path (goFatal, onAttemptFailed's fatal branch, reportAndSchedule's
+		// exhaustion/disabled branch) already nils cl.conn in the same
+		// critical section it sets clientClosed in, so wasActive is already
+		// false by the time any of those run first -- this guard is a no-op
+		// for them. closeStart (Close/CloseWith) is the one path that sets
+		// clientClosed WITHOUT nil-ing cl.conn (the caller still needs it,
+		// to close/drain itself): without this guard, THIS watchConn call,
+		// triggered by that very close, would overwrite clientClosed with
+		// clientDisconnected right before returning -- a client that was
+		// connected when Close()/CloseWith() was called always observed
+		// State()=="disconnected" instead of "closed" once they returned.
+		if cl.state != clientClosed {
+			cl.state = clientDisconnected
+		}
 	}
 	if cl.retiringConn == conn {
 		cl.retiringConn = nil
@@ -1494,27 +1942,39 @@ func (cl *Client) watchConn(conn *Conn) {
 		if !used {
 			cl.reportAndSchedule(reason, func(int) time.Duration { return 0 })
 		} else {
-			cl.mu.Lock()
-			cl.keepaliveRetryUsed = false
-			cl.mu.Unlock()
+			// The budget stays spent: only armStability un-spends it, once
+			// this cycle's connection (if it ever lands) stays up
+			// StableAfter. Un-spending it here too, on every recurring
+			// 4013, used to make it self-reset every other cycle regardless
+			// of stability -- masked at v0.4.1 by welcome itself also
+			// resetting it, but a real bug now that welcome alone no longer
+			// does (docs/DECISIONS.md 2026-09-20): a server flapping 4013
+			// forever got an immediate retry on every odd cycle, never
+			// climbing backoff past fullJitter(2).
 			cl.reportAndSchedule(reason, func(next int) time.Duration { return cl.rc.fullJitter(next) })
 		}
 	case 4009, 4014:
 		// WIRE.md section 2.9: "start at cap" for both -- 4009 (drain at
 		// max_streams) and 4014 (APPLICATION_CLOSE) are both deliberate
 		// post-welcome refusals, not failures: the app accepted the
-		// connection, then refused it (e.g. a per-account connection cap),
-		// so onAttemptSucceeded just reset attempt to 0 and ordinary
-		// fullJitter(attempt) would never climb past its lowest rung --
-		// scheduleReconnectAtCap starts the backoff where a real failure
-		// ladder would already be, instead of redialing once a second
-		// forever. retry_after_ms is a field of the drain message, not
-		// error{} -- and any drain the client observes already triggers its
-		// own immediate parallel reconnect above (the drainSched branch,
-		// which now honours retry_after_ms itself -- see handleServerDrain),
-		// which takes priority over this close-code classification for that
-		// same connection. Mirrors the JS SDK's scheduleReconnectAtCap,
-		// which does not look for a hint here either.
+		// connection, then refused it on purpose (e.g. a per-account
+		// connection cap), so the right response is to back off hard
+		// immediately rather than ever probe it again at the bottom of the
+		// ladder. (Before StableAfter existed, this doubled as a workaround
+		// for onAttemptSucceeded resetting attempt to 0 on every welcome --
+		// with the counter now only re-armed once a connection has actually
+		// stayed up StableAfter, that workaround reasoning no longer
+		// applies, but the explicit "refused on purpose" rule stands on its
+		// own regardless.) scheduleReconnectAtCap starts the backoff where a
+		// real failure ladder would already be, instead of redialing once a
+		// second forever. retry_after_ms is a field of the drain message,
+		// not error{} -- and any drain the client observes already triggers
+		// its own immediate parallel reconnect above (the drainSched
+		// branch, which now honours retry_after_ms itself -- see
+		// handleServerDrain), which takes priority over this close-code
+		// classification for that same connection. Mirrors the JS SDK's
+		// scheduleReconnectAtCap, which does not look for a hint here
+		// either.
 		cl.reportAndSchedule(reason, func(int) time.Duration { return cl.rc.jitter(cl.rc.Cap) })
 	default:
 		// Everything else: 4001/4003/4004 (an SDK bug -- still just normal
@@ -1557,6 +2017,16 @@ func (cl *Client) buildConnectedDisconnectReason(conn *Conn) DisconnectReason {
 	}
 	if raw := conn.PeerCloseCode(); raw != -1 {
 		r.WSCode = raw
+		// Report-only, same derivation classifyFailureErr's bare-close case
+		// uses (deriveBareCloseErrorCode): a bare close still gets a usable
+		// ErrorCode/ErrorName. This never changes which switch case
+		// watchConn takes -- that reads wsCode via effectiveWSCode, not
+		// these fields -- only what this DisconnectReason itself carries.
+		if ec, has := deriveBareCloseErrorCode(raw); has {
+			r.ErrorCode = ec
+			r.HasErrorCode = true
+			r.ErrorName = ec.String()
+		}
 	}
 	if err := conn.Err(); err != nil {
 		r.Message = err.Error()

@@ -19,7 +19,7 @@ go get github.com/mcpwarp/ws-mixer-go
 
 | Type | Role |
 |---|---|
-| `Client` | Reconnecting high-level client (`client_reconnect.go`): owns the WIRE.md §2.9 state machine on top of `Dial`, reconnect on by default. `NewClient`/`Connect`/`Close`, `OnConnect`/`OnDisconnect`/`OnStream`/`OnApp`/`OnDrain`, `Stats()`. |
+| `Client` | Reconnecting high-level client (`client_reconnect.go`): owns the WIRE.md §2.9 state machine on top of `Dial`, reconnect on by default. `NewClient`/`Connect`/`Close`/`CloseWith`, `OnConnect`/`OnDisconnect`/`OnStream`/`OnApp`/`OnDrain`, `Stats()`. |
 | `Conn` | One handshaken connection, dialed (`Dial`) or accepted (`AcceptConn`). Opens streams, sends `app`, drains, `Stats()`. |
 | `Stream` | One byte stream. `io.Reader` + `io.Writer` + `Close()` + `CloseWrite()` + `Reset(code, msg)`. |
 | `Options` | `Window`, `MaxStreams`, `PingInterval`, `PingTimeout`, `HelloTimeout`, `ReadLimit`, `Logger`, `Metrics`, plus the stream-0 flood-limit and refused-open-escalation knobs. |
@@ -85,23 +85,92 @@ defer client.Close(context.Background()) // drain{client_requested}, wait <=5s, 
 ```
 
 `Token` is a `TokenProvider func(ctx) (string, error)`, called fresh on every dial — `StaticToken` above is
-just a convenience wrapper for a token that never changes. `OnConnect` fires on every successful `welcome`,
-first connection and every reconnect alike (WIRE.md: no resumption, so nothing from the old `*Conn`
-survives); `OnDisconnect` fires for every disconnect, recoverable or fatal, as one `DisconnectReason`
-(`Phase`, `WSCode`, `ErrorCode`/`ErrorName`, `HTTPStatus`, `Fatal`, `Message`, `CloseReason`, `Cause`).
+just a convenience wrapper for a token that never changes. A `StaticToken` rejected by the server (HTTP 401,
+`error{UNAUTHORIZED}`, or a bare pre-welcome WS close 4011) is fatal at once, not retried with backoff: the
+same fixed token can never start working, so retrying it forever only hammers the auth service and hides the
+problem. A real `TokenProvider` still gets WIRE.md section 2.9's one-time immediate refresh-retry on the same
+rejections (call the provider again, redial right away, no backoff) — but that refresh-retry is itself a
+once-only budget now, re-armed only once a connection has stayed up `ReconnectOptions.StableAfter` (below),
+not on every dial attempt.
+
+A `TokenProvider` error is normally fatal too, surfaced verbatim on `DisconnectReason.Cause` -- but a provider
+that could not OBTAIN a token for a temporary reason (the network is briefly down, the auth server is
+unreachable while refreshing an expired token) can mark that one failure as temporary instead, by wrapping
+`wsmixer.ErrTokenUnavailable`:
+
+```go
+token := func(ctx context.Context) (string, error) {
+	tok, err := refreshFromAuthServer(ctx)
+	if err != nil {
+		return "", fmt.Errorf("refreshing token: %w", wsmixer.ErrTokenUnavailable)
+	}
+	return tok, nil
+}
+```
+
+Client then treats that attempt like an ordinary failed dial (phase `"dial"`, non-fatal, normal backoff, no
+immediate retry) instead of ending the client -- detected via `errors.Is` only, never inferred from an error's
+shape (no `Retryable()`/`Temporary()` duck-typing), so an accidental match can never turn a genuinely fatal
+provider failure into an endless retry loop. An unmarked provider error stays fatal exactly as before.
+
+`OnConnect` fires on every successful `welcome`, first connection and every reconnect alike (WIRE.md: no
+resumption, so nothing from the old `*Conn` survives); `OnDisconnect` fires for every disconnect, recoverable
+or fatal, as one `DisconnectReason` (`Phase`, `WSCode`, `ErrorCode`/`ErrorName`, `HTTPStatus`, `Fatal`,
+`Message`, `CloseReason`, `Cause`). `Phase` is `"dial"`, `"handshake"`, or `"connected"`: any failure after
+`websocket.Dial`'s own upgrade (the 101) and before `welcome` is `"handshake"` — including a transport
+death/EOF with no close frame at all, and a shared per-attempt ctx deadline that happens to expire during the
+welcome wait rather than during the dial itself — not just the `*ConnError`/close-frame cases; a dial
+explicitly *cancelled* by the application (`Close`/`CloseWith` during the handshake wait, or the caller's own
+cancelled `ctx` on a plain `Dial` — as opposed to that same `ctx`'s deadline simply elapsing) stays `"dial"`,
+since that's not a failure to attribute to the peer or the transport at all.
+
 `CloseReason` is the *peer's* WebSocket close-frame reason string, verbatim, whenever one was actually
 observed — including when no ws-mixer `error{}` message preceded it (e.g. it was lost); "" when no close
-frame was observed, this side initiated the close itself (`Close`/`Client.Close`/a protocol violation), or
-one arrived right behind an `error{}` this side had already stopped reading for. A consumer generally wants
-`CloseReason` first, falling back to `Message` when it's empty. An application closing a connection for a
-reason ws-mixer itself does not interpret (e.g. an over-capacity refusal) should use
-`wsmixer.ApplicationCloseCode` with `Conn.Close` (`Client.Close(ctx)` takes no code/message -- there is no
-Client-level application close in this release; calling `Conn.Close` on a connection `Client` is managing
-just looks like an ordinary disconnect to it, and it will reconnect as usual), so the peer's `OnDisconnect`
-sees `ErrorName: "APPLICATION_CLOSE"` rather than `INTERNAL_ERROR` for an unrecognized code; application
-codes `>= 0x1000_0000` remain stream-`Reset`-only, never valid for a connection close. `Client` reconnects
-after an `APPLICATION_CLOSE` (WS 4014) starting at `Cap`, not from the bottom of the backoff ladder: it is a
-deliberate post-`welcome` refusal, and the attempt counter has just been reset by that same `welcome`.
+frame was observed, this side initiated the close itself (`Close`/`CloseWith`/`Client.Close`/a protocol
+violation), or one arrived right behind an `error{}` this side had already stopped reading for. A consumer
+generally wants `CloseReason` first, falling back to `Message` when it's empty.
+
+`ErrorCode`/`HasErrorCode`/`ErrorName` are set whenever the disconnect carries a ws-mixer error code, from any of
+three sources: a peer's wire `error{}` message preceded the close (`ErrorCode` exactly that message's code); no
+`error{}` message was ever seen (e.g. one lost the same way `CloseReason` above can be) but the close frame itself
+carried a WS code in ws-mixer's own reserved range (4001-4999), in which case `ErrorCode` is derived mechanically
+as `ErrorCode(wsCode-4000)` (`ws_close = 4000 + error_code`, run in reverse — never wrong, so never guessed); or a
+ws-mixer error the SDK itself raises locally, with no close frame from the peer involved at all — a
+missing/mismatched subprotocol echo on the upgrade (`UNSUPPORTED`, no close frame or HTTP status either), the
+welcome timeout (its own locally generated `PROTOCOL_ERROR`/4001), and any other local protocol-violation failure
+of an already-connected conn. Left unset for anything that isn't a ws-mixer code: an HTTP upgrade rejection
+(`HTTPStatus` carries that instead), an abnormal closure, no close frame at all, or an ordinary non-ws-mixer WS
+close code.
+
+Backoff's attempt counter, and every once-only reconnect budget alongside it (the keepalive-timeout immediate
+retry, the token refresh-retry above), reset only once a connection has stayed up
+`ReconnectOptions.StableAfter` (default 10s) past its own `welcome` — not at `welcome` itself. A server that
+welcomes a connection and then immediately closes it therefore cannot make the client redial about once a
+second forever, or re-arm a once-only budget on every such cycle: the delay keeps climbing, and each budget
+stays spent, until a connection genuinely stays up. `Client` reconnects after an `APPLICATION_CLOSE` (WS
+4014) or `ENHANCE_YOUR_CALM` (WS 4009) starting at `Cap` instead, not the bottom of the backoff ladder: both
+are deliberate post-`welcome` refusals, not failures, so backing off hard immediately is the right response
+regardless of where the attempt counter happens to be. `ReconnectOptions.MaxAttempts` counts consecutive
+reconnects that never reach a stable connection — a healthy client that drops and recovers occasionally is
+never at risk of exhausting it.
+
+Differs from the JS SDK: Go's `ReconnectOptions.StableAfter` follows Go's usual zero-value idiom — `0` means
+the 10s default, not "no stability window at all" — and a tiny nonzero duration (e.g. `time.Nanosecond`)
+approximates the old reset-at-`welcome` behavior instead. The JS SDK's `stableAfter: 0` means the opposite:
+no stability window, i.e. reset-at-`welcome`. A `0` config value is therefore **not** portable between the
+two SDKs.
+
+An application closing a connection for its own reasons — one ws-mixer itself does not interpret, e.g. an
+over-capacity refusal — should use `wsmixer.ApplicationCloseCode` with `Conn.Close`, or, on a `Client`,
+`Client.CloseWith(ctx, code, message)`: unlike `Close` (graceful: `drain{client_requested}` → grace →
+`NO_ERROR`), `CloseWith` closes the live connection at once with `error{code,message}` then WS close
+`4000+code`, and — like `Close` — stops the reconnect loop for good rather than letting the client redial
+(calling `Conn.Close` directly on a connection a `Client` is managing looks like an ordinary disconnect to it
+instead, and it reconnects as usual). Either way the peer's `OnDisconnect` sees `ErrorName:
+"APPLICATION_CLOSE"` rather than `INTERNAL_ERROR` for an unrecognized code; application codes `>= 0x1000_0000`
+remain stream-`Reset`-only, never valid for a connection close, and any code `> 999` is clamped on the wire to
+`InternalErrorCode`'s 4002 (`error{}` still carries the real code).
+
 `Stats()` returns the
 "ignore and count" counters (unknown frame types, stale frames, duplicate pongs, refused opens, protocol
 violations, bytes in/out), cumulative across reconnects.

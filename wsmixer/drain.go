@@ -85,7 +85,10 @@ func (c *Conn) Drain(ctx context.Context, reason string, opts DrainOptions) erro
 	case <-deadline:
 	case <-ctx.Done():
 	case <-c.closed:
-		return c.Err()
+		// connClosedErr, not Err(): an abnormal closure leaves Err() nil,
+		// which a caller checking err != nil would misread as a clean
+		// (nil-error) Drain completion.
+		return c.connClosedErr()
 	}
 
 	c.mu.Lock()

@@ -88,7 +88,7 @@ func TestClassifyFailureErr(t *testing.T) {
 		{
 			name:      "subprotocol mismatch fatal",
 			err:       &DialError{Err: errors.New("mismatch"), Fatal: true, Mismatch: true},
-			wantPhase: PhaseDial, wantFatal: true,
+			wantPhase: PhaseDial, wantFatal: true, wantCode: UnsupportedCode, hasCode: true,
 		},
 		{
 			name:      "handshake unauthorized not fatal until forced",
@@ -110,6 +110,47 @@ func TestClassifyFailureErr(t *testing.T) {
 			err:       &providerError{cause: errors.New("boom")},
 			wantPhase: PhaseDial, wantFatal: true,
 		},
+		// --- D-2026-09-20-09: bare-close ErrorCode/ErrorName derivation ---
+		{
+			name:      "bare close in ws-mixer range derives ErrorCode/ErrorName",
+			err:       websocket.CloseError{Code: 4014, Reason: "over cap"},
+			wantPhase: PhaseHandshake, wantFatal: false, wantCode: ApplicationCloseCode, hasCode: true,
+		},
+		{
+			name:      "bare close with an unknown ws-mixer code derives INTERNAL_ERROR",
+			err:       websocket.CloseError{Code: 4777, Reason: "?"},
+			wantPhase: PhaseHandshake, wantFatal: false, wantCode: ErrorCode(777), hasCode: true,
+		},
+		{
+			name:      "bare close 1001 (not a ws-mixer code) has no ErrorCode",
+			err:       websocket.CloseError{Code: 1001, Reason: "going away"},
+			wantPhase: PhaseHandshake, wantFatal: false,
+		},
+		{
+			name:      "error{} preceding a 4009 close keeps the message's code, not the derived one",
+			err:       &ConnError{Code: EnhanceYourCalm, Message: "over cap"},
+			wantPhase: PhaseHandshake, wantFatal: false, wantCode: EnhanceYourCalm, hasCode: true,
+		},
+		{
+			name:      "http 401 never gets an ErrorCode (HTTPStatus only)",
+			err:       newDialError(errors.New("401"), &http.Response{StatusCode: 401}),
+			wantPhase: PhaseDial, wantFatal: false, wantHTTP: 401,
+		},
+		{
+			name:      "http 403 never gets an ErrorCode (HTTPStatus only)",
+			err:       newDialError(errors.New("403"), &http.Response{StatusCode: 403}),
+			wantPhase: PhaseDial, wantFatal: true, wantHTTP: 403,
+		},
+		{
+			name:      "http 503 never gets an ErrorCode (HTTPStatus only)",
+			err:       newDialError(errors.New("503"), &http.Response{StatusCode: 503}),
+			wantPhase: PhaseDial, wantFatal: false, wantHTTP: 503,
+		},
+		{
+			name:      "abnormal closure (no close frame) has no ErrorCode",
+			err:       newDialError(errors.New("connection refused"), nil),
+			wantPhase: PhaseDial, wantFatal: false,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -123,11 +164,77 @@ func TestClassifyFailureErr(t *testing.T) {
 			if fi.httpStatus != tc.wantHTTP {
 				t.Errorf("httpStatus = %d, want %d", fi.httpStatus, tc.wantHTTP)
 			}
-			if tc.hasCode && (!fi.hasErrorCode || fi.errCode != tc.wantCode) {
-				t.Errorf("errCode = %v (has=%v), want %v", fi.errCode, fi.hasErrorCode, tc.wantCode)
+			// hasErrorCode is checked unconditionally (not just when
+			// tc.hasCode is true): D-2026-09-20-09 requires ErrorCode be
+			// left UNSET for anything that isn't a ws-mixer code, and this
+			// table exists specifically to pin both directions.
+			if fi.hasErrorCode != tc.hasCode {
+				t.Errorf("hasErrorCode = %v, want %v", fi.hasErrorCode, tc.hasCode)
+			}
+			if tc.hasCode && fi.errCode != tc.wantCode {
+				t.Errorf("errCode = %v, want %v", fi.errCode, tc.wantCode)
 			}
 		})
 	}
+}
+
+// TestBuildConnectedDisconnectReasonBareCloseDerivation unit-tests the
+// connected-phase half of D-2026-09-20-09's derivation (classifyFailureErr's
+// table above covers the handshake-phase half): buildConnectedDisconnectReason
+// derives ErrorCode/ErrorName from a bare close in ws-mixer's own range, and
+// leaves them unset for an abnormal closure or an ordinary non-ws-mixer close
+// code -- built directly against a *Conn (newUnrunConn, close_before_run_test.go),
+// no network needed.
+func TestBuildConnectedDisconnectReasonBareCloseDerivation(t *testing.T) {
+	cl := &Client{}
+
+	t.Run("bare 4014 in range derives ErrorCode/ErrorName", func(t *testing.T) {
+		ws := newFakeWS()
+		c := newUnrunConn(ws)
+		c.mu.Lock()
+		c.observedCloseCode = 4014
+		c.err = errors.New("ws-mixer: peer closed with code 4014")
+		c.mu.Unlock()
+		r := cl.buildConnectedDisconnectReason(c)
+		if r.WSCode != 4014 {
+			t.Errorf("WSCode = %d, want 4014", r.WSCode)
+		}
+		if !r.HasErrorCode || r.ErrorCode != ApplicationCloseCode || r.ErrorName != "APPLICATION_CLOSE" {
+			t.Errorf("HasErrorCode/ErrorCode/ErrorName = %v/%v/%q, want true/ApplicationCloseCode/APPLICATION_CLOSE", r.HasErrorCode, r.ErrorCode, r.ErrorName)
+		}
+	})
+
+	t.Run("bare 1001 (not a ws-mixer code) has no ErrorCode", func(t *testing.T) {
+		ws := newFakeWS()
+		c := newUnrunConn(ws)
+		c.mu.Lock()
+		c.observedCloseCode = 1001
+		c.err = errors.New("ws-mixer: peer closed with code 1001")
+		c.mu.Unlock()
+		r := cl.buildConnectedDisconnectReason(c)
+		if r.WSCode != 1001 {
+			t.Errorf("WSCode = %d, want 1001", r.WSCode)
+		}
+		if r.HasErrorCode {
+			t.Errorf("HasErrorCode = true, want false: 1001 is not a ws-mixer close code")
+		}
+	})
+
+	t.Run("abnormal closure (no close frame observed) has no ErrorCode", func(t *testing.T) {
+		ws := newFakeWS()
+		c := newUnrunConn(ws)
+		// observedCloseCode stays at its newConn-assigned -1 (none observed).
+		c.mu.Lock()
+		c.err = errors.New("ws-mixer: write failed: connection reset")
+		c.mu.Unlock()
+		r := cl.buildConnectedDisconnectReason(c)
+		if r.WSCode != 0 {
+			t.Errorf("WSCode = %d, want 0 (never fabricated)", r.WSCode)
+		}
+		if r.HasErrorCode {
+			t.Errorf("HasErrorCode = true, want false: no close frame was ever observed")
+		}
+	})
 }
 
 func TestIsUnauthorized(t *testing.T) {
@@ -185,6 +292,60 @@ func waitForCalls(t *testing.T, fa *fakeAfter, n int) []time.Duration {
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("only %d delays recorded after 2s, want >= %d", len(calls), n)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// nonStabilityCalls filters raw fa.snapshot() output down to backoff/jitter
+// delays only, dropping every armStability arm (client_reconnect.go: every
+// successful welcome now also calls rc.after(rc.StableAfter), sharing the
+// same seam the backoff/jitter delays themselves use, per StableAfter's own
+// doc comment on why it must). Distinguishable purely by value, not
+// position -- armStability's call can land anywhere in the slice relative
+// to a test's own backoff/jitter calls, racing goroutine scheduling, not
+// something a test should ever depend on ordering-wise. testReconnectOptions
+// never sets StableAfter, so it defaults to 10s -- always far larger than
+// any Base=10ms/Cap=1s backoff value or any jitter(0,2s) call these tests
+// configure.
+func nonStabilityCalls(calls []time.Duration, stableAfter time.Duration) []time.Duration {
+	out := make([]time.Duration, 0, len(calls))
+	for _, d := range calls {
+		if d == stableAfter {
+			continue
+		}
+		out = append(out, d)
+	}
+	return out
+}
+
+// waitForBackoffCalls is waitForCalls, but counting (and returning) only
+// the non-stability delays (nonStabilityCalls) -- for a test asserting a
+// specific backoff/jitter value, since raw waitForCalls's count now also
+// includes however many armStability arms have fired by the time it polls.
+// stableAfterOf returns rc.StableAfter, defaulted the same way
+// ReconnectOptions.setDefaults does -- testReconnectOptions builds a
+// ReconnectOptions directly, without ever calling setDefaults itself (only
+// NewClient's own internal copy gets defaulted), so a test's local rc
+// variable still reads StableAfter's zero value.
+func stableAfterOf(rc ReconnectOptions) time.Duration {
+	if rc.StableAfter <= 0 {
+		return 10 * time.Second
+	}
+	return rc.StableAfter
+}
+
+func waitForBackoffCalls(t *testing.T, fa *fakeAfter, rc ReconnectOptions, n int) []time.Duration {
+	t.Helper()
+	stableAfter := stableAfterOf(rc)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		calls := nonStabilityCalls(fa.snapshot(), stableAfter)
+		if len(calls) >= n {
+			return calls
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d non-stability delays recorded after 2s, want >= %d (raw: %v)", len(calls), n, fa.snapshot())
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -330,6 +491,62 @@ func TestClientSecond401Fatal(t *testing.T) {
 	}
 }
 
+// TestClientMissingSubprotocolEchoReportsUnsupported: a server that upgrades
+// but doesn't echo the ws-mixer subprotocol (websocket.Accept called with no
+// Subprotocols of its own) makes Dial (client.go) fail before clientHandshake
+// is ever reached -- a *DialError{Mismatch: true}, never a close frame or an
+// HTTP status. This is CLIENT-SDK.md's third errorCode source: a ws-mixer
+// error the SDK raises locally. classifyFailureErr's *DialError branch now
+// reports it as UnsupportedCode/UNSUPPORTED even though nothing was ever on
+// the wire (D-2026-09-20-09's amendment).
+func TestClientMissingSubprotocolEchoReportsUnsupported(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// No Subprotocols: the upgrade succeeds, but the client's requested
+		// ws-mixer subprotocol is never echoed back.
+		ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{CompressionMode: websocket.CompressionDisabled})
+		if err != nil {
+			return
+		}
+		defer ws.CloseNow()
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+	url := "ws" + srv.URL[len("http"):] + "/tunnel"
+
+	rec := newDisconnectRecorder()
+	fa := &fakeAfter{}
+	rc := testReconnectOptions(fa, 0)
+	cl := NewClient(url, StaticToken("tok"), ClientConfig{
+		Reconnect:    rc,
+		OnDisconnect: rec.onDisconnect,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := cl.Connect(ctx); err == nil {
+		t.Fatal("Connect should have failed fatally on a missing subprotocol echo")
+	}
+
+	r := rec.waitNext(t)
+	if r.Phase != PhaseDial {
+		t.Errorf("Phase = %v, want dial", r.Phase)
+	}
+	if !r.Fatal {
+		t.Error("Fatal = false, want true")
+	}
+	if !r.HasErrorCode || r.ErrorCode != UnsupportedCode || r.ErrorName != "UNSUPPORTED" {
+		t.Errorf("HasErrorCode/ErrorCode/ErrorName = %v/%v/%q, want true/UnsupportedCode/UNSUPPORTED", r.HasErrorCode, r.ErrorCode, r.ErrorName)
+	}
+	if r.WSCode != 0 {
+		t.Errorf("WSCode = %d, want 0 (no close frame was involved)", r.WSCode)
+	}
+	if r.HTTPStatus != 0 {
+		t.Errorf("HTTPStatus = %d, want 0 (the upgrade itself succeeded)", r.HTTPStatus)
+	}
+	if cl.State() != "closed" {
+		t.Errorf("State() = %s, want closed", cl.State())
+	}
+}
+
 // TestClientHandshakePhaseBareClose4010Fatal: a peer that closes 4010
 // (UNSUPPORTED) before ever sending welcome, with no preceding ws-mixer
 // error{} frame -- an SDK bug on the peer's part, but WIRE.md section 2.9's
@@ -359,6 +576,9 @@ func TestClientHandshakePhaseBareClose4010Fatal(t *testing.T) {
 	}
 	if r.WSCode != 4010 {
 		t.Errorf("WSCode = %d, want 4010", r.WSCode)
+	}
+	if !r.HasErrorCode || r.ErrorCode != UnsupportedCode || r.ErrorName != "UNSUPPORTED" {
+		t.Errorf("HasErrorCode/ErrorCode/ErrorName = %v/%v/%q, want true/UnsupportedCode/UNSUPPORTED (derived from the bare 4010 close, D-2026-09-20-09)", r.HasErrorCode, r.ErrorCode, r.ErrorName)
 	}
 	if !r.Fatal {
 		t.Error("Fatal = false, want true")
@@ -416,6 +636,9 @@ func TestClientHandshakePhaseBareClose4011OneRetryThenFatal(t *testing.T) {
 	if r.WSCode != 4011 {
 		t.Errorf("WSCode = %d, want 4011", r.WSCode)
 	}
+	if !r.HasErrorCode || r.ErrorCode != UnauthorizedCode || r.ErrorName != "UNAUTHORIZED" {
+		t.Errorf("HasErrorCode/ErrorCode/ErrorName = %v/%v/%q, want true/UnauthorizedCode/UNAUTHORIZED (derived from the bare 4011 close, D-2026-09-20-09)", r.HasErrorCode, r.ErrorCode, r.ErrorName)
+	}
 	if !r.Fatal {
 		t.Error("Fatal = false, want true")
 	}
@@ -455,9 +678,10 @@ func TestClientDrainTriggersParallelReconnect(t *testing.T) {
 
 	rec := newDisconnectRecorder()
 	fa := &fakeAfter{}
+	rc := testReconnectOptions(fa, 0.5)
 	var onConnectCount atomic.Int32
 	cl := NewClient(url, StaticToken("tok"), ClientConfig{
-		Reconnect:    testReconnectOptions(fa, 0.5),
+		Reconnect:    rc,
 		OnDisconnect: rec.onDisconnect,
 		OnConnect:    func(*Conn, *WelcomeMsg) { onConnectCount.Add(1) },
 	})
@@ -497,10 +721,11 @@ func TestClientDrainTriggersParallelReconnect(t *testing.T) {
 		t.Fatalf("OnConnect fired %d times, want >= 2 (initial + reconnect)", got)
 	}
 
-	calls := fa.snapshot()
-	if len(calls) == 0 {
-		t.Fatal("no backoff delay recorded for the drain-triggered reconnect")
-	}
+	// The initial connect's own welcome also arms a stability timer
+	// (armStability, sharing this same rc.after seam) -- waitForBackoffCalls
+	// filters it out rather than assuming index 0 is the drain-triggered
+	// delay.
+	calls := waitForBackoffCalls(t, fa, rc, 1)
 	if d := calls[0]; d < 0 || d > 2*time.Second {
 		t.Errorf("drain reconnect delay = %v, want in [0,2s]", d)
 	}
@@ -511,12 +736,14 @@ func TestClientDrainTriggersParallelReconnect(t *testing.T) {
 // "immediate attempt" half is directly testable end to end: a keepalive
 // timeout's very next reconnect attempt costs no backoff delay at all. The
 // "then normal backoff" half only applies to a keepalive timeout that
-// recurs without an intervening successful welcome (Client's
+// recurs without an intervening STABLE connection (Client's
 // keepaliveRetryUsed flag -- like the JS reference's
-// keepaliveImmediateRetryUsed -- is cleared on every welcome, matching
-// WIRE.md's "attempt resets ONLY on welcome" for this flag too); that
-// narrower case is exercised at the unit level in TestClassifyFailureErr's
-// siblings rather than choreographed over real network here.
+// keepaliveImmediateRetryUsed -- is cleared once a connection has stayed up
+// ReconnectOptions.StableAfter past its own welcome, not at welcome itself
+// -- D-2026-09-20, armStability -- for this flag too); that narrower case
+// is exercised at the unit level in TestClassifyFailureErr's siblings
+// rather than choreographed over real network here. TestClientKeepalive4013NotReArmedByWelcomeThenClose
+// pins the StableAfter-specific half of this directly.
 func TestClientKeepaliveTimeoutImmediateRetry(t *testing.T) {
 	var closed atomic.Bool
 	var onConnectCount atomic.Int32
@@ -528,8 +755,9 @@ func TestClientKeepaliveTimeoutImmediateRetry(t *testing.T) {
 
 	rec := newDisconnectRecorder()
 	fa := &fakeAfter{}
+	rc := testReconnectOptions(fa, 1)
 	cl := NewClient(url, StaticToken("tok"), ClientConfig{
-		Reconnect:    testReconnectOptions(fa, 1),
+		Reconnect:    rc,
 		OnDisconnect: rec.onDisconnect,
 		OnConnect:    func(*Conn, *WelcomeMsg) { onConnectCount.Add(1) },
 	})
@@ -552,7 +780,7 @@ func TestClientKeepaliveTimeoutImmediateRetry(t *testing.T) {
 	if got := onConnectCount.Load(); got < 2 {
 		t.Fatalf("OnConnect fired %d times, want 2 (initial + immediate retry)", got)
 	}
-	if calls := fa.snapshot(); len(calls) != 0 {
+	if calls := nonStabilityCalls(fa.snapshot(), stableAfterOf(rc)); len(calls) != 0 {
 		t.Errorf("backoff delays recorded = %v, want none (the retry was immediate)", calls)
 	}
 }
@@ -563,8 +791,9 @@ func TestClientEnhanceYourCalmStartsAtCap(t *testing.T) {
 	}})
 	rec := newDisconnectRecorder()
 	fa := &fakeAfter{}
+	rc := testReconnectOptions(fa, 0.5)
 	cl := NewClient(url, StaticToken("tok"), ClientConfig{
-		Reconnect:    testReconnectOptions(fa, 0.5),
+		Reconnect:    rc,
 		OnDisconnect: rec.onDisconnect,
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -578,7 +807,7 @@ func TestClientEnhanceYourCalmStartsAtCap(t *testing.T) {
 	if r.WSCode != 4009 {
 		t.Fatalf("reason.WSCode = %d, want 4009", r.WSCode)
 	}
-	calls := waitForCalls(t, fa, 1)
+	calls := waitForBackoffCalls(t, fa, rc, 1)
 	want := time.Duration(0.5 * float64(time.Second)) // rand=0.5, cap=1s
 	if calls[0] != want {
 		t.Errorf("4009 delay = %v, want exactly %v (jitter(cap), no retry_after_ms present)", calls[0], want)
@@ -618,7 +847,7 @@ func TestClientApplicationCloseStartsAtCap(t *testing.T) {
 	if r.Fatal {
 		t.Errorf("reason.Fatal = true, want false")
 	}
-	calls := waitForCalls(t, fa, 1)
+	calls := waitForBackoffCalls(t, fa, rc, 1)
 	want := time.Duration(0.5 * float64(time.Second)) // rand=0.5, cap=1s
 	if calls[0] != want {
 		t.Errorf("4014 delay = %v, want exactly %v (jitter(cap), not fullJitter)", calls[0], want)
@@ -629,7 +858,9 @@ func TestClientApplicationCloseStartsAtCap(t *testing.T) {
 // same case -- a peer that sends a raw WS close 4014 with no preceding
 // error{} (effectiveWSCode falls back to conn.PeerCloseCode() and reaches
 // the same switch case) must schedule the same jitter(cap) delay, not
-// fullJitter.
+// fullJitter. ErrorCode/ErrorName are still derived from the bare 4014 close
+// code itself (deriveBareCloseErrorCode, D-2026-09-20-09), even though no
+// error{} message was ever seen.
 func TestClientApplicationCloseBareStartsAtCap(t *testing.T) {
 	var raw atomic.Pointer[websocket.Conn]
 	_, url := startTestServer(t, testAcceptHandler{OnRawConn: func(ws *websocket.Conn) { raw.Store(ws) }})
@@ -659,13 +890,13 @@ func TestClientApplicationCloseBareStartsAtCap(t *testing.T) {
 	if r.WSCode != 4014 {
 		t.Fatalf("reason.WSCode = %d, want 4014", r.WSCode)
 	}
-	if r.HasErrorCode {
-		t.Errorf("reason.HasErrorCode = true, want false: no error{} frame preceded the close")
+	if !r.HasErrorCode || r.ErrorCode != ApplicationCloseCode || r.ErrorName != "APPLICATION_CLOSE" {
+		t.Errorf("reason.HasErrorCode/ErrorCode/ErrorName = %v/%v/%q, want true/ApplicationCloseCode/APPLICATION_CLOSE (derived from the bare 4014 close)", r.HasErrorCode, r.ErrorCode, r.ErrorName)
 	}
 	if r.Fatal {
 		t.Errorf("reason.Fatal = true, want false")
 	}
-	calls := waitForCalls(t, fa, 1)
+	calls := waitForBackoffCalls(t, fa, rc, 1)
 	want := time.Duration(0.5 * float64(time.Second)) // rand=0.5, cap=1s
 	if calls[0] != want {
 		t.Errorf("bare 4014 delay = %v, want exactly %v (jitter(cap), not fullJitter)", calls[0], want)
@@ -707,54 +938,14 @@ func TestClientFatalCloseCodesPostConnect(t *testing.T) {
 	}
 }
 
-func TestClientAttemptResetOnWelcome(t *testing.T) {
-	var attempt atomic.Int32
-	_, url := startTestServer(t, testAcceptHandler{OnConn: func(c *Conn) {
-		n := attempt.Add(1)
-		if n == 2 {
-			// The second connection (the retry after the first plain
-			// connected-phase failure below) succeeds and is left alone.
-			return
-		}
-		go func() { _ = c.Close(uint32(ProtocolErrorCode), "test forcing a plain backoff") }()
-	}})
-
-	rec := newDisconnectRecorder()
-	fa := &fakeAfter{}
-	cl := NewClient(url, StaticToken("tok"), ClientConfig{
-		Reconnect:    testReconnectOptions(fa, 1), // rand=1: delay lands exactly on fullJitter's upper bound
-		OnDisconnect: rec.onDisconnect,
-	})
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := cl.Connect(ctx); err != nil {
-		t.Fatalf("Connect: %v", err)
-	}
-	// First failure: attempt goes 0->1, delay = fullJitter(1).
-	rec.waitNext(t)
-	// Wait for the reconnect to actually land (welcome resets attempt to 0).
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) && cl.Conn() == nil {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if cl.Conn() == nil {
-		t.Fatal("client never reconnected")
-	}
-
-	// Force one more plain failure by closing the now-active connection
-	// directly, and check the resulting delay used attempt=1 again (i.e. was
-	// reset by the intervening welcome), not attempt=2.
-	_ = cl.Conn().Close(uint32(ProtocolErrorCode), "test forcing a second plain backoff")
-	rec.waitNext(t)
-	defer cl.Close(context.Background())
-
-	rc := testReconnectOptions(fa, 1)
-	want := rc.fullJitter(1)
-	calls := waitForCalls(t, fa, 2)
-	if calls[0] != want || calls[1] != want {
-		t.Errorf("delays = %v, want both == %v (attempt counter reset on welcome, not accumulating)", calls, want)
-	}
-}
+// TestClientAttemptResetOnWelcome is superseded by
+// client_reconnect_stability_test.go's TestClientAttemptResetOnlyAfterStability
+// and TestClientAttemptResetAfterStabilityElapses (D-2026-09-20,
+// StableAfter): the attempt counter no longer resets at welcome alone, so
+// this test's premise no longer holds. Kept as a named pointer rather than
+// silently deleted, since it is exactly the test D-2026-09-20's
+// revert-proof exercises (see TestClientAttemptResetProofRevertsWithoutStabilityGate's
+// doc comment).
 
 func TestClientCloseSendsClientRequestedDrainAndWaits(t *testing.T) {
 	var serverDrain atomic.Pointer[DrainMsg]
@@ -799,5 +990,61 @@ func TestClientCloseSendsClientRequestedDrainAndWaits(t *testing.T) {
 	}
 	if serverConn.CloseCode() != 1000 {
 		t.Errorf("server-observed close code = %d, want 1000 (NO_ERROR, per WIRE.md section 2.10 rule 14)", serverConn.CloseCode())
+	}
+}
+
+// TestClientCloseTreatsAbnormalDrainEndAsSuccess: the peer drops the raw
+// transport (no WS close frame at all) while this side is waiting out its
+// own graceful drain{client_requested} -- Conn.Drain's `case <-c.closed:`
+// branch now returns connClosedErr's io.ErrUnexpectedEOF (conn.go) for
+// exactly this abnormal-closure case, but that must not surface as an error
+// from Client.Close: a peer that simply drops the connection mid-drain is
+// still an ordinary, successful shutdown outcome from the client's own
+// point of view (Close's contract is "the client ends up closed", not "the
+// peer completed the handshake").
+func TestClientCloseTreatsAbnormalDrainEndAsSuccess(t *testing.T) {
+	var raw atomic.Pointer[websocket.Conn]
+	_, url := startTestServer(t, testAcceptHandler{
+		OnRawConn: func(ws *websocket.Conn) { raw.Store(ws) },
+		OnConn: func(c *Conn) {
+			// Drain's initial select (drain.go) resolves immediately via
+			// waitForDrainedOrEmpty() when the stream table is already
+			// empty -- this test needs the <-c.closed branch instead, so it
+			// keeps one stream open (never closed) to make Drain actually
+			// wait rather than complete in the same instant it starts.
+			go func() { _, _ = c.OpenStream(context.Background()) }()
+			c.OnDrain(func(*DrainMsg) {
+				// Drop the transport outright instead of letting the normal
+				// server-side drain sequence run: no WS close frame at all,
+				// exactly a TCP reset/half-open death mid-drain.
+				go func() {
+					if ws := raw.Load(); ws != nil {
+						_ = ws.CloseNow()
+					}
+				}()
+			})
+		},
+	})
+
+	rec := newDisconnectRecorder()
+	cl := NewClient(url, StaticToken("tok"), ClientConfig{OnDisconnect: rec.onDisconnect})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := cl.Connect(ctx); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer closeCancel()
+	if err := cl.Close(closeCtx); err != nil {
+		t.Errorf("Close() = %v, want nil (an abnormal transport drop mid-drain is still a successful shutdown)", err)
+	}
+	if got := cl.State(); got != "closed" {
+		t.Errorf("State() = %s, want closed", got)
+	}
+
+	r := rec.waitNext(t)
+	if r.Fatal {
+		t.Errorf("reason.Fatal = true, want false")
 	}
 }

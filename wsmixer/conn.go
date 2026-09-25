@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -424,35 +425,71 @@ func (c *Conn) Run() {
 // hold up delivery of the next event. There is no way to preempt a handler
 // that is currently running -- a handler that blocks forever (never spawning
 // a goroutine for its real work) is an application bug that permanently
-// wedges this goroutine, full stop. This loop checks c.closed with priority
-// over c.deliveryQueue on every iteration, so at most one more handler may
-// start after close (the two cases race in the second select below) before
-// it returns, rather than continuing to drain whatever backlog is queued.
+// wedges this goroutine, full stop.
+//
+// On <-c.closed, this loop does not just return: readerLoop (dispatch.go),
+// the only producer that ever sends to c.deliveryQueue, has always already
+// stopped calling dispatch by the time anything closes c.closed (every
+// fail()/Close()/handlePeerError path either runs synchronously on
+// readerLoop's own goroutine right before it returns, or closes c.closed from
+// a separate goroutine well after readerLoop stopped reading) -- so whatever
+// is still sitting in the queue at that point was enqueued from a frame that
+// arrived strictly before whatever ended the connection. A real peer's
+// error{} is always the LAST message it sends (OVERVIEW.md section 2.8), so
+// an app/drain/open event queued ahead of it was received before error{} --
+// dropping it here would violate OnApp's "called for every incoming app
+// message" promise (and OnStream/OnDrain's equivalent) for an event that has
+// already, unambiguously, arrived. flushDeliveryQueue drains exactly that
+// backlog, in order, before this returns.
 func (c *Conn) deliveryLoop() {
 	for {
 		select {
+		case ev := <-c.deliveryQueue:
+			c.deliverEvent(ev)
 		case <-c.closed:
+			c.flushDeliveryQueue()
 			return
-		default:
 		}
+	}
+}
+
+// flushDeliveryQueue drains whatever is already sitting in c.deliveryQueue,
+// in order, once the connection has closed -- see deliveryLoop's doc comment
+// for why this backlog is still owed delivery rather than dropped. Bounded at
+// cap(c.deliveryQueue) iterations so this always terminates unconditionally:
+// readerLoop, the only producer, has already stopped by the time c.closed
+// fires, so the queue only ever shrinks from here in the ordinary case, but
+// nothing about a non-blocking drain loop on its own guarantees termination
+// against every conceivable producer, and this must never be the one thing
+// that can hang after close.
+func (c *Conn) flushDeliveryQueue() {
+	for i := 0; i < cap(c.deliveryQueue); i++ {
 		select {
 		case ev := <-c.deliveryQueue:
-			h := c.hp.Load()
-			if h == nil {
-				continue
-			}
-			if ev.open != nil && h.onStream != nil {
-				h.onStream(ev.open)
-			}
-			if ev.app != nil && h.onApp != nil {
-				h.onApp(ev.app)
-			}
-			if ev.drain != nil && h.onDrain != nil {
-				h.onDrain(ev.drain)
-			}
-		case <-c.closed:
+			c.deliverEvent(ev)
+		default:
 			return
 		}
+	}
+}
+
+// deliverEvent invokes the one handler ev carries -- OnStream, OnApp, or
+// OnDrain -- against the current handlers snapshot. Shared by deliveryLoop's
+// live path and flushDeliveryQueue's post-close flush so both invoke handlers
+// identically and in the same wire order.
+func (c *Conn) deliverEvent(ev deliveryEvent) {
+	h := c.hp.Load()
+	if h == nil {
+		return
+	}
+	if ev.open != nil && h.onStream != nil {
+		h.onStream(ev.open)
+	}
+	if ev.app != nil && h.onApp != nil {
+		h.onApp(ev.app)
+	}
+	if ev.drain != nil && h.onDrain != nil {
+		h.onDrain(ev.drain)
 	}
 }
 
@@ -498,6 +535,22 @@ func (c *Conn) Err() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.err
+}
+
+// connClosedErr returns the error that ended the connection, never nil: an
+// abnormal closure (no close frame) leaves c.err nil, and a Stream must still
+// report "the tunnel died" rather than a nil error -- WIRE.md section 2.9
+// requires a handler to tell EOF from a dead tunnel. Use this, never Err(),
+// at any point that has already observed c.closed and is about to hand that
+// fact to a caller as an error return: a nil error there would be read as
+// success (Write) or misread as a clean end-of-stream, not io.EOF, so a
+// caller re-checking for exactly io.EOF (as Read's own peer-CLOSE path
+// requires) would loop instead of stopping.
+func (c *Conn) connClosedErr() error {
+	if err := c.Err(); err != nil {
+		return err
+	}
+	return io.ErrUnexpectedEOF
 }
 
 // finishHandshake marks the handshake complete and releases the ping and
@@ -673,6 +726,14 @@ func (c *Conn) fail(e *ConnError) {
 			} else {
 				// No writer loop yet (a pre-run handshake failure): write the
 				// error{} frame synchronously, right here, or it is lost.
+				// Unlike Close (below), this does not also flush whatever is
+				// already sitting in controlQueue first: every pre-Run fail()
+				// call site is handshake-internal (AcceptConn,
+				// runServerHandshake's hello timer, Dial) -- strictly before
+				// the application has ever been handed this *Conn -- so the
+				// queue is necessarily empty here. An application holding a
+				// not-yet-running Conn (e.g. a server's OnConn) can only end
+				// it itself via Close or Drain, both of which do flush.
 				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 				_ = c.writeControlNow(ctx, EncodeData(0, b))
 				cancel()
@@ -715,6 +776,15 @@ func (c *Conn) fail(e *ConnError) {
 // 4000-4999) and so cannot be expressed as one: the WS close this method
 // sends is clamped to InternalErrorCode's code (4002) in that case, while
 // error{} still carries the caller's real code.
+//
+// This does not stop OnStream/OnApp/OnDrain from firing: any stream/app/drain
+// event that had already arrived before Close was called -- queued but not
+// yet delivered -- is still delivered, on deliveryLoop's own goroutine, which
+// can run briefly after this method returns (deliveryLoop's doc comment). A
+// caller that tears down per-connection state on Close returning must be able
+// to tolerate one more already-in-flight callback invocation after that,
+// exactly as it already must tolerate one racing Close from the read/delivery
+// side in the first place.
 func (c *Conn) Close(code uint32, msg string) error {
 	c.closeOnce.Do(func() {
 		ec := ErrorCode(code)

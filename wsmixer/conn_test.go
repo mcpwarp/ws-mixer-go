@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -359,6 +361,228 @@ func TestOpenStreamDoesNotDeadlockWithFailWrite(t *testing.T) {
 	}
 
 	waitForGoroutines(t, before)
+}
+
+// --- deliveryLoop flush-on-close tests --------------------------------------
+//
+// These build a *Conn with newConn directly, without calling Run(): the
+// point is to drive deliveryLoop as a bare goroutine against a hand-populated
+// c.deliveryQueue and a c.closed the test closes itself, so the
+// close-vs-still-queued race that used to drop already-received events
+// (conn.go's deliveryLoop, pre-fix: a priority `select { case <-c.closed:
+// return; default: }` ahead of the real select) is deterministic instead of
+// depending on goroutine scheduling.
+
+// newUnrunConnForDelivery builds a handshake-complete *Conn that Run() has
+// never been called on (close_before_run_test.go's newUnrunConn, plus test
+// cleanup), mirroring the setup TestWriterLoopRoundRobinsAcrossStreams and
+// friends use for driving a single loop directly.
+func newUnrunConnForDelivery(t *testing.T) *Conn {
+	t.Helper()
+	ws := newFakeWS()
+	c := newUnrunConn(ws)
+	t.Cleanup(func() { _ = ws.CloseNow() })
+	return c
+}
+
+// runDeliveryLoopToCompletion starts deliveryLoop and waits (bounded) for it
+// to return, failing the test if it doesn't -- every flush test needs both
+// "the events arrived" and "the loop actually terminated" checked.
+func runDeliveryLoopToCompletion(t *testing.T, c *Conn) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		c.deliveryLoop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("deliveryLoop did not return within 2s of c.closed closing")
+	}
+}
+
+// TestDeliveryLoopFlushesQueuedAppEventsOnClose is the core regression test:
+// two app events queued, then c.closed closed (simulating the read loop
+// enqueueing both, without yielding, right before the peer's error{} tears
+// the connection down) -- both must still be delivered, in order, and
+// deliveryLoop must return. Pre-fix, this failed 100% of the time (the
+// priority check saw c.closed already closed and returned without draining
+// anything).
+func TestDeliveryLoopFlushesQueuedAppEventsOnClose(t *testing.T) {
+	c := newUnrunConnForDelivery(t)
+
+	var mu sync.Mutex
+	var got []string
+	c.OnApp(func(body json.RawMessage) {
+		mu.Lock()
+		got = append(got, string(body))
+		mu.Unlock()
+	})
+
+	c.deliveryQueue <- deliveryEvent{app: json.RawMessage(`{"seq":1}`)}
+	c.deliveryQueue <- deliveryEvent{app: json.RawMessage(`{"seq":2}`)}
+	close(c.closed)
+
+	runDeliveryLoopToCompletion(t, c)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if want := []string{`{"seq":1}`, `{"seq":2}`}; !slicesEqual(got, want) {
+		t.Fatalf("delivered app bodies = %v, want %v (in order)", got, want)
+	}
+}
+
+// TestDeliveryLoopFlushesQueuedDrainEventOnClose is the drain variant of the
+// same regression: a drain message queued right before close must still be
+// delivered.
+func TestDeliveryLoopFlushesQueuedDrainEventOnClose(t *testing.T) {
+	c := newUnrunConnForDelivery(t)
+
+	delivered := make(chan *DrainMsg, 1)
+	c.OnDrain(func(d *DrainMsg) { delivered <- d })
+
+	want := &DrainMsg{T: "drain", Reason: "maintenance", LastStreamID: 7}
+	c.deliveryQueue <- deliveryEvent{drain: want}
+	close(c.closed)
+
+	runDeliveryLoopToCompletion(t, c)
+
+	select {
+	case got := <-delivered:
+		if got != want {
+			t.Fatalf("OnDrain delivered %#v, want the same *DrainMsg %#v", got, want)
+		}
+	default:
+		t.Fatal("OnDrain never fired for the queued drain event")
+	}
+}
+
+// TestDeliveryLoopFlushesQueuedOpenEventOnClose is the stream-OPEN variant:
+// an OnStream event queued right before the conn died must still fire, and
+// (per handleRemoteOpen's own doc comment) the handler must be able to use
+// the *Stream even though the conn is already dead -- Read/Write on it return
+// the conn's error promptly rather than hang, since Stream.wait selects on
+// s.conn.closed.
+func TestDeliveryLoopFlushesQueuedOpenEventOnClose(t *testing.T) {
+	c := newUnrunConnForDelivery(t)
+
+	st := newStream(c, 3, c.ourWindow, c.peerWindow)
+	delivered := make(chan *Stream, 1)
+	c.OnStream(func(s *Stream) { delivered <- s })
+
+	c.deliveryQueue <- deliveryEvent{open: st}
+	// Match what every real close path does: c.err is always set before
+	// c.closed closes (fail/Close/handlePeerError all set it under c.mu in
+	// the same critical section) -- Stream.wait relies on that to turn
+	// <-s.conn.closed into a non-nil error, so close c.closed here the same
+	// way or ReadContext's err/eof-less loop spins on a nil wait() forever.
+	c.mu.Lock()
+	c.err = &ConnError{Code: InternalErrorCode, Message: "test: connection died"}
+	c.mu.Unlock()
+	close(c.closed)
+
+	runDeliveryLoopToCompletion(t, c)
+
+	select {
+	case got := <-delivered:
+		if got != st {
+			t.Fatalf("OnStream delivered %#v, want %#v", got, st)
+		}
+		// The conn is already dead: a read on this stream must return the
+		// conn's own error promptly, never hang.
+		buf := make([]byte, 1)
+		readDone := make(chan struct{})
+		go func() {
+			_, _ = got.Read(buf)
+			close(readDone)
+		}()
+		select {
+		case <-readDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("Read on a stream delivered after the conn died did not return promptly")
+		}
+	default:
+		t.Fatal("OnStream never fired for the queued open event")
+	}
+}
+
+// TestDeliveryLoopFlushOrderingMixed checks that a mix of open/app/drain
+// events flushed on close still delivers in exactly the order they were
+// enqueued -- deliverEvent must not reorder across event kinds.
+func TestDeliveryLoopFlushOrderingMixed(t *testing.T) {
+	c := newUnrunConnForDelivery(t)
+
+	st := newStream(c, 5, c.ourWindow, c.peerWindow)
+	drainMsg := &DrainMsg{T: "drain", Reason: "maintenance"}
+
+	var mu sync.Mutex
+	var order []string
+	c.OnStream(func(*Stream) {
+		mu.Lock()
+		order = append(order, "open")
+		mu.Unlock()
+	})
+	c.OnApp(func(json.RawMessage) {
+		mu.Lock()
+		order = append(order, "app")
+		mu.Unlock()
+	})
+	c.OnDrain(func(*DrainMsg) {
+		mu.Lock()
+		order = append(order, "drain")
+		mu.Unlock()
+	})
+
+	c.deliveryQueue <- deliveryEvent{app: json.RawMessage(`{}`)}
+	c.deliveryQueue <- deliveryEvent{open: st}
+	c.deliveryQueue <- deliveryEvent{drain: drainMsg}
+	c.deliveryQueue <- deliveryEvent{app: json.RawMessage(`{}`)}
+	close(c.closed)
+
+	runDeliveryLoopToCompletion(t, c)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if want := []string{"app", "open", "drain", "app"}; !slicesEqual(order, want) {
+		t.Fatalf("flush order = %v, want %v", order, want)
+	}
+}
+
+// TestDeliveryLoopFlushIsBounded checks that a queue filled to capacity is
+// still fully flushed and deliveryLoop still returns -- the flush's
+// cap(c.deliveryQueue) iteration bound must never cut the drain short for a
+// legitimately full backlog (only guard against a producer that somehow
+// outlives readerLoop, which cannot happen in practice).
+func TestDeliveryLoopFlushIsBounded(t *testing.T) {
+	c := newUnrunConnForDelivery(t)
+
+	n := cap(c.deliveryQueue)
+	var count atomic.Int64
+	c.OnApp(func(json.RawMessage) { count.Add(1) })
+
+	for i := 0; i < n; i++ {
+		c.deliveryQueue <- deliveryEvent{app: json.RawMessage(`{}`)}
+	}
+	close(c.closed)
+
+	runDeliveryLoopToCompletion(t, c)
+
+	if got := count.Load(); got != int64(n) {
+		t.Fatalf("delivered %d of %d queued events, want all %d flushed", got, n, n)
+	}
+}
+
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // TestWriterLoopRoundRobinsAcrossStreams is a deterministic, non-timing-based

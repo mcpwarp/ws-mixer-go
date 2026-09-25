@@ -9,8 +9,7 @@ package wsmixer
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
+	"encoding/json"
 	"runtime"
 	"sync/atomic"
 	"testing"
@@ -221,68 +220,139 @@ func TestClientDrainRaceWinnerReportsSupersededDisconnect(t *testing.T) {
 	t.Fatalf("no OnDisconnect reported for the superseded conn (reasons so far: %+v)", rec.snapshotAll())
 }
 
-// TestClientStaticTokenNoImmediateRetryOn401 pins nit 6: a StaticToken
-// client has no way for a redial to fix an HTTP 401 (it would hand back the
-// exact same, already-rejected token), so isRealProvider gates the
-// one-time immediate refresh-retry off for it -- the 401 goes through the
-// ordinary recoverable-disconnect path (reported, then backed off) instead.
-// This asserts the outward, user-visible behavior (a report, not a second
-// immediate dial) rather than reflecting on isRealProvider directly.
-// TestClient401RefreshRetrySuccess is this test's provider-side
-// counterpart: 2 token-provider calls before Connect ever returns, no
-// intervening report.
-//
-// The retry this test must rule out happens inline, inside dialAndHandshake,
-// strictly before onAttemptFailed/reportAndSchedule ever runs -- so it can't
-// be told apart from the correctly-scheduled backoff retry by racing a
-// channel receive against however fast a second dial reaches the network
-// (both would look identical, and on this machine the scheduled retry often
-// wins that race despite being entirely legitimate). Instead, the backoff
-// clock itself is held closed (rc.after never fires) until after the
-// assertion: since a real provider's retry never calls rc.after at all (see
-// TestClient401RefreshRetrySuccess -- it succeeds inline, no report, no
-// backoff), holding it closed can only ever stall the correct, scheduled
-// retry, never mask an incorrect inline one -- so "still exactly 1 dial
-// while backoff is held closed" is a deterministic proof, not a timing bet.
-func TestClientStaticTokenNoImmediateRetryOn401(t *testing.T) {
-	var n atomic.Int32
-	inner := newTestListener(testAcceptHandler{Options: Options{Logger: discardLogger()}})
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if n.Add(1) == 1 {
-			http.Error(w, "flaky", http.StatusUnauthorized)
-			return
-		}
-		inner.ServeHTTP(w, r)
-	}))
-	t.Cleanup(srv.Close)
-	url := "ws" + srv.URL[len("http"):] + "/tunnel"
-
-	afterCh := make(chan time.Time)
-	rc := ReconnectOptions{Base: 10 * time.Millisecond, Cap: time.Second, ConnectTimeout: 2 * time.Second}
-	rc.after = func(time.Duration) <-chan time.Time { return afterCh }
-	// randFloat64 must not be 0: fullJitter(next) = randFloat64()*exp, and a
-	// delay of exactly 0 takes waitBackoff's fast path without ever calling
-	// rc.after at all -- defeating the block below.
-	rc.randFloat64 = fixedRand(1)
+// TestClientStaticToken401Fatal pins the reversed nit-2 decision
+// (docs/DECISIONS.md 2026-09-20): a StaticToken client has no way for a
+// redial to fix an HTTP 401 (it would hand back the exact same,
+// already-rejected token), so a rejected static token is now fatal at once
+// -- retrying it forever with backoff can never turn into success, only
+// hammer the auth service and hide the problem. Exactly one dial happens;
+// no refresh-retry (that needs a real TokenProvider, see
+// TestClientSecond401Fatal) and no backoff (fatal skips reportAndSchedule's
+// scheduling entirely).
+func TestClientStaticToken401Fatal(t *testing.T) {
+	// newFlakyServer with statuses covering every attempt (more than the one
+	// dial this test expects) is what proves no redial ever happens: a
+	// second dial would fall through to the inner listener instead.
+	url, flaky := newFlakyServer(t, []int{401, 401, 401}, testAcceptHandler{})
 
 	rec := newDisconnectRecorder()
+	fa := &fakeAfter{}
 	cl := NewClient(url, StaticToken("tok"), ClientConfig{
-		Reconnect:    rc,
+		Reconnect:    testReconnectOptions(fa, 1),
 		OnDisconnect: rec.onDisconnect,
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	go func() { _ = cl.Connect(ctx) }()
+	if err := cl.Connect(ctx); err == nil {
+		t.Fatal("Connect should have failed fatally on a rejected static token")
+	}
 	defer cl.Close(context.Background())
 
 	r := rec.waitNext(t)
+	if !r.Fatal {
+		t.Errorf("reason.Fatal = false, want true (a rejected static token is fatal at once)")
+	}
 	if r.HTTPStatus != 401 {
-		t.Fatalf("reason.HTTPStatus = %d, want 401", r.HTTPStatus)
+		t.Errorf("reason.HTTPStatus = %d, want 401", r.HTTPStatus)
 	}
-	if got := n.Load(); got != 1 {
-		t.Errorf("dial attempts while backoff is held closed = %d, want exactly 1 (no immediate refresh-retry for a static token)", got)
+	if r.Phase != PhaseDial {
+		t.Errorf("reason.Phase = %v, want dial", r.Phase)
 	}
-	close(afterCh) // let the correctly-scheduled retry (against inner) through
+	if got := flaky.n.Load(); got != 1 {
+		t.Errorf("dial attempts = %d, want exactly 1 (fatal at once, no refresh-retry, no backoff redial)", got)
+	}
+	if got := cl.State(); got != "closed" {
+		t.Errorf("State() = %s, want closed", got)
+	}
+}
+
+// TestClientStaticTokenBareClose4011HandshakeFatal pins the same
+// reversed nit-2 decision one layer lower on the wire: a bare pre-welcome WS
+// close 4011 (no ws-mixer error{} frame), with a StaticToken client, is
+// fatal at once -- exactly one dial, no refresh-retry (isRealProvider gates
+// that off for a static token, same as ever), no backoff redial.
+func TestClientStaticTokenBareClose4011HandshakeFatal(t *testing.T) {
+	var accepts atomic.Int32
+	_, url := startTestServer(t, testAcceptHandler{OnRawConn: func(ws *websocket.Conn) {
+		accepts.Add(1)
+		_ = ws.Close(4011, "reauth required")
+	}})
+
+	rec := newDisconnectRecorder()
+	fa := &fakeAfter{}
+	cl := NewClient(url, StaticToken("tok"), ClientConfig{
+		Reconnect:    testReconnectOptions(fa, 1),
+		OnDisconnect: rec.onDisconnect,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := cl.Connect(ctx); err == nil {
+		t.Fatal("Connect should have failed fatally on a rejected static token")
+	}
+	defer cl.Close(context.Background())
+
+	r := rec.waitNext(t)
+	if !r.Fatal {
+		t.Errorf("reason.Fatal = false, want true (a rejected static token is fatal at once)")
+	}
+	if r.Phase != PhaseHandshake {
+		t.Errorf("reason.Phase = %v, want handshake", r.Phase)
+	}
+	if r.WSCode != 4011 {
+		t.Errorf("reason.WSCode = %d, want 4011", r.WSCode)
+	}
+	if got := accepts.Load(); got != 1 {
+		t.Errorf("server accepted %d connections, want exactly 1", got)
+	}
+}
+
+// TestClientStaticTokenConnErrorUnauthorizedFatal is the same again, one
+// layer higher: a real error{11} stream-0 frame before welcome (a
+// *ConnError{UnauthorizedCode} on the client side, not just a bare close)
+// with a StaticToken client is fatal at once. Written directly on the raw
+// WebSocket (OnRawConn), the same way TestClientHandshakePhaseBareCloseReason
+// pokes the wire below AcceptConn's own handshake.
+func TestClientStaticTokenConnErrorUnauthorizedFatal(t *testing.T) {
+	var accepts atomic.Int32
+	_, url := startTestServer(t, testAcceptHandler{OnRawConn: func(ws *websocket.Conn) {
+		accepts.Add(1)
+		errMsg := &ErrorMsg{T: "error", Code: uint32(UnauthorizedCode), Message: "nope"}
+		b, err := json.Marshal(errMsg)
+		if err != nil {
+			t.Fatalf("marshal error{}: %v", err)
+		}
+		if err := ws.Write(context.Background(), websocket.MessageBinary, EncodeData(0, b)); err != nil {
+			t.Fatalf("write error{}: %v", err)
+		}
+		_ = ws.Close(4011, "nope")
+	}})
+
+	rec := newDisconnectRecorder()
+	fa := &fakeAfter{}
+	cl := NewClient(url, StaticToken("tok"), ClientConfig{
+		Reconnect:    testReconnectOptions(fa, 1),
+		OnDisconnect: rec.onDisconnect,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := cl.Connect(ctx); err == nil {
+		t.Fatal("Connect should have failed fatally on a rejected static token")
+	}
+	defer cl.Close(context.Background())
+
+	r := rec.waitNext(t)
+	if !r.Fatal {
+		t.Errorf("reason.Fatal = false, want true (a rejected static token is fatal at once)")
+	}
+	if r.Phase != PhaseHandshake {
+		t.Errorf("reason.Phase = %v, want handshake", r.Phase)
+	}
+	if !r.HasErrorCode || r.ErrorCode != UnauthorizedCode {
+		t.Errorf("reason.ErrorCode = %v (has=%v), want UnauthorizedCode", r.ErrorCode, r.HasErrorCode)
+	}
+	if got := accepts.Load(); got != 1 {
+		t.Errorf("server accepted %d connections, want exactly 1", got)
+	}
 }
 
 // TestClientCloseCode1001ClassifiedLikeGoingAway pins nit 6's other test
@@ -297,9 +367,10 @@ func TestClientCloseCode1001ClassifiedLikeGoingAway(t *testing.T) {
 
 	rec := newDisconnectRecorder()
 	fa := &fakeAfter{}
+	rc := testReconnectOptions(fa, 0.5)
 	var onConnectCount atomic.Int32
 	cl := NewClient(url, StaticToken("tok"), ClientConfig{
-		Reconnect:    testReconnectOptions(fa, 0.5),
+		Reconnect:    rc,
 		OnDisconnect: rec.onDisconnect,
 		OnConnect:    func(*Conn, *WelcomeMsg) { onConnectCount.Add(1) },
 	})
@@ -324,7 +395,7 @@ func TestClientCloseCode1001ClassifiedLikeGoingAway(t *testing.T) {
 	if r.WSCode != 1001 || r.Fatal {
 		t.Fatalf("reason = %+v, want WSCode=1001 fatal=false", r)
 	}
-	calls := waitForCalls(t, fa, 1)
+	calls := waitForBackoffCalls(t, fa, rc, 1)
 	want := time.Duration(0.5 * float64(2*time.Second)) // rand=0.5, jitter(0,2s)
 	if calls[0] != want {
 		t.Errorf("1001 reconnect delay = %v, want exactly %v (jitter(0,2s), same as 4012)", calls[0], want)
@@ -336,5 +407,59 @@ func TestClientCloseCode1001ClassifiedLikeGoingAway(t *testing.T) {
 	}
 	if got := onConnectCount.Load(); got < 2 {
 		t.Fatalf("OnConnect fired %d times, want >= 2 (client reconnected after 1001)", got)
+	}
+}
+
+// TestClientDrainThenFatalCloseNeverReconnects pins the bug fixed alongside
+// this test: handleServerDrain, run from conn.go's post-close
+// flushDeliveryQueue for a drain frame that arrived just before a fatal
+// error{UNAUTHORIZED}/close 4011, used to check only cl.closing and
+// cl.conn == conn -- never whether conn was still alive -- and so still set
+// drainReconnectScheduled and started a reconnect for an already-dead conn.
+// watchConn's drainSched branch then reported that disconnect as a
+// non-fatal, already-being-retried one instead of running the 4010/4011
+// switch case, turning a fatal close into a silent reconnect.
+//
+// This drives the fixed check directly rather than racing for it: no
+// Connect() is called, so there is no watchConn goroutine to race against
+// in the first place. The Client is built white-box (cl.conn/cl.state set
+// by hand, the same pattern TestBuildConnectedDisconnectReasonBareCloseDerivation
+// uses for newUnrunConn) with a conn that is already dead -- failed and past
+// conn.Done() -- before handleServerDrain ever runs, so its
+// "case <-conn.Done():" branch is guaranteed to fire, no ordering to
+// arrange. startTestServer is only here to hand NewClient a URL; nothing
+// ever dials it, since Connect is never called.
+func TestClientDrainThenFatalCloseNeverReconnects(t *testing.T) {
+	var dials atomic.Int32
+	_, url := startTestServer(t, testAcceptHandler{OnConn: func(*Conn) { dials.Add(1) }})
+
+	fa := &fakeAfter{}
+	cl := NewClient(url, StaticToken("tok"), ClientConfig{
+		Reconnect: testReconnectOptions(fa, 0.5),
+	})
+
+	conn := newUnrunConn(newFakeWS())
+	cl.mu.Lock()
+	cl.conn = conn
+	cl.state = clientConnected
+	cl.mu.Unlock()
+
+	conn.fail(newConnErrorf(UnauthorizedCode, "test: unauthorized right after drain"))
+	<-conn.Done()
+
+	cl.handleServerDrain(conn, &DrainMsg{T: "drain", Reason: "reauth"})
+
+	cl.mu.Lock()
+	scheduled := cl.drainReconnectScheduled
+	retiring := cl.retiringConn
+	cl.mu.Unlock()
+	if scheduled {
+		t.Error("drainReconnectScheduled = true, want false: conn was already dead when the drain ran")
+	}
+	if retiring != nil {
+		t.Errorf("retiringConn = %v, want nil", retiring)
+	}
+	if got := dials.Load(); got != 0 {
+		t.Errorf("dial attempts = %d, want 0 (a flushed drain on a dead conn must not trigger a reconnect)", got)
 	}
 }

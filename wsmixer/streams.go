@@ -54,6 +54,19 @@ func (c *Conn) OpenStream(ctx context.Context) (*Stream, error) {
 	if c.role != RoleServer {
 		return nil, newConnErrorf(ProtocolErrorCode, "only the server opens streams")
 	}
+	// A conn that died ABNORMALLY leaves c.err nil (handleReadError,
+	// dispatch.go): every check below this point only ever looks at c.err,
+	// never c.closed itself, so without this guard a conn that died
+	// abnormally moments ago -- c.closed already closed, c.err still nil --
+	// would sail through every one of them and allocate a stream id,
+	// enqueue OPEN on a controlQueue nobody drains, and return (st, nil) as
+	// if it had actually succeeded. Cheap and non-blocking: a conn that is
+	// merely draining or at its stream-slot limit does not hit this at all.
+	select {
+	case <-c.closed:
+		return nil, c.connClosedErr()
+	default:
+	}
 	for {
 		c.mu.Lock()
 		if c.err != nil {
@@ -74,7 +87,10 @@ func (c *Conn) OpenStream(ctx context.Context) (*Stream, error) {
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			case <-c.closed:
-				return nil, c.Err()
+				// connClosedErr, not Err(): an abnormal closure leaves
+				// Err() nil, which would misreport "opened successfully"
+				// to a caller that only checks err != nil.
+				return nil, c.connClosedErr()
 			}
 		}
 		c.mu.Unlock()
@@ -107,7 +123,12 @@ func (c *Conn) OpenStream(ctx context.Context) (*Stream, error) {
 }
 
 // SendApp sends an opaque `app` message to the peer. Legal in both directions
-// at any time after the handshake completes.
+// at any time after the handshake completes. Delivery is best-effort: the
+// returned error only ever reflects a failure to marshal body, never
+// anything about the connection itself -- if the conn has already ended
+// (even abnormally), the frame is silently dropped (sendControlFrame's own
+// `case <-c.closed:`) and this still returns nil, exactly as it would for a
+// connection that is still healthy.
 func (c *Conn) SendApp(ctx context.Context, body any) error {
 	raw, err := json.Marshal(body)
 	if err != nil {
@@ -125,6 +146,10 @@ func (c *Conn) SendApp(ctx context.Context, body any) error {
 // goroutine as OnStream/OnDrain, in wire order with them: do not block here;
 // a handler that has real work to do must spawn its own goroutine, or it will
 // hold up delivery of every other stream/app/drain event queued behind it.
+// Not guaranteed to stop firing the instant Close/fail ends the connection:
+// an event for a message that had already arrived before the close is still
+// delivered afterward, so this may still run briefly after Close returns or
+// Done() fires (deliveryLoop's doc comment, conn.go).
 func (c *Conn) OnApp(fn func(body json.RawMessage)) {
 	c.updateHandlers(func(h *handlers) { h.onApp = fn })
 }
@@ -137,7 +162,11 @@ func (c *Conn) OnApp(fn func(body json.RawMessage)) {
 // it. May be called at any time; see OnApp. Note that the stream passed to
 // the callback may already have been reset by the time it fires (e.g. by a
 // concurrent Drain sweeping up survivors, see Drain/drain.go): Read on it
-// then returns the StreamError that reset it, rather than any data.
+// then returns the StreamError that reset it, rather than any data. Not
+// guaranteed to stop firing the instant Close/fail ends the connection: a
+// stream OPEN that had already arrived before the close is still delivered
+// afterward, so this may still run briefly after Close returns or Done()
+// fires (deliveryLoop's doc comment, conn.go).
 func (c *Conn) OnStream(fn func(*Stream)) {
 	c.updateHandlers(func(h *handlers) { h.onStream = fn })
 }
@@ -145,7 +174,11 @@ func (c *Conn) OnStream(fn func(*Stream)) {
 // OnDrain registers the callback invoked when a `drain` message arrives. May
 // be called at any time; see OnApp. It runs on the same shared delivery
 // goroutine as OnStream/OnApp; do not block here -- spawn a goroutine for any
-// real work, exactly as OnStream's doc comment describes.
+// real work, exactly as OnStream's doc comment describes. Not guaranteed to
+// stop firing the instant Close/fail ends the connection: a drain that had
+// already arrived before the close is still delivered afterward, so this may
+// still run briefly after Close returns or Done() fires (deliveryLoop's doc
+// comment, conn.go).
 func (c *Conn) OnDrain(fn func(*DrainMsg)) {
 	c.updateHandlers(func(h *handlers) { h.onDrain = fn })
 }

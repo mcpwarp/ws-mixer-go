@@ -164,7 +164,14 @@ func (s *Stream) wait(ctx context.Context, ch chan struct{}) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-s.conn.closed:
-		return s.conn.Err()
+		// connClosedErr, not conn.Err(): an abnormal closure leaves the
+		// conn's own error nil, and a nil return here would send
+		// ReadContext's loop right back around into wait() on a fresh
+		// notifyCh nobody will ever close -- s.conn.closed is already
+		// closed, so that next call would spin forever, never returning
+		// (see ReadContext's err/eof checks, which only stop the loop on a
+		// non-nil s.err/EOF).
+		return s.conn.connClosedErr()
 	}
 }
 
@@ -190,7 +197,25 @@ func (s *Stream) ReadContext(ctx context.Context, p []byte) (int, error) {
 		ch := s.notifyCh
 		s.mu.Unlock()
 		if err := s.wait(ctx, ch); err != nil {
-			return 0, err
+			// wait()'s own error (ctx cancellation, or the conn ending --
+			// possibly abnormally, via connClosedErr) can land in the very
+			// same instant as a CLOSE/RESET/buffered-DATA event: prefer
+			// whichever of those already resolved over wait()'s own error,
+			// so a stream that in fact ended cleanly is never misreported
+			// as "the tunnel died" just because both raced (WIRE.md section
+			// 2.5: CLOSE preserves buffered data -- still readable -- and
+			// RESET discards it, a *StreamError; a clean end-of-stream must
+			// win either way). Re-check under s.mu and only return wait()'s
+			// error when none of buffered data, s.eof, or s.err ended up
+			// set; otherwise fall through to the loop's own top-of-loop
+			// checks, still holding s.mu exactly as the loop invariant
+			// requires.
+			s.mu.Lock()
+			if len(s.buf) == 0 && !s.eof && s.err == nil {
+				s.mu.Unlock()
+				return 0, err
+			}
+			continue
 		}
 		s.mu.Lock()
 	}
@@ -252,7 +277,10 @@ func (s *Stream) WriteContext(ctx context.Context, p []byte) (int, error) {
 		case <-ctx.Done():
 			return total, ctx.Err()
 		case <-s.conn.closed:
-			return total, s.conn.Err()
+			// connClosedErr, not conn.Err(): a nil return here on an
+			// abnormal closure would look like total's bytes so far were a
+			// clean, complete write (a dead tunnel returning success).
+			return total, s.conn.connClosedErr()
 		}
 		s.conn.markStreamReady(s)
 		select {
@@ -265,7 +293,7 @@ func (s *Stream) WriteContext(ctx context.Context, p []byte) (int, error) {
 			// call returns; the returned n does not count those bytes.
 			return total, ctx.Err()
 		case <-s.conn.closed:
-			return total, s.conn.Err()
+			return total, s.conn.connClosedErr()
 		}
 		total += n
 	}
@@ -306,6 +334,26 @@ func (s *Stream) reserveSendCredit(ctx context.Context, want int) (int, error) {
 		ch := s.notifyCh
 		s.mu.Unlock()
 		if err := s.wait(ctx, ch); err != nil {
+			// The same race ReadContext guards against: a RESET (which sets
+			// s.err) can land in the very same instant wait() observes the
+			// conn dying, and wait()'s own error (possibly connClosedErr's
+			// synthesized io.ErrUnexpectedEOF for an abnormal closure) must
+			// not be allowed to mask the *StreamError a RESET actually
+			// carries. Re-check s.err and, if it's now set, loop back to the
+			// top -- which re-locks and returns it via the s.err != nil
+			// branch above -- instead of returning wait()'s own error.
+			// Credit becoming available in this same race is not the
+			// analogous problem: even a spuriously "successful" reservation
+			// here still has to queue its chunk through WriteContext's own
+			// outQueue select, which independently observes s.conn.closed
+			// and returns connClosedErr there -- so there is no equivalent
+			// data to lose on this path.
+			s.mu.Lock()
+			sErr := s.err
+			s.mu.Unlock()
+			if sErr != nil {
+				continue
+			}
 			return 0, err
 		}
 	}

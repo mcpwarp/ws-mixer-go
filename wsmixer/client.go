@@ -14,7 +14,7 @@ import (
 
 // defaultSDKVersion is reported as Agent.SDKVersion in the hello message
 // when the caller doesn't set one. Single source for this package.
-const defaultSDKVersion = "0.4.1"
+const defaultSDKVersion = "0.5.0"
 
 // ClientOptions configures Dial: one dial attempt, one handshake, no
 // reconnect/backoff of its own. It is the low-level building block Client
@@ -38,6 +38,20 @@ type ClientOptions struct {
 	// reconnect on its own; the caller decides what to do.
 	OnDrain func(*DrainMsg)
 }
+
+// postUpgradeError marks a clientHandshake failure as having happened after
+// websocket.Dial's own upgrade already succeeded (the 101) -- everything
+// from here to welcome is phase "handshake" (client_reconnect.go's
+// phaseFor), regardless of what kind of error it turns out to be
+// underneath: a transport death/EOF with no close frame carries no more
+// information than a plain wrapped error, but it still happened strictly
+// after the 101, not during the dial that precedes it. Unwrap-able so
+// errors.As for a *ConnError/websocket.CloseError/*DialError still sees
+// through it exactly as before this existed.
+type postUpgradeError struct{ err error }
+
+func (e *postUpgradeError) Error() string { return e.err.Error() }
+func (e *postUpgradeError) Unwrap() error { return e.err }
 
 // Dial connects to a ws-mixer.v1 server, performs the hello/welcome
 // handshake, and returns a ready-to-use *Conn. ctx bounds both the dial
@@ -90,7 +104,32 @@ func Dial(ctx context.Context, url string, opts ClientOptions) (*Conn, error) {
 			c.fail(ce)
 			<-c.closed
 		}
-		return nil, err
+		if errors.Is(ctx.Err(), context.Canceled) {
+			// The caller is abandoning the dial (Client.Close/CloseWith
+			// during the handshake wait cancels this same ctx via
+			// dialAndHandshake's closeCh watcher, or a plain Dial caller
+			// explicitly cancelling their own ctx) -- not a handshake
+			// failure to report as one, and nothing here to blame the peer
+			// for. Leave err unwrapped: phase dial, exactly as before
+			// postUpgradeError existed.
+			//
+			// Deliberately NOT ctx.Err() != nil (review item 6, probed): a
+			// context.DeadlineExceeded is a timeout, not an application
+			// cancellation -- dialAndHandshake's one ctx covers
+			// ConnectTimeout+HelloTimeout in sum, so a dial that eats into
+			// most of that combined budget before the 101 even lands can
+			// make the shared ctx's own deadline expire during the welcome
+			// wait that follows, before the HelloTimeout AfterFunc above
+			// ever gets a chance to fire its own graceful 4001 -- that is a
+			// genuine post-101 failure (phase handshake), not the caller
+			// abandoning anything. errors.Is unwraps through fmt.Errorf's
+			// %w chain, so a plain Dial caller's own context.DeadlineExceeded
+			// still tests true through postUpgradeError's own Unwrap either
+			// way -- only the phase classification changes here, not
+			// whether that sentinel is still detectable.
+			return nil, err
+		}
+		return nil, &postUpgradeError{err: err}
 	}
 
 	c.opts.Metrics.ConnectionOpened(c.session, "client")
@@ -182,12 +221,31 @@ func clientHandshake(ctx context.Context, c *Conn, opts ClientOptions) error {
 		if errors.As(rerr, &ce) {
 			return fmt.Errorf("wsmixer: peer closed with code %d before welcome completed the handshake: %w", ce.Code, rerr)
 		}
-		// Anything else not caught above -- a cancelled/expired caller ctx
-		// (the caller is abandoning the dial, not something to blame the
-		// peer for) or a plain transport error/EOF before the deadline (a
-		// dead connection has nothing left to gracefully close) -- stays a
-		// plain wrapped error: phase dial, no synthesized close.
-		return fmt.Errorf("wsmixer: no welcome within %dms of hello: %w", c.opts.HelloTimeout.Milliseconds(), rerr)
+		// Anything else not caught above splits two ways, both still plain
+		// wrapped errors (no synthesized close -- Dial's own postUpgradeError
+		// wrapping, or the lack of it, is what actually decides the phase
+		// now, not the message text here):
+		if errors.Is(ctx.Err(), context.Canceled) {
+			// A caller-cancelled ctx -- the caller is abandoning the dial
+			// (Client.Close/CloseWith during this very wait, or a plain
+			// Dial caller explicitly cancelling their own ctx), not
+			// something to blame the peer for. Dial leaves this one
+			// unwrapped (phase dial), so the message doesn't need to
+			// pretend a welcome timeout happened either. Deliberately NOT
+			// ctx.Err() != nil: see Dial's own identical check for why a
+			// DeadlineExceeded must NOT take this branch (review item 6).
+			return fmt.Errorf("wsmixer: hello/welcome wait ended: %w", rerr)
+		}
+		// ctx is either still live, or its deadline (not a cancellation)
+		// expired: a genuine transport death (TCP reset, a half-open
+		// connection finally dying, plain EOF) strictly after the 101,
+		// before welcome -- not the HelloTimeout deadline (claimed above
+		// would have caught that) and not a caller-driven cancellation.
+		// Naming it "no welcome within Nms" would claim a timeout that
+		// never actually happened; Dial's postUpgradeError wrapping is what
+		// now reports this as phase handshake (D-2026-09-20 change 3), so
+		// the message just says what was actually observed.
+		return fmt.Errorf("wsmixer: connection lost before welcome completed the handshake: %w", rerr)
 	}
 	// timer.Stop() returning false means the deadline already fired and its
 	// callback has started running (time.AfterFunc guarantees the callback
