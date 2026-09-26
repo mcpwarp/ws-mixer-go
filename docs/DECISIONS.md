@@ -739,3 +739,26 @@ links its own spec counterpart explicitly, so read the link, not the number.
   delivery is best-effort and it returns nil even when the connection has already ended (it always did; the
   doc just didn't say so) -- left the underlying silent-drop behavior itself unchanged, out of scope
   (`sendControlFrame`'s own `case <-c.closed:` has no error return at all to plumb one through).
+
+## 2026-09-25
+
+- **D-2026-09-25-01** — `Client.CloseWith` (`client_reconnect.go`): implements
+  [`ws-mixer-spec`'s `D-2026-09-25-01`](https://github.com/mcpwarp/ws-mixer-spec/blob/main/docs/DECISIONS.md),
+  which settles that the application-close API takes a message only and always sends
+  `APPLICATION_CLOSE` -- `WIRE.md` §2.8 allows an application exactly one connection-close code, so a
+  caller-supplied code was never meaningful there. Dropped `CloseWith`'s `code ErrorCode` parameter;
+  it now always closes with `ApplicationCloseCode` internally, both for the active conn and for a
+  retiring one during a drain hand-over. `Conn.Close` itself is untouched -- it keeps taking an
+  arbitrary `ErrorCode`, since it is the lower-level primitive `CloseWith` is built on, not the
+  application-close API this decision constrains. The conformance adapter's `close` command
+  (`conformance/adapter/adapter.go`) now accepts only code `0`/absent (routed to `Client.Close`) or
+  `14` (routed to `Client.CloseWith`) when a `Client` is driving the connection, rejecting anything
+  else with `cmdErr`; the plain-conn path (no `Client`, exercising `Conn.Close` directly for wire-level
+  conformance cases) now enforces the same `0`/`14` rule, routing `14` to `Conn.Close` with
+  `ApplicationCloseCode` instead of accepting an arbitrary code. Breaking change, released as
+  v0.6.0: v0.5.0 had no external `CloseWith` consumer, so no deprecation shim. Updated every caller in
+  `wsmixer/client_closewith_test.go` (all of which already passed `ApplicationCloseCode`, so this was a
+  mechanical drop of the argument, not a behavior change to any test) and the README's matching
+  paragraph; that test file's and `client_reconnect.go`'s own comments describing `CloseWith`'s
+  cross-SDK alignment were updated too, since they still referred to a caller-supplied code. `spec.pin`
+  stays at `v0.4.0` -- the wire itself is unchanged, only the Go SDK's own `Client`-level API surface.

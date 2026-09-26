@@ -14,7 +14,7 @@ import (
 
 // defaultSDKVersion is reported as Agent.SDKVersion in the hello message
 // when the caller doesn't set one. Single source for this package.
-const defaultSDKVersion = "0.5.0"
+const defaultSDKVersion = "0.6.0"
 
 // ClientOptions configures Dial: one dial attempt, one handshake, no
 // reconnect/backoff of its own. It is the low-level building block Client

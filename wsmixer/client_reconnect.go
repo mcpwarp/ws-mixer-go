@@ -1010,23 +1010,15 @@ func (cl *Client) Close(ctx context.Context) error {
 	return err
 }
 
-// CloseWith closes the client immediately with a ws-mixer application error
-// code and message (CLIENT-SDK.md's "Application close" row): unlike Close,
-// there is no drain{client_requested}/grace period -- the live connection,
-// if any, is closed at once with error{code,message} then WS close
-// 4000+code (Conn.Close's own three steps; codes > 999, including every
-// application code >= 0x1000_0000, are clamped on the wire to
-// InternalErrorCode's 4002, exactly as for any Conn.Close -- see its doc).
-// For an application closing a connection for its own reasons ws-mixer
-// itself does not interpret, use ApplicationCloseCode.
-//
-// Takes an ErrorCode, not the uint32 Conn.Close does: CloseWith's whole
-// point is being the Client-level counterpart to Conn.Close for exactly the
-// ApplicationCloseCode use case ApplicationCloseCode's own doc comment
-// already describes, so a call site reads naturally as
-// `cl.CloseWith(ctx, wsmixer.ApplicationCloseCode, "bye")` rather than
-// forcing a uint32 conversion at the call site for the common case; CloseWith
-// converts internally where Conn.Close's own signature requires it.
+// CloseWith closes the client immediately with an application message
+// (CLIENT-SDK.md's "Application close" row): unlike Close, there is no
+// drain{client_requested}/grace period -- the live connection, if any, is
+// closed at once with error{APPLICATION_CLOSE,message} then WS close 4014
+// (Conn.Close's own three steps, called with ApplicationCloseCode). Per spec
+// D-2026-09-25-01, the application-close API takes a message only and
+// always sends APPLICATION_CLOSE: WIRE.md §2.8 allows an application
+// exactly one connection-close code, so there is nothing for a caller to
+// choose here.
 //
 // Like Close, this marks the client closing FIRST (closeStart, shared with
 // Close -- see its own doc comment for exactly which state transitions that
@@ -1036,12 +1028,13 @@ func (cl *Client) Close(ctx context.Context) error {
 // back to closeAlreadyClosing and still blocks until the winner has
 // finished). Ends any retiring conn (during a drain hand-over) and any
 // in-flight dial the same way Close does (closeStart/stopBackoff) -- except
-// the retiring conn itself is closed with CloseWith's own code/message too,
-// not Close's NO_ERROR, matching the JS SDK's close({code,message})
-// (cross-SDK alignment: JS closes every conn it still owns with the
-// caller's code, not just the active one). Reports exactly one non-fatal
-// DisconnectReason, with code's ErrorCode/ErrorName/WSCode, the same way
-// Close does: not synthesized here directly, but via watchConn observing
+// the retiring conn itself is also closed with ApplicationCloseCode and
+// this call's message, not Close's NO_ERROR, matching the JS SDK's
+// close({message}) (cross-SDK alignment: JS closes every conn it still
+// owns with that same message, not just the active one). Reports exactly
+// one non-fatal DisconnectReason, with ApplicationCloseCode's own
+// ErrorCode/ErrorName/WSCode, the same way Close does: not synthesized
+// here directly, but via watchConn observing
 // the conn.Close call below end the connection, exactly the same mechanism
 // that produces Close's own one report -- see watchConn's closingNow
 // branch. When there is no live connection yet (still dialing/backing off,
@@ -1066,7 +1059,7 @@ func (cl *Client) Close(ctx context.Context) error {
 // deliveryLoop goroutine, untracked by cl.wg, which still delivers an event
 // that had already arrived before this call ended that conn (see Close's
 // own doc comment and deliveryLoop's, conn.go).
-func (cl *Client) CloseWith(ctx context.Context, code ErrorCode, message string) error {
+func (cl *Client) CloseWith(ctx context.Context, message string) error {
 	conn, retiring, ok := cl.closeStart()
 	if !ok {
 		cl.closeAlreadyClosing()
@@ -1075,19 +1068,20 @@ func (cl *Client) CloseWith(ctx context.Context, code ErrorCode, message string)
 
 	// retiring != conn: see Close's own identical guard/comment above --
 	// the same drain-hand-over window applies here, and losing this race
-	// would send NO_ERROR/1000 instead of the application code/message this
+	// would send NO_ERROR/1000 instead of the APPLICATION_CLOSE/message this
 	// call is specifically trying to send. The retiring conn itself gets
-	// the SAME code/message CloseWith was called with, not NoError -- cross-
-	// SDK alignment with the JS SDK's close({code,message}), which closes
-	// every conn it still owns with the caller's own code, not just the
-	// active one. Plain Close keeps NO_ERROR for both (its own graceful
-	// shutdown is never conditional on which conn happens to be retiring).
+	// the SAME message CloseWith was called with, not NoError -- both closed
+	// with ApplicationCloseCode -- cross-SDK alignment with the JS SDK's
+	// close({message}), which closes every conn it still owns with that
+	// same message, not just the active one. Plain Close keeps NO_ERROR for
+	// both (its own graceful shutdown is
+	// never conditional on which conn happens to be retiring).
 	if retiring != nil && retiring != conn {
-		go func() { _ = retiring.Close(uint32(code), message) }()
+		go func() { _ = retiring.Close(uint32(ApplicationCloseCode), message) }()
 	}
 	var err error
 	if conn != nil {
-		err = conn.Close(uint32(code), message)
+		err = conn.Close(uint32(ApplicationCloseCode), message)
 	}
 	cl.wg.Wait()
 	cl.closeCbCh()

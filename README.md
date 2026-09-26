@@ -162,14 +162,15 @@ two SDKs.
 
 An application closing a connection for its own reasons — one ws-mixer itself does not interpret, e.g. an
 over-capacity refusal — should use `wsmixer.ApplicationCloseCode` with `Conn.Close`, or, on a `Client`,
-`Client.CloseWith(ctx, code, message)`: unlike `Close` (graceful: `drain{client_requested}` → grace →
-`NO_ERROR`), `CloseWith` closes the live connection at once with `error{code,message}` then WS close
-`4000+code`, and — like `Close` — stops the reconnect loop for good rather than letting the client redial
-(calling `Conn.Close` directly on a connection a `Client` is managing looks like an ordinary disconnect to it
-instead, and it reconnects as usual). Either way the peer's `OnDisconnect` sees `ErrorName:
-"APPLICATION_CLOSE"` rather than `INTERNAL_ERROR` for an unrecognized code; application codes `>= 0x1000_0000`
-remain stream-`Reset`-only, never valid for a connection close, and any code `> 999` is clamped on the wire to
-`InternalErrorCode`'s 4002 (`error{}` still carries the real code).
+`Client.CloseWith(ctx, message)`: unlike `Close` (graceful: `drain{client_requested}` → grace → `NO_ERROR`),
+`CloseWith` closes the live connection at once with `error{APPLICATION_CLOSE,message}` then WS close `4014`,
+and — like `Close` — stops the reconnect loop for good rather than letting the client redial (calling
+`Conn.Close` directly on a connection a `Client` is managing looks like an ordinary disconnect to it instead,
+and it reconnects as usual). Per spec D-2026-09-25-01, `CloseWith` takes a message only and always sends
+`APPLICATION_CLOSE`: WIRE.md §2.8 allows an application exactly one connection-close code, so there is no
+code parameter to choose. `Conn.Close` itself is unchanged and still takes an arbitrary `ErrorCode`; codes
+`>= 0x1000_0000` remain stream-`Reset`-only, never valid for a connection close, and any code `> 999` is
+clamped on the wire to `InternalErrorCode`'s 4002 (`error{}` still carries the real code).
 
 `Stats()` returns the
 "ignore and count" counters (unknown frame types, stale frames, duplicate pongs, refused opens, protocol

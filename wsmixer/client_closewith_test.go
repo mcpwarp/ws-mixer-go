@@ -47,7 +47,7 @@ func TestClientCloseWithApplicationCloseCode(t *testing.T) {
 
 	closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer closeCancel()
-	if err := cl.CloseWith(closeCtx, ApplicationCloseCode, "bye"); err != nil {
+	if err := cl.CloseWith(closeCtx, "bye"); err != nil {
 		t.Fatalf("CloseWith: %v", err)
 	}
 
@@ -169,7 +169,7 @@ func TestClientCloseWithDuringDial(t *testing.T) {
 	go func() { _ = cl.Connect(context.Background()) }()
 	time.Sleep(300 * time.Millisecond)
 	start := time.Now()
-	if err := cl.CloseWith(context.Background(), ApplicationCloseCode, "bye"); err != nil {
+	if err := cl.CloseWith(context.Background(), "bye"); err != nil {
 		t.Fatalf("CloseWith: %v", err)
 	}
 	if d := time.Since(start); d > 2*time.Second {
@@ -198,7 +198,7 @@ func TestClientCloseWithThenCloseIdempotent(t *testing.T) {
 	}
 	<-connCh
 
-	if err := cl.CloseWith(context.Background(), ApplicationCloseCode, "bye"); err != nil {
+	if err := cl.CloseWith(context.Background(), "bye"); err != nil {
 		t.Fatalf("CloseWith: %v", err)
 	}
 	rec.waitNext(t)
@@ -232,7 +232,7 @@ func TestClientCloseThenCloseWithIdempotent(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 	rec.waitNext(t)
-	if err := cl.CloseWith(context.Background(), ApplicationCloseCode, "bye"); err != nil {
+	if err := cl.CloseWith(context.Background(), "bye"); err != nil {
 		t.Fatalf("CloseWith after Close: %v", err)
 	}
 	select {
@@ -264,7 +264,7 @@ func TestClientCloseWithConcurrentIdempotent(t *testing.T) {
 	done := make(chan struct{}, 4)
 	for i := 0; i < 2; i++ {
 		go func() { _ = cl.Close(context.Background()); done <- struct{}{} }()
-		go func() { _ = cl.CloseWith(context.Background(), ApplicationCloseCode, "bye"); done <- struct{}{} }()
+		go func() { _ = cl.CloseWith(context.Background(), "bye"); done <- struct{}{} }()
 	}
 	for i := 0; i < 4; i++ {
 		select {
@@ -301,7 +301,7 @@ func TestClientCloseWithDoesNotLeakGoroutines(t *testing.T) {
 		}
 		cancel()
 		<-connCh
-		if err := cl.CloseWith(context.Background(), ApplicationCloseCode, "bye"); err != nil {
+		if err := cl.CloseWith(context.Background(), "bye"); err != nil {
 			t.Fatalf("client #%d: CloseWith: %v", i, err)
 		}
 	}
@@ -324,11 +324,11 @@ func TestClientCloseWithDoesNotLeakGoroutines(t *testing.T) {
 // must still send the application code, not lose a race to the bare
 // NoError close "the retiring conn" (the very same live conn, from the
 // other side) would otherwise send; (item 6, cross-SDK alignment) had that
-// retiring-side close actually run, it now carries CloseWith's own
-// code/message too, not Close's bare NO_ERROR, matching the JS SDK's
-// close({code,message}) closing every conn it still owns with the caller's
-// own code -- defense-in-depth for a divergent-retiring-conn state this
-// file's current invariants don't appear to make reachable at all, kept
+// retiring-side close actually run, it now also carries
+// ApplicationCloseCode and this call's message, not Close's bare NO_ERROR,
+// matching the JS SDK's close({message}) closing every conn it still owns
+// with that same message -- defense-in-depth for a divergent-retiring-conn
+// state this file's current invariants don't appear to make reachable at all, kept
 // consistent with closeLiveConns' identical existing guard on the
 // fatal paths. The parallel reconnect's own dial is gated (blocked
 // mid-upgrade) so this test can land CloseWith deterministically inside
@@ -396,7 +396,7 @@ func TestClientCloseWithDuringDrainHandoverSendsApplicationCode(t *testing.T) {
 	}
 	time.Sleep(20 * time.Millisecond) // let handleServerDrain finish setting cl.retiringConn
 
-	if err := cl.CloseWith(context.Background(), ApplicationCloseCode, "bye"); err != nil {
+	if err := cl.CloseWith(context.Background(), "bye"); err != nil {
 		t.Fatalf("CloseWith: %v", err)
 	}
 
@@ -425,7 +425,7 @@ func TestClientCloseWithFromOnDisconnectSync(t *testing.T) {
 	cl = NewClient(url, StaticToken("tok"), ClientConfig{
 		Reconnect: testReconnectOptions(fa, 0),
 		OnDisconnect: func(DisconnectReason) {
-			_ = cl.CloseWith(context.Background(), ApplicationCloseCode, "bye") // the natural thing a user writes
+			_ = cl.CloseWith(context.Background(), "bye") // the natural thing a user writes
 			close(done)
 		},
 	})

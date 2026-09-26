@@ -33,7 +33,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"net"
 	"net/http"
 	"os"
@@ -876,8 +875,11 @@ func handleCommand(st *adapterState, name string, seq float64, cmd map[string]an
 
 	case "close":
 		// docs/CONFORMANCE.md's `close` row: code absent/0 (NO_ERROR) is the
-		// SDK's own graceful shutdown; a non-zero code is an immediate close
-		// via the SDK's application-close API. This holds for a client
+		// SDK's own graceful shutdown; code 14 is an immediate close via the
+		// SDK's application-close API, which per spec D-2026-09-25-01 always
+		// sends APPLICATION_CLOSE and takes no code of its own (WIRE.md
+		// §2.8 allows an application exactly one connection-close code, so
+		// there is nothing else to route here). This holds for a client
 		// adapter driving a reconnecting wsmixer.Client too -- CLIENT-SDK.md's
 		// Application close row requires that API to also stop the
 		// reconnect loop for good, not merely drop the current socket
@@ -885,24 +887,26 @@ func handleCommand(st *adapterState, name string, seq float64, cmd map[string]an
 		// plain Client.Close dropped code/message entirely, so a non-zero
 		// `close` looked identical to a graceful one). Route through the
 		// Client when one is driving this connection: Client.Close for
-		// code 0/absent, Client.CloseWith(code, message) otherwise -- both
-		// stop the reconnect loop, unlike closing st.getConn() directly
-		// would.
+		// code 0/absent, Client.CloseWith(message) for code 14, anything
+		// else rejected -- both stop the reconnect loop, unlike closing
+		// st.getConn() directly would.
 		if cl := st.getClient(); cl != nil {
-			code, _ := cmd["code"].(float64)
+			codeRaw, codePresent := cmd["code"]
+			code, codeIsNum := codeRaw.(float64)
+			if codePresent && !codeIsNum {
+				cmdErr(seq, "close: code must be a number")
+				return
+			}
 			msg, _ := cmd["message"].(string)
-			if code < 0 || code > math.MaxUint32 {
-				// uint32(code) on an out-of-range float64 is
-				// implementation-defined (Go spec, conversions); reject
-				// instead of feeding CloseWith a garbage code.
-				cmdErr(seq, fmt.Sprintf("close: code %v out of range", code))
+			if code != 0 && code != 14 {
+				cmdErr(seq, fmt.Sprintf("close: code %v not allowed (only 0 or 14)", code))
 				return
 			}
 			ack(seq)
 			if code == 0 {
 				go func() { _ = cl.Close(context.Background()) }()
 			} else {
-				go func() { _ = cl.CloseWith(context.Background(), wsmixer.ErrorCode(uint32(code)), msg) }()
+				go func() { _ = cl.CloseWith(context.Background(), msg) }()
 			}
 			return
 		}
@@ -911,17 +915,23 @@ func handleCommand(st *adapterState, name string, seq float64, cmd map[string]an
 			cmdErr(seq, "close before connection established")
 			return
 		}
-		code, _ := cmd["code"].(float64)
+		codeRaw, codePresent := cmd["code"]
+		code, codeIsNum := codeRaw.(float64)
+		if codePresent && !codeIsNum {
+			cmdErr(seq, "close: code must be a number")
+			return
+		}
 		msg, _ := cmd["message"].(string)
-		if code < 0 || code > math.MaxUint32 {
-			// uint32(code) on an out-of-range float64 is
-			// implementation-defined (Go spec, conversions); reject
-			// instead of feeding conn.Close a garbage code.
-			cmdErr(seq, fmt.Sprintf("close: code %v out of range", code))
+		if code != 0 && code != 14 {
+			cmdErr(seq, fmt.Sprintf("close: code %v not allowed (only 0 or 14)", code))
 			return
 		}
 		ack(seq)
-		go func() { _ = conn.Close(uint32(code), msg) }()
+		if code == 14 {
+			go func() { _ = conn.Close(uint32(wsmixer.ApplicationCloseCode), msg) }()
+		} else {
+			go func() { _ = conn.Close(0, msg) }()
+		}
 
 	case "shutdown":
 		// S4(b): connectReconnecting's wsmixer.Client owns background
