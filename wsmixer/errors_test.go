@@ -148,7 +148,7 @@ func TestClientApplicationCloseIsRecoverablePostRun(t *testing.T) {
 // sequence entirely, via the same low-level c.sendControl + c.fail this
 // package's own drain/error-path machinery is built on) must still have the
 // drain delivered to the client's OnDrain -- it arrived strictly before the
-// error{} that ended the connection (OVERVIEW.md section 2.8: error{} is
+// error{} that ended the connection (WIRE.md §2.8: error{} is
 // always last). Pre-fix, deliveryLoop's priority close-check could drop this
 // exactly like the app-message case.
 func TestClientDrainThenErrorCloseDeliversOnDrain(t *testing.T) {

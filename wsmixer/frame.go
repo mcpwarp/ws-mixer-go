@@ -6,8 +6,8 @@ import (
 	"unicode/utf8"
 )
 
-// FrameType is the first byte of the 8-byte mux frame header (OVERVIEW.md
-// section 2.2). Values outside the five known ones are legal on the wire and
+// FrameType is the first byte of the 8-byte mux frame header (WIRE.md
+// §2.2). Values outside the five known ones are legal on the wire and
 // MUST be ignored (and counted) rather than rejected, so FrameType is not a
 // closed enum.
 type FrameType uint8
@@ -46,13 +46,13 @@ func (t FrameType) String() string {
 const (
 	frameHeaderSize = 8
 	// MaxMessageSize is the largest legal WebSocket message: 8-byte header plus
-	// a 64 KiB payload (OVERVIEW.md section 2.4).
+	// a 64 KiB payload (WIRE.md §2.4).
 	MaxMessageSize = frameHeaderSize + 65536
-	// MaxStreamZeroPayload is the control-channel message size cap (OVERVIEW.md
-	// section 2.4 and 2.7).
+	// MaxStreamZeroPayload is the control-channel message size cap (WIRE.md
+	// §2.4 and §2.7).
 	MaxStreamZeroPayload = 16384
 	// streamIDMask masks off the reserved high bit of a 32-bit stream id,
-	// leaving the 31 bits of actual id space (OVERVIEW.md section 2.5).
+	// leaving the 31 bits of actual id space (WIRE.md §2.5).
 	streamIDHighBit uint32 = 0x8000_0000
 )
 
@@ -65,8 +65,8 @@ type Frame struct {
 	Payload  []byte
 }
 
-// DecodeFrame parses one WebSocket message into a Frame per OVERVIEW.md
-// sections 2.2-2.4. The returned error is either a *ConnError (connection-fatal)
+// DecodeFrame parses one WebSocket message into a Frame per WIRE.md
+// §2.2-2.4. The returned error is either a *ConnError (connection-fatal)
 // or a *StreamError (scoped to Frame.StreamID); both are safe to inspect even
 // though the returned *Frame is nil in the error case.
 func DecodeFrame(msg []byte) (*Frame, error) {
@@ -91,7 +91,7 @@ func DecodeFrame(msg []byte) (*Frame, error) {
 
 	if !typ.Known() {
 		// Unknown type: structurally accepted. The caller ignores it and
-		// increments a counter (OVERVIEW.md section 2.2).
+		// increments a counter (WIRE.md §2.2).
 		return f, nil
 	}
 
@@ -148,7 +148,7 @@ func (f *Frame) ResetCode() ErrorCode {
 
 // ResetMessage returns the (UTF-8 sanitized) message carried by a RESET frame.
 // Invalid UTF-8 bytes are replaced with U+FFFD rather than rejected
-// (OVERVIEW.md section 2.3).
+// (WIRE.md §2.3).
 func (f *Frame) ResetMessage() string {
 	return sanitizeUTF8(f.Payload[4:])
 }

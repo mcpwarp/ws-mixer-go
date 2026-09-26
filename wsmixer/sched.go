@@ -2,8 +2,8 @@ package wsmixer
 
 import "sync"
 
-// dataSched is the connection's round-robin DATA scheduler (OVERVIEW.md
-// section 2.6 rule 3): one <=16 KiB chunk per ready stream, in rotation.
+// dataSched is the connection's round-robin DATA scheduler (WIRE.md
+// §2.6 rule 3): one <=16 KiB chunk per ready stream, in rotation.
 // ready is the FIFO rotation order; inReady dedupes it so a stream already
 // waiting its turn is never queued twice. Its lock is a leaf lock: never
 // held while touching a Stream's outQueue or c.mu, and never acquired by
@@ -34,7 +34,7 @@ func (c *Conn) writerLoop() {
 		}
 
 		// One <=16 KiB DATA chunk from the next ready stream, round-robin
-		// (OVERVIEW.md section 2.6 rule 3).
+		// (WIRE.md §2.6 rule 3).
 		if pc, ok := c.nextChunk(); ok {
 			err := c.writeMessage(EncodeData(pc.streamID, pc.data))
 			pc.err = err
@@ -83,11 +83,11 @@ func (c *Conn) markStreamReady(st *Stream) {
 // chunk to send. A stream can reach the front of the rotation with nothing
 // left in outQueue (e.g. its only chunk was already claimed elsewhere in the
 // same turn) or with a chunk that must not be written -- CLOSE already sent,
-// or RESET, per OVERVIEW.md section 2.5's sending table -- and both cases
+// or RESET, per WIRE.md §2.5's sending table -- and both cases
 // must not stall streams still waiting behind it in the rotation. If more
 // chunks remain queued behind the one taken, the stream goes back to the end
 // of the rotation, so every other ready stream gets a turn before it comes up
-// again (OVERVIEW.md section 2.6 rule 3's "one chunk per ready stream,
+// again (WIRE.md §2.6 rule 3's "one chunk per ready stream,
 // round-robin").
 func (c *Conn) nextChunk() (*pendingChunk, bool) {
 	for {

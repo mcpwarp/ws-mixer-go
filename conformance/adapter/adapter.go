@@ -84,9 +84,13 @@ type adapterState struct {
 	floorMs    int64
 	allowSubfl bool
 
-	conn    *wsmixer.Conn
-	client  *wsmixer.Client // set only by connectReconnecting (S4(b)/(c))
-	streams map[uint32]*wsmixer.Stream
+	conn *wsmixer.Conn
+	// connReady is closed (once, connReadyOnce) by the first setConn; see
+	// awaitConn.
+	connReady     chan struct{}
+	connReadyOnce sync.Once
+	client        *wsmixer.Client // set only by connectReconnecting (S4(b)/(c))
+	streams       map[uint32]*wsmixer.Stream
 	// streamOwner records which *wsmixer.Conn each tracked stream id
 	// belongs to, when known (see teardownAllStreams). Only
 	// connectReconnecting's OnStream populates this; the plain Dial and
@@ -139,7 +143,7 @@ type adapterState struct {
 	// full it error-acks the new command with "queue_full" instead of
 	// waiting for room.
 	//
-	// RESET (OVERVIEW.md section 2.5: abortive, discards buffered data and
+	// RESET (WIRE.md §2.5: abortive, discards buffered data and
 	// unblocks writers) deliberately does NOT go through this FIFO --
 	// resetStream below cancels the worker's context (unblocking any
 	// WriteContext call that is queued and currently blocked on send
@@ -209,6 +213,7 @@ func newState(be ServerBackend) *adapterState {
 		streamOwner:   make(map[uint32]*wsmixer.Conn),
 		closed:        make(map[uint32]closedDirs),
 		streamWorkers: make(map[uint32]*streamWorker),
+		connReady:     make(chan struct{}),
 		backend:       be,
 	}
 }
@@ -354,7 +359,7 @@ func (s *adapterState) teardownAllStreams(conn *wsmixer.Conn) {
 
 // drainAbortedJobs error-acks every job still buffered in w's channel
 // (queued write/close_write commands that never got to run) after a RESET
-// has cancelled the worker -- see resetStream and OVERVIEW.md section 2.5
+// has cancelled the worker -- see resetStream and WIRE.md §2.5
 // ("RESET is abortive; it discards buffered data and unblocks writers").
 func drainAbortedJobs(w *streamWorker) {
 	for {
@@ -369,7 +374,7 @@ func drainAbortedJobs(w *streamWorker) {
 
 // resetStream runs RESET out-of-band, immediately, bypassing the per-stream
 // FIFO that serializes write/close_write (see the streamWorkers field
-// comment and OVERVIEW.md section 2.5): it cancels the stream's worker
+// comment and WIRE.md §2.5): it cancels the stream's worker
 // context first, so a write already running on the worker and blocked on
 // exhausted send credit (WriteContext) unblocks right away instead of
 // stalling the reset behind it, then calls Stream.Reset (which discards
@@ -509,12 +514,37 @@ func (s *adapterState) setConn(c *wsmixer.Conn) {
 	s.mu.Lock()
 	s.conn = c
 	s.mu.Unlock()
+	s.connReadyOnce.Do(func() { close(s.connReady) })
 }
 
 func (s *adapterState) getConn() *wsmixer.Conn {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.conn
+}
+
+// connWaitBudget bounds how long awaitConn waits for the first conn.
+const connWaitBudget = 5 * time.Second
+
+// awaitConn is getConn for the commands that act on the conn (open_stream,
+// send_app, drain, close): when no conn has been set yet it waits up to
+// connWaitBudget for the first one instead of failing at once. The peer sees
+// the handshake finish before this adapter does -- server role: AcceptConn
+// writes welcome to the socket and only then returns, after which the
+// backend calls OnConn (setConn) on the HTTP handler goroutine; client role:
+// Dial returns once welcome is read, after which the connect goroutine calls
+// setConn. The runner paces fixture steps on the wire (it issues open_stream
+// as soon as its raw actor has observed welcome), so its next command can
+// land on the stdin loop inside that gap.
+func (s *adapterState) awaitConn() *wsmixer.Conn {
+	if c := s.getConn(); c != nil {
+		return c
+	}
+	select {
+	case <-s.connReady:
+	case <-time.After(connWaitBudget):
+	}
+	return s.getConn()
 }
 
 // setClient/getClient guard st.client, set only by connectReconnecting
@@ -768,7 +798,7 @@ func handleCommand(st *adapterState, name string, seq float64, cmd map[string]an
 		}()
 
 	case "open_stream":
-		conn := st.getConn()
+		conn := st.awaitConn()
 		if conn == nil {
 			cmdErr(seq, "open_stream before listen/connect completed")
 			return
@@ -830,7 +860,7 @@ func handleCommand(st *adapterState, name string, seq float64, cmd map[string]an
 		}
 
 	case "reset":
-		// RESET is abortive (OVERVIEW.md section 2.5) and runs out-of-band,
+		// RESET is abortive (WIRE.md §2.5) and runs out-of-band,
 		// immediately -- it must not wait behind a blocked write on the
 		// per-stream FIFO the way write/close_write do. See resetStream.
 		id := uint32ID(cmd["id"])
@@ -844,7 +874,7 @@ func handleCommand(st *adapterState, name string, seq float64, cmd map[string]an
 		st.resetStream(id, s, wsmixer.ErrorCode(uint32(code)), msg, seq)
 
 	case "send_app":
-		conn := st.getConn()
+		conn := st.awaitConn()
 		if conn == nil {
 			cmdErr(seq, "send_app before connection established")
 			return
@@ -858,7 +888,7 @@ func handleCommand(st *adapterState, name string, seq float64, cmd map[string]an
 		ack(seq)
 
 	case "drain":
-		conn := st.getConn()
+		conn := st.awaitConn()
 		if conn == nil {
 			cmdErr(seq, "drain before connection established")
 			return
@@ -890,7 +920,7 @@ func handleCommand(st *adapterState, name string, seq float64, cmd map[string]an
 		// code 0/absent, Client.CloseWith(message) for code 14, anything
 		// else rejected -- both stop the reconnect loop, unlike closing
 		// st.getConn() directly would.
-		if cl := st.getClient(); cl != nil {
+		closeViaClient := func(cl *wsmixer.Client) {
 			codeRaw, codePresent := cmd["code"]
 			code, codeIsNum := codeRaw.(float64)
 			if codePresent && !codeIsNum {
@@ -908,9 +938,18 @@ func handleCommand(st *adapterState, name string, seq float64, cmd map[string]an
 			} else {
 				go func() { _ = cl.CloseWith(context.Background(), msg) }()
 			}
+		}
+		if cl := st.getClient(); cl != nil {
+			closeViaClient(cl)
 			return
 		}
-		conn := st.getConn()
+		conn := st.awaitConn()
+		// connectReconnecting may have set st.client while awaitConn was
+		// waiting: closing its conn directly would just trigger a reconnect.
+		if cl := st.getClient(); cl != nil {
+			closeViaClient(cl)
+			return
+		}
 		if conn == nil {
 			cmdErr(seq, "close before connection established")
 			return
@@ -976,7 +1015,7 @@ func autoRead(st *adapterState, s *wsmixer.Stream) {
 				emit(map[string]any{"event": "stream_closed", "id": s.ID(), "direction": "read", "t_ms": tMs()})
 				if st.noteHalfClosed(s.ID(), "read") {
 					// Both directions closed: the stream is fully terminal
-					// (OVERVIEW.md section 2.5), so there is nothing further
+					// (WIRE.md §2.5), so there is nothing further
 					// to legally watch for -- tear down now rather than
 					// leaking a poll goroutine per stream for the rest of
 					// the connection's life (see the 50-cycle open/close
@@ -986,7 +1025,7 @@ func autoRead(st *adapterState, s *wsmixer.Stream) {
 				} else {
 					// Only the read side closed (half-closed-remote); this
 					// side may still send, and the peer may still illegally
-					// send more DATA later (OVERVIEW.md section 2.5's
+					// send more DATA later (WIRE.md §2.5's
 					// half-closed(remote) row: "recv DATA -> RESET(STREAM_CLOSED)"
 					// -- see spec/fixtures/sequences/data_after_close_toward_client.json).
 					// Stream.Read would busy-loop returning io.EOF forever

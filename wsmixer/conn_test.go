@@ -223,8 +223,8 @@ func TestStream0RateLimitEscalates(t *testing.T) {
 // further lowers max_streams below what the peer (server) actually declared
 // in welcome does not have those self-inflicted refusals count toward the
 // repeat-offence escalation: only OPENs that exceed what this side told the
-// peer it could send are evidence of a misbehaving peer (OVERVIEW.md section
-// 2.7: the client "MAY lower it further to its own ceiling").
+// peer it could send are evidence of a misbehaving peer (WIRE.md
+// §2.7: the client "MAY lower it further to its own ceiling").
 func TestRefusedOpenNoEscalationWhenSelfLimited(t *testing.T) {
 	ws := newFakeWS()
 	opts := Options{RefusedOpenLimit: 3, RefusedOpenWindow: time.Minute}
@@ -269,7 +269,7 @@ func TestRefusedOpenNoEscalationWhenSelfLimited(t *testing.T) {
 // than just refusing the one stream: only the server opens streams, so an
 // OPEN above the boundary it already promised is always the server
 // violating its own promise, never something the client could have
-// self-inflicted (OVERVIEW.md section 2.7 Drain, decision log 2026-08-27).
+// self-inflicted (WIRE.md §2.7 Drain, decision log 2026-08-27).
 func TestOpenAboveDrainLastStreamIDIsProtocolError(t *testing.T) {
 	ws := newFakeWS()
 	c := newConn(ws, RoleClient, Options{}) // only the client receives OPEN
@@ -586,7 +586,7 @@ func slicesEqual(a, b []string) bool {
 }
 
 // TestWriterLoopRoundRobinsAcrossStreams is a deterministic, non-timing-based
-// unit test of the writer's DATA scheduler (OVERVIEW.md section 2.6 rule 3):
+// unit test of the writer's DATA scheduler (WIRE.md §2.6 rule 3):
 // 4 streams each have 8 chunks queued directly on their outQueue (bypassing
 // WriteContext's credit/context plumbing, which is exercised elsewhere), and
 // the wire order the writer loop produces must be strictly interleaved --
@@ -613,7 +613,7 @@ func TestWriterLoopRoundRobinsAcrossStreams(t *testing.T) {
 
 	streams := make([]*Stream, nStreams)
 	for i := 0; i < nStreams; i++ {
-		id := uint32(2*i + 1) // server-opened ids are odd (OVERVIEW.md section 2.5)
+		id := uint32(2*i + 1) // server-opened ids are odd (WIRE.md §2.5)
 		st := newStream(c, id, c.ourWindow, c.peerWindow)
 		// Room for all nChunks at once: this test pushes a stream's whole
 		// backlog before the writer loop starts draining it, unlike

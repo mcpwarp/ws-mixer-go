@@ -1922,7 +1922,7 @@ func (cl *Client) watchConn(conn *Conn) {
 	case 4010, 4011:
 		cl.goFatal(reason)
 	case 4012, 1001:
-		// close 4012, or a plain WS 1001 (nit 3: OVERVIEW.md section 2.8
+		// close 4012, or a plain WS 1001 (nit 3: WIRE.md §2.8
 		// treats a non-ws-mixer 1001 as equivalent to 4012, matching the JS
 		// SDK's ABNORMAL_CLOSURE_WS_CODE branch), with no preceding drain
 		// (drainSched already handled the with-drain case above): reconnect

@@ -22,6 +22,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/mcpwarp/ws-mixer-go/conformance/adapter"
+	"github.com/mcpwarp/ws-mixer-go/internal/version"
 	"github.com/mcpwarp/ws-mixer-go/wsmixer"
 )
 
@@ -76,6 +77,6 @@ func main() {
 	os.Exit(adapter.Run(adapter.Config{
 		Backend:    acceptBackend{},
 		SDK:        "ws-mixer-go",
-		SDKVersion: "0.1.0",
+		SDKVersion: version.SDK,
 	}))
 }

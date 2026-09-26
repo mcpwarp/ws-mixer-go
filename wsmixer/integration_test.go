@@ -236,7 +236,7 @@ func dialWithSpy(t *testing.T, url string, opts ClientOptions) (*Conn, *spyWS) {
 
 // TestIntegrationConcurrentStreamsFairness opens several streams that each
 // write a large payload and checks every stream makes steady progress
-// instead of one hogging the connection (OVERVIEW.md section 2.6 rule 3:
+// instead of one hogging the connection (WIRE.md §2.6 rule 3:
 // round-robin one <=16KiB DATA chunk per ready stream).
 func TestIntegrationConcurrentStreamsFairness(t *testing.T) {
 	connCh := make(chan *Conn, 1)

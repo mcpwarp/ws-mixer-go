@@ -944,8 +944,7 @@ func TestClientFatalCloseCodesPostConnect(t *testing.T) {
 // StableAfter): the attempt counter no longer resets at welcome alone, so
 // this test's premise no longer holds. Kept as a named pointer rather than
 // silently deleted, since it is exactly the test D-2026-09-20's
-// revert-proof exercises (see TestClientAttemptResetProofRevertsWithoutStabilityGate's
-// doc comment).
+// revert-proof exercises (docs/DECISIONS.md D-2026-09-26-01).
 
 func TestClientCloseSendsClientRequestedDrainAndWaits(t *testing.T) {
 	var serverDrain atomic.Pointer[DrainMsg]

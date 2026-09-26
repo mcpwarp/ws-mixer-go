@@ -2,7 +2,7 @@ package wsmixer
 
 // This file holds the per-message-type validators dispatched by
 // ParseControl in control.go, one function per t in the v1 seven
-// (OVERVIEW.md section 2.7's field tables).
+// (WIRE.md §2.7's field tables).
 
 import (
 	"encoding/json"
@@ -150,7 +150,7 @@ func parseWelcome(top map[string]json.RawMessage) (*WelcomeMsg, error) {
 		return nil, newConnErrorf(ProtocolErrorCode, "welcome.max_streams %d out of range %d..%d", m.MaxStreams, maxStreamsMin, maxStreamsMax)
 	}
 	// The ping_interval >= 5000ms / ping_timeout >= 2x ping_interval floor
-	// (OVERVIEW.md section 2.9/2.10) is enforced by Conn.applyWelcome
+	// (WIRE.md §2.7) is enforced by Conn.applyWelcome
 	// (client.go), not here: this parser is a stateless wire decoder with no
 	// notion of the conformance-only allowSubfloorTiming escape hatch, and
 	// applyWelcome is the one place that can gate the check on it.
@@ -276,7 +276,7 @@ func parseDrain(top map[string]json.RawMessage) (*DrainMsg, error) {
 }
 
 // KnownDrainReason reports whether reason is one of the documented values.
-// An unrecognized reason is tolerated at runtime (OVERVIEW.md section 2.7):
+// An unrecognized reason is tolerated at runtime (WIRE.md §2.7):
 // callers should treat it as "maintenance" and count it, not reject it.
 func KnownDrainReason(reason string) bool {
 	switch reason {

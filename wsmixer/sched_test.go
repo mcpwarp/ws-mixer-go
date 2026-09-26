@@ -72,7 +72,7 @@ func TestNextChunkSkipsEmptiedStreamInRotation(t *testing.T) {
 
 // TestNextChunkNeverSendsDataAfterReset checks that a chunk still sitting in
 // outQueue when the stream is RESET is completed with the stream's error
-// instead of being written to the wire (OVERVIEW.md section 2.5's sending
+// instead of being written to the wire (WIRE.md §2.5's sending
 // table: no DATA after RESET).
 func TestNextChunkNeverSendsDataAfterReset(t *testing.T) {
 	c := newTestSchedConn(t)

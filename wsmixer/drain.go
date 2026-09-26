@@ -8,7 +8,7 @@ import (
 
 // --- drain ---------------------------------------------------------------
 
-// DrainOptions configures a Drain call (OVERVIEW.md section 2.9).
+// DrainOptions configures a Drain call (WIRE.md §2.9).
 type DrainOptions struct {
 	Deadline   time.Duration // grace for in-flight streams; 0 = immediately
 	RetryAfter time.Duration // reconnect hint
@@ -38,7 +38,7 @@ func (c *Conn) isDraining() bool {
 
 // Drain stops opening new streams, tells the peer, waits up to opts.Deadline
 // for in-flight streams to finish, then RESETs every survivor with CANCEL and
-// closes with GOING_AWAY (OVERVIEW.md section 2.9). Role-agnostic: WIRE.md
+// closes with GOING_AWAY (WIRE.md §2.9). Role-agnostic: WIRE.md
 // section 2.9/2.10 has the server send drain for its own policy reasons
 // (rollout, idle eviction, load shedding, id exhaustion) and the client send
 // it with reason "client_requested" on graceful shutdown (rule 14) -- both

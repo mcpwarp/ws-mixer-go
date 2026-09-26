@@ -102,7 +102,7 @@ const harnessHelloToken = "harness-synthetic-token"
 
 // harnessAuthenticate is the sequence harness's Authenticate hook: it accepts
 // every token except the one fixture (auth_failure.json) that names a
-// specifically revoked one, exactly the way OVERVIEW.md section 3.4 expects a
+// specifically revoked one, exactly the way WIRE.md §2.1's Auth row expects a
 // real Authenticate hook to reject a bad/expired token.
 func harnessAuthenticate(ctx context.Context, h *Hello) (WelcomeMeta, error) {
 	if h.Token == "stale-or-revoked-token" {
@@ -733,7 +733,7 @@ func (rt *seqRuntime) assertMatches(got []byte, wantRaw json.RawMessage, probe g
 			t.Errorf("error.code = %d, want %d", em.Code, want.Code)
 		}
 	case "pong":
-		// OVERVIEW.md section 2.7: "A pong MUST carry the same id and ts and
+		// WIRE.md §2.7: "A pong MUST carry the same id and ts and
 		// jump ahead of queued DATA."
 		var want struct {
 			ID int64 `json:"id"`

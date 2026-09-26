@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-// The seven v1 control message discriminators (OVERVIEW.md section 2.7).
+// The seven v1 control message discriminators (WIRE.md §2.7).
 const (
 	tHello   = "hello"
 	tWelcome = "welcome"
@@ -19,7 +19,7 @@ const (
 	tApp     = "app"
 )
 
-// Field bounds from OVERVIEW.md section 2.7's field tables.
+// Field bounds from WIRE.md §2.7's field tables.
 const (
 	maxTokenLen      = 4096
 	maxAgentFieldLen = 128
@@ -119,9 +119,9 @@ type AppMsg struct {
 }
 
 // ParseControl validates and decodes one stream-0 DATA payload. It implements
-// OVERVIEW.md section 2.7's "envelope validation and forward compatibility"
-// table plus every message type's per-field checks by hand (decision 9 in
-// OVERVIEW.md section 6: never a JSON Schema validator on the hot path).
+// WIRE.md §2.7's "envelope validation and forward compatibility"
+// table plus every message type's per-field checks by hand (ws-mixer-spec's
+// spec/README.md: never a JSON Schema validator on the hot path).
 //
 // The returned value is one of *HelloMsg, *WelcomeMsg, *PingMsg, *PongMsg,
 // *DrainMsg, *ErrorMsg or *AppMsg. Every validation failure is a *ConnError
@@ -210,7 +210,7 @@ func fieldInt(raw json.RawMessage, name string) (int64, error) {
 	if _, ok := v.(float64); !ok {
 		return 0, fmt.Errorf("field %q must be an integer", name)
 	}
-	// Reject floats: OVERVIEW.md section 2.7 "No floats anywhere in the
+	// Reject floats: WIRE.md §2.7 "No floats anywhere in the
 	// control channel". Re-render the raw bytes and check they parse cleanly
 	// as a base-10 integer literal, rather than trusting float64 (which loses
 	// precision above 2^53 and silently accepts "1.0").

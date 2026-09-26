@@ -15,7 +15,7 @@ import (
 )
 
 // Subprotocol is the WebSocket subprotocol both sides must negotiate
-// (OVERVIEW.md section 2.1).
+// (WIRE.md §2.1).
 const Subprotocol = "ws-mixer.v1"
 
 // Hello is what the Authenticate hook sees: everything hello carried, plus
@@ -94,7 +94,7 @@ func AcceptConn(ctx context.Context, ws WSConn, bearer string, opts AcceptOption
 }
 
 // runServerHandshake runs the post-upgrade half of the server-side handshake
-// (OVERVIEW.md sections 2.1/2.7): read hello with a timeout, validate it,
+// (WIRE.md §2.1/2.7): read hello with a timeout, validate it,
 // call Authenticate, and send welcome — or return an error on failure, which
 // AcceptConn turns into the error{}+close teardown. It operates purely
 // through c.ws (the WSConn interface both *websocket.Conn and the sequence
@@ -104,8 +104,8 @@ func runServerHandshake(ctx context.Context, c *Conn, bearer string, opts Accept
 	// A context deadline passed straight to Read would make coder/websocket
 	// tear the whole connection down with no close frame at all once it
 	// fires (context cancellation on Read closes the connection outright, per
-	// its documented behavior — the same caveat OVERVIEW.md section 3.1 notes
-	// for Ping). Timing this out with an explicit Close instead delivers the
+	// its documented behavior — the same caveat docs/DECISIONS.md
+	// D-2026-08-26-05a notes for Ping). Timing this out with an explicit Close instead delivers the
 	// real error{PROTOCOL_ERROR}/4001 to the peer, and closing is what
 	// unblocks the Read below.
 	helloErr := newConnErrorf(ProtocolErrorCode, "no hello within %dms of connection accept", opts.HelloTimeout.Milliseconds())

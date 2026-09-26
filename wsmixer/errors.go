@@ -2,8 +2,8 @@ package wsmixer
 
 import "fmt"
 
-// ErrorCode is a value from the ws-mixer.v1 wire error code table (OVERVIEW.md
-// section 2.8). It is shared between stream RESET frames and the connection-level
+// ErrorCode is a value from the ws-mixer.v1 wire error code table (WIRE.md
+// §2.8). It is shared between stream RESET frames and the connection-level
 // `error` control message.
 type ErrorCode uint32
 
@@ -26,8 +26,8 @@ const (
 	GoingAwayCode     ErrorCode = 0x0c
 	KeepaliveTimeout  ErrorCode = 0x0d
 	// ApplicationCloseCode: the application layer above ws-mixer closed the
-	// connection for a reason ws-mixer does not interpret (OVERVIEW.md
-	// section 2.8's error code table). This package never produces it itself
+	// connection for a reason ws-mixer does not interpret (WIRE.md
+	// §2.8's error code table). This package never produces it itself
 	// -- it is sent only by an application, on either side, via Conn.Close.
 	ApplicationCloseCode ErrorCode = 0x0e
 )

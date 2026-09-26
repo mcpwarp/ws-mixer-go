@@ -3,18 +3,18 @@ package wsmixer
 import "time"
 
 // Metrics is the callback interface an embedder implements to wire ws-mixer's
-// counters and gauges into whatever metrics library it uses (OVERVIEW.md
-// section 3.4). The core package has no Prometheus (or any other) dependency;
+// counters and gauges into whatever metrics library it uses
+// (docs/METRICS.md). The core package has no Prometheus (or any other) dependency;
 // pass NoopMetrics{} (the default) to disable observability entirely.
 //
 // Every method must return promptly: it is called from the connection's
 // read/write/handshake goroutines and must never block on I/O.
 //
-// wsmixer_socket_buffered_bytes (OVERVIEW.md section 3.4) is deliberately not
+// wsmixer_socket_buffered_bytes (docs/METRICS.md) is deliberately not
 // part of this interface: coder/websocket does not expose the underlying
 // net.Conn's or its own internal write buffer's queued-byte count (Write is
-// synchronous and returns only once the write syscall completes, per section
-// 3.1's comparison table), so there is nothing for this package to sample. An
+// synchronous and returns only once the write syscall completes, per
+// docs/DECISIONS.md D-2026-08-26-05a's comparison table), so there is nothing for this package to sample. An
 // embedder that needs this gauge has to get it from the OS socket (e.g.
 // /proc/net or SO_ANY on the underlying fd), not from ws-mixer.
 type Metrics interface {
@@ -22,8 +22,8 @@ type Metrics interface {
 	ConnectionClosed(session string, closeCode int, errorCode string)
 	HandshakeFailed(stage string)
 	StreamOpened(session string, streamID uint32)
-	// StreamClosed fires once a stream is fully retired (OVERVIEW.md section
-	// 2.5's "fully closed" point). duration is wall-clock lifetime since
+	// StreamClosed fires once a stream is fully retired (WIRE.md
+	// §2.5's "fully closed" point). duration is wall-clock lifetime since
 	// OPEN/newStream, feeding wsmixer_stream_duration_seconds.
 	StreamClosed(session string, streamID uint32, duration time.Duration)
 	StreamReset(session string, streamID uint32, code ErrorCode)
@@ -46,8 +46,8 @@ type Metrics interface {
 	BytesTransferred(session string, direction string, n int64)
 	// SendWindowBlocked feeds wsmixer_send_window_blocked_seconds: an
 	// application Write() had to wait d for send credit to become available
-	// (OVERVIEW.md section 3.4: "the number that tells you whether 256 KiB is
-	// right"). Never called for a Write that had credit immediately.
+	// (docs/METRICS.md: "the number that tells you whether the configured
+	// window is right"). Never called for a Write that had credit immediately.
 	SendWindowBlocked(session string, streamID uint32, d time.Duration)
 	// RecvWindowSample feeds wsmixer_recv_window_bytes: a sampled snapshot of
 	// remaining receive credit on one stream, taken on every DATA frame.

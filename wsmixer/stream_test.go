@@ -57,7 +57,7 @@ func TestStreamCloseResetsWhenPeerStillSending(t *testing.T) {
 // producing that stray DATA in the first place. CloseWrite sets state to
 // half_closed_local (or closed, if the peer had already half-closed); a
 // subsequent WriteContext must fail with STREAM_CLOSED rather than silently
-// queuing a chunk that would violate OVERVIEW.md section 2.5's "MUST NOT
+// queuing a chunk that would violate WIRE.md §2.5's "MUST NOT
 // send" row for half-closed(local)/closed.
 func TestStreamWriteAfterCloseWriteFails(t *testing.T) {
 	c := newTestSchedConn(t)

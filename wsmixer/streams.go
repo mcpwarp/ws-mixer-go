@@ -123,19 +123,40 @@ func (c *Conn) OpenStream(ctx context.Context) (*Stream, error) {
 }
 
 // SendApp sends an opaque `app` message to the peer. Legal in both directions
-// at any time after the handshake completes. Delivery is best-effort: the
-// returned error only ever reflects a failure to marshal body, never
-// anything about the connection itself -- if the conn has already ended
-// (even abnormally), the frame is silently dropped (sendControlFrame's own
-// `case <-c.closed:`) and this still returns nil, exactly as it would for a
-// connection that is still healthy.
+// at any time after the handshake completes. Returns an error if body fails
+// to marshal, or if the conn has already ended -- the same error Stream.Read/
+// Write report for a dead conn (connClosedErr: the close error, or
+// io.ErrUnexpectedEOF for an abnormal closure). A nil return means the frame
+// was queued, never that it was delivered: a conn that dies right after the
+// frame is queued (or concurrently with this call) can still lose it. ctx
+// bounds the wait for space in the control queue: if it is done first,
+// SendApp returns ctx.Err() and the frame is not sent.
 func (c *Conn) SendApp(ctx context.Context, body any) error {
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return err
 	}
+	b, err := json.Marshal(&AppMsg{T: "app", Body: raw})
+	if err != nil {
+		return err
+	}
+	// Checked up front because select picks at random among ready cases: a
+	// controlQueue with room would otherwise still accept the frame some of
+	// the time after c.closed has fired.
+	select {
+	case <-c.closed:
+		return c.connClosedErr()
+	default:
+	}
+	select {
+	case c.controlQueue <- EncodeData(0, b):
+	case <-c.closed:
+		return c.connClosedErr()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	c.opts.Metrics.AppMessage(c.session, "send")
-	return c.sendControl(&AppMsg{T: "app", Body: raw})
+	return nil
 }
 
 // OnApp registers the callback invoked for every incoming `app` message. May

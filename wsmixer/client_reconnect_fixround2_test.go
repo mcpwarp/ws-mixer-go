@@ -357,7 +357,7 @@ func TestClientStaticTokenConnErrorUnauthorizedFatal(t *testing.T) {
 
 // TestClientCloseCode1001ClassifiedLikeGoingAway pins nit 6's other test
 // gap: a raw WebSocket 1001 close with no preceding ws-mixer error{} frame
-// (OVERVIEW.md section 2.8, matching the JS SDK's ABNORMAL_CLOSURE_WS_CODE
+// (WIRE.md §2.8, matching the JS SDK's ABNORMAL_CLOSURE_WS_CODE
 // branch) is classified exactly like 4012 -- reported non-fatal, and
 // reconnected immediately with jitter(0,2s) -- not run through the plain
 // full-jitter-backoff default case.

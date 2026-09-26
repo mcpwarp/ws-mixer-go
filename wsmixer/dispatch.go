@@ -3,7 +3,7 @@ package wsmixer
 // This file holds the connection's frame- and control-message dispatch: the
 // read loop calls dispatch() for every decoded frame, which routes stream
 // frames (OPEN/DATA/WINDOW/CLOSE/RESET) and stream-0 control messages
-// (hello/welcome/ping/pong/drain/error/app) per OVERVIEW.md sections 2.5 and 2.7.
+// (hello/welcome/ping/pong/drain/error/app) per WIRE.md §2.5 and §2.7.
 
 import (
 	"context"
@@ -120,7 +120,7 @@ func (c *Conn) handleRemoteOpen(id uint32) bool {
 		c.failProtocol(newConnErrorf(ProtocolErrorCode, "OPEN for id %d is not greater than highest_opened %d", id, c.highestOpened))
 		return true
 	}
-	// OVERVIEW.md section 2.7 Drain: an OPEN with id > last_stream_id after
+	// WIRE.md §2.7 Drain: an OPEN with id > last_stream_id after
 	// the server has drained means the server violated the boundary it
 	// already promised -- connection-fatal, not a stream-scoped
 	// REFUSED_STREAM, because only the server opens streams and this is
@@ -152,7 +152,7 @@ func (c *Conn) handleRemoteOpen(id uint32) bool {
 		// actually declared to the peer (welcome.max_streams / hello) counts
 		// as peer misbehavior. A refusal caused purely by this side
 		// unilaterally lowering its own effective cap further is expected,
-		// self-inflicted behavior (OVERVIEW.md section 2.7: the client "MAY
+		// self-inflicted behavior (WIRE.md §2.7: the client "MAY
 		// lower it further to its own ceiling") and must never escalate.
 		if streamCount >= declared && c.repeatRefusedOpen() {
 			c.failProtocol(newConnErrorf(EnhanceYourCalm, "%d refused OPENs (STREAM_LIMIT) within %s", c.refusedOpenLimit(), c.refusedOpenWindowDuration()))
@@ -176,7 +176,7 @@ func (c *Conn) handleRemoteOpen(id uint32) bool {
 	return false
 }
 
-// lookupLiveStream classifies an id per OVERVIEW.md section 2.5's receiving
+// lookupLiveStream classifies an id per WIRE.md §2.5's receiving
 // table: neverOpened means "id > highest_opened" (always connection-fatal for
 // a non-OPEN frame); otherwise ok reports whether a live *Stream still exists.
 func (c *Conn) lookupLiveStream(id uint32) (st *Stream, neverOpened bool) {
@@ -307,7 +307,7 @@ func (c *Conn) retireStream(id uint32) {
 // --- control channel dispatch -------------------------------------------------
 
 func (c *Conn) handleControlData(payload []byte) bool {
-	// Token bucket over stream-0 message throughput (OVERVIEW.md section 2.7:
+	// Token bucket over stream-0 message throughput (WIRE.md §2.7:
 	// "app is ... subject to the same stream-0 rate limit as everything
 	// else"). Checked before parsing so a flood of junk can't burn CPU on top
 	// of exhausting the bucket.
@@ -444,7 +444,7 @@ func (c *Conn) handlePeerError(m *ErrorMsg) {
 	c.localCloseInitiated = true
 	c.mu.Unlock()
 	// A peer that receives error MUST NOT reply with another error; just
-	// close (OVERVIEW.md section 2.7). m.Code is peer-controlled and only
+	// close (WIRE.md §2.7). m.Code is peer-controlled and only
 	// bounded to uint32 by the wire format (control.go), so it can map
 	// outside the legal WS close-code range just like a caller's own code
 	// to fail/Close -- wsCloseCode clamps it the same way.

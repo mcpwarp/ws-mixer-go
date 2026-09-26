@@ -10,11 +10,12 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/mcpwarp/ws-mixer-go/internal/version"
 )
 
 // defaultSDKVersion is reported as Agent.SDKVersion in the hello message
-// when the caller doesn't set one. Single source for this package.
-const defaultSDKVersion = "0.6.0"
+// when the caller doesn't set one.
+const defaultSDKVersion = version.SDK
 
 // ClientOptions configures Dial: one dial attempt, one handshake, no
 // reconnect/backoff of its own. It is the low-level building block Client
@@ -180,8 +181,8 @@ func clientHandshake(ctx context.Context, c *Conn, opts ClientOptions) error {
 	// tear the whole connection down with no close frame at all once it
 	// fires (context.AfterFunc-driven c.close() -- conn.go's
 	// setupReadTimeout in coder/websocket -- the same caveat
-	// runServerHandshake's own hello timeout notes, and OVERVIEW.md section
-	// 3.1 for Ping): fabricating a *ConnError afterward would be pointless,
+	// runServerHandshake's own hello timeout notes, and docs/DECISIONS.md
+	// D-2026-08-26-05a for Ping): fabricating a *ConnError afterward would be pointless,
 	// since fail()'s own graceful error{}+close would find nothing left to
 	// write to. Timing the wait out with an explicit fail() from a
 	// time.AfterFunc instead -- mirroring runServerHandshake's own

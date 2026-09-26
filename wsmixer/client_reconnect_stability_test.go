@@ -189,24 +189,6 @@ func TestClientAttemptResetOnlyAfterStability(t *testing.T) {
 	}
 }
 
-// TestClientAttemptResetProofRevertsWithoutStabilityGate documents the
-// revert-proof actually performed during development (not run in CI: there
-// is no supported way to flip the production gate off from a test):
-// temporarily restoring onAttemptSucceeded's old `cl.attempt = 0` /
-// `cl.keepaliveRetryUsed = false` (removing armStability's gating) and
-// rerunning TestClientAttemptResetOnlyAfterStability produced exactly the
-// predicted failure --
-//
-//	delay[1] = 20ms, want 40ms (climbing: attempt never reset, stability never elapsed)
-//	delay[2] = 20ms, want 80ms (climbing: attempt never reset, stability never elapsed)
-//	delay[3] = 20ms, want 160ms (climbing: attempt never reset, stability never elapsed)
-//
-// every delay collapsing back to rc.fullJitter(1) -- and restoring the fix
-// (git diff against the pre-revert file was empty) made it pass again.
-func TestClientAttemptResetProofRevertsWithoutStabilityGate(t *testing.T) {
-	t.Skip("documentation only -- see this test's own doc comment for the revert-proof output it pins")
-}
-
 // TestClientAttemptResetAfterStabilityElapses: a connection that survives
 // StableAfter, then drops, must have its backoff delay back at the first
 // rung -- not accumulating from wherever a prior, never-reset failure left

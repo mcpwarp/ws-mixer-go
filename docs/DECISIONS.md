@@ -762,3 +762,98 @@ links its own spec counterpart explicitly, so read the link, not the number.
   paragraph; that test file's and `client_reconnect.go`'s own comments describing `CloseWith`'s
   cross-SDK alignment were updated too, since they still referred to a caller-supplied code. `spec.pin`
   stays at `v0.4.0` -- the wire itself is unchanged, only the Go SDK's own `Client`-level API surface.
+
+## 2026-09-26
+
+- **D-2026-09-26-01** — v0.7.0 follow-ups: `SendApp` on a dead conn, a single version source, test
+  hardening, and the conformance adapter's handshake-gap flake. Go-only, no spec counterpart.
+
+  (1) `Conn.SendApp` (`streams.go`) now returns an error when the conn has already ended, closing the
+  "reported, not fixed" gap D-2026-09-20-13 left open: it used to go through `sendControl`/
+  `sendControlFrame`, whose `case <-c.closed:` drops the frame with no return value, so a dead conn looked
+  exactly like a healthy one. `SendApp` now does its own enqueue: a non-blocking `c.closed` check first
+  (needed because `select` picks at random among ready cases -- a `controlQueue` with room would otherwise
+  still accept the frame about half the time after `c.closed` fired), then `select` on `controlQueue` vs
+  `c.closed`. Both closed branches return `connClosedErr`, the same precedence `Stream.Read`/`Write` use:
+  the recorded close error (`*ConnError` for a clean `Close`, a peer `error{}` or a local `fail`), else
+  `io.ErrUnexpectedEOF` for an abnormal closure. The doc comment says nil means *queued*, never delivered --
+  a conn that dies right after the enqueue (or concurrently with the call) can still lose the frame; no
+  attempt is made to close that race, since nothing short of an end-to-end ack could. `sendControl`/
+  `sendControlFrame` are unchanged (their other callers -- ping, pong, drain -- all discard the result).
+  Consumers: the conformance adapter's `send_app` (`conformance/adapter/adapter.go`) already routes any
+  `SendApp` error to `cmdErr("send_app: ...")`, and `cmd/testserver`'s `send_app` to its own error output;
+  no spec scenario or fixture issues `send_app` after a close (only `app_roundtrip.json` uses it, on a live
+  connection), so none relied on the old silent no-op. Tests (`wsmixer/sendapp_test.go`):
+  `TestSendAppLiveConnQueuesFrame` (nil, and the app{} frame reaches the wire),
+  `TestSendAppAfterAbnormalCloseReturnsUnexpectedEOF` (`fakeWS.CloseNow()`, no close frame), and
+  `TestSendAppAfterCleanCloseReturnsCloseError` (`Close(0, "bye")`: the exact `Conn.Err()` value, a
+  `*ConnError{NO_ERROR, "bye"}`). The two dead-conn tests call `SendApp` 32 times each so the random
+  `select` would be caught; revert-proof: with the up-front `c.closed` check removed both failed on the
+  2nd/3rd call, then restored.
+
+  (2) Single version source: new `internal/version` package, `const SDK = "0.7.0"`. `wsmixer`'s
+  `defaultSDKVersion` (the default `hello.agent.sdk_version`) is now `version.SDK`, and
+  `cmd/conformance-adapter` reports `version.SDK` on its `ready` event and client-role `hello.agent`
+  instead of the long-stale hardcoded `"0.1.0"`. Exported API unchanged (`internal/` is not importable
+  outside this module; `conformance/adapter.Config.SDKVersion` still lets another thin main -- e.g.
+  ws-mixer-server's -- pass its own).
+
+  (3) Test hardening, from review:
+  - `wsmixer/stream_race_close_test.go`: `parkedRead` slept 5ms and assumed the reader had parked in
+    `Stream.wait()`; if it hadn't, `ReadContext` resolved via its own top-of-loop checks and all five tests
+    passed without reaching the post-`wait()` re-check they exist for. `parkedRead` now records the reader
+    goroutine's `goroutine N [` header and polls `runtime.Stack(all)` until that goroutine's own frame list
+    contains `(*Stream).wait(` (bounded 2s, `t.Fatal` otherwise). Revert-proof: with `ReadContext`'s
+    re-check replaced by an unconditional `return 0, err`, all five failed 3/3, then restored.
+  - `TestClientCloseWithDuringDrainHandoverSendsApplicationCode`: deleted. Its own comment admitted it
+    passed with the review-item-5 guard removed, and that can't be fixed: since D-2026-09-25-01 the
+    retiring-conn branch closes with the same `ApplicationCloseCode` and message as the active-conn
+    branch, so whichever wins the `closeOnce` race, the wire shows the identical 4014 + message -- the
+    guard has no observable effect to assert. What the test did observe (CloseWith → 4014 on the wire) is
+    already pinned by `TestClientCloseWithApplicationCloseCode`.
+  - `TestClientFatalStateExactlyClosed`: polled until `State()=="closed"`, so it could not tell "closed and
+    stays closed" from "closed, then overwritten". It now samples `State()` from inside the fatal
+    `OnDisconnect` itself (goFatal sets `clientClosed` before reporting, so it must already read `closed`
+    there) and again after `cl.wg.Wait()` (every client goroutine has exited). The comment no longer claims
+    to guard watchConn's `clientClosed` guard -- that guard is a no-op on the fatal path (goFatal nils
+    `cl.conn` in the same critical section); removing it fails `TestClientCloseStateExactlyClosed` and
+    `TestClientCloseWithApplicationCloseCode` instead (verified). Removing goFatal's `clientClosed` write
+    fails this test on both samples (verified).
+  - `TestClientCloseWithDuringDial`: the fixed 300ms sleep couldn't distinguish "dial in flight" from
+    "not started yet" or backoff. It now waits for the listener's TCP accept (the upgrade then hangs by
+    construction), asserts `State()=="dialing"` before `CloseWith`, and afterwards asserts exactly one
+    accept and that `Connect` returned an error. New `TestClientCloseWithDuringBackoff` covers the backoff
+    half the old comment also claimed: first dial gets HTTP 503 (recoverable), `rc.after` never fires, the
+    test waits for `State()=="backoff"`, then `CloseWith` must return promptly with exactly one request seen.
+  - `TestClientAttemptResetProofRevertsWithoutStabilityGate`: deleted -- an always-`t.Skip` test used as
+    documentation. Its text, kept here: the revert-proof for D-2026-09-20-07 (StableAfter) was performed
+    during development and is not run in CI (there is no supported way to flip the production gate off from
+    a test): temporarily restoring `onAttemptSucceeded`'s old `cl.attempt = 0` /
+    `cl.keepaliveRetryUsed = false` (removing `armStability`'s gating) and rerunning
+    `TestClientAttemptResetOnlyAfterStability` produced exactly the predicted failure --
+    `delay[1] = 20ms, want 40ms`, `delay[2] = 20ms, want 80ms`, `delay[3] = 20ms, want 160ms` (each
+    "climbing: attempt never reset, stability never elapsed"), every delay collapsing back to
+    `rc.fullJitter(1)` -- and restoring the fix (`git diff` against the pre-revert file was empty) made it
+    pass again.
+
+  (4) Conformance flake: the go-server fixture `window_exhaustion_then_resume` failed once in CI with
+  `step 2 (send): open_stream failed: open_stream before listen/connect completed`. Cause, adapter side: the
+  peer observes the handshake finishing before the adapter records the conn. Server role:
+  `wsmixer.AcceptConn` writes `welcome` to the socket and only then returns, after which the backend calls
+  `OnConn` → `setConn` on the HTTP handler goroutine. The runner (`conformance/runner/driver`) paces
+  fixture steps on the wire: step 1 (`send welcome`) is observe-only and completes the moment the raw actor
+  reads `welcome`, and step 2 (`send OPEN`) immediately writes `open_stream` to the adapter's stdin -- which
+  the stdin loop could process before the handler goroutine reached `setConn`, so `getConn()` was still nil.
+  The client role has the same gap (`Dial` returns once `welcome` is read; the connect goroutine calls
+  `setConn` after). `listen`'s own ack is not the problem (`srv.Serve` on an already-bound listener just
+  queues connections in the backlog). Fixed in the adapter: `adapterState.awaitConn` returns the conn if
+  set, else waits up to 5s (`connWaitBudget`) on `connReady`, a channel the first `setConn` closes;
+  `open_stream`, `send_app`, `drain` and the plain-conn `close` path use it instead of `getConn`. Test
+  (`conformance/adapter/race_test.go`): `TestOpenStreamInHandshakeGapWaitsForConn` holds `OnConn` behind a
+  gate after the client has its `welcome`, issues `open_stream` inside that gap, releases the gate 50ms
+  later, and asserts the client sees the stream and no `error` event was emitted. Revert-proof: with
+  `open_stream` back on `getConn`, it failed 3/3 with the exact CI message, then restored. The runner never
+  waits for the adapter's own server-role `connected` event before sending the next command; that is
+  consistent with CONFORMANCE.md (§1.2 lists `connected` as an event, not a gate) and needs no spec change,
+  though awaiting it after an observed `welcome` would make the runner robust to other adapters with the
+  same gap.

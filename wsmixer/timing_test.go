@@ -269,7 +269,7 @@ func TestDrainWithInflightTimeout(t *testing.T) {
 
 // TestStreamIDExhaustion checks that OpenStream refuses to hand out an id
 // past the 31-bit space, instead sends drain{reason:"id_exhausted"} and
-// closes, and leaves no goroutine behind, per OVERVIEW.md section 2.5.
+// closes, and leaves no goroutine behind, per WIRE.md §2.5.
 func TestStreamIDExhaustion(t *testing.T) {
 	before := runtime.NumGoroutine()
 
@@ -365,7 +365,7 @@ func rawDialAndWaitForClose(t *testing.T, url string) {
 	defer c.CloseNow()
 
 	// The server must write the stream-0 error{PROTOCOL_ERROR} frame before
-	// closing the socket (OVERVIEW.md section 2.8's three-step sequence).
+	// closing the socket (WIRE.md §2.8's three-step sequence).
 	_, data, err := c.Read(ctx)
 	if err != nil {
 		t.Fatalf("expected an error{} frame before the close, got a read error: %v", err)

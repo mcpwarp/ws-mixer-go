@@ -33,31 +33,62 @@ package wsmixer
 // nondeterminism.
 
 import (
+	"bytes"
 	"io"
+	"runtime"
 	"testing"
 	"time"
 )
 
-// parkedRead starts a Read in a goroutine and gives it a moment to actually
-// enter Stream.wait()'s blocked select (buf/err/eof must still be clean at
-// this point, or ReadContext resolves before ever reaching wait()).
-func parkedRead(st *Stream, buf []byte) chan struct {
+// parkedRead starts a Read in a goroutine and returns only once that
+// goroutine's own stack shows it inside Stream.wait() -- i.e. ReadContext has
+// already passed its buf/err/eof checks with the state still clean. Fails
+// the test if that never happens, so a reader that resolved (or had not yet
+// reached wait()) can never let a test pass without exercising the re-check.
+func parkedRead(t *testing.T, st *Stream, buf []byte) chan struct {
 	n   int
 	err error
 } {
+	t.Helper()
 	resultCh := make(chan struct {
 		n   int
 		err error
 	}, 1)
+	gidCh := make(chan []byte, 1)
 	go func() {
+		gidCh <- goroutineHeader()
 		n, err := st.Read(buf)
 		resultCh <- struct {
 			n   int
 			err error
 		}{n, err}
 	}()
-	time.Sleep(5 * time.Millisecond)
+	waitInStreamWait(t, <-gidCh)
 	return resultCh
+}
+
+// goroutineHeader returns the calling goroutine's "goroutine N [" stack
+// prefix, which identifies its block in a runtime.Stack(all=true) dump.
+func goroutineHeader() []byte {
+	b := make([]byte, 64)
+	b = b[:runtime.Stack(b, false)]
+	return b[:bytes.IndexByte(b, '[')+1]
+}
+
+func waitInStreamWait(t *testing.T, header []byte) {
+	t.Helper()
+	buf := make([]byte, 1<<20)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		dump := buf[:runtime.Stack(buf, true)]
+		for _, g := range bytes.Split(dump, []byte("\n\n")) {
+			if bytes.HasPrefix(g, header) && bytes.Contains(g, []byte("wsmixer.(*Stream).wait(")) {
+				return
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("reader never parked in Stream.wait() within 2s")
 }
 
 func waitParkedRead(t *testing.T, resultCh chan struct {
@@ -83,7 +114,7 @@ func TestParkedReadCleanCloseRacingAbnormalConnDeathReturnsIOEOF(t *testing.T) {
 	c := newTestSchedConn(t)
 	st := registerTestStream(c, 1)
 	buf := make([]byte, 1)
-	resultCh := parkedRead(st, buf)
+	resultCh := parkedRead(t, st, buf)
 
 	st.mu.Lock()
 	st.remoteClosed = true
@@ -106,7 +137,7 @@ func TestParkedReadBufferedDataRacingAbnormalConnDeathReturnsData(t *testing.T) 
 	c := newTestSchedConn(t)
 	st := registerTestStream(c, 1)
 	buf := make([]byte, 16)
-	resultCh := parkedRead(st, buf)
+	resultCh := parkedRead(t, st, buf)
 
 	st.mu.Lock()
 	st.buf = []byte("hello")
@@ -138,7 +169,7 @@ func TestParkedReadResetRacingAbnormalConnDeathReturnsStreamError(t *testing.T) 
 	c := newTestSchedConn(t)
 	st := registerTestStream(c, 1)
 	buf := make([]byte, 1)
-	resultCh := parkedRead(st, buf)
+	resultCh := parkedRead(t, st, buf)
 
 	st.mu.Lock()
 	st.state = streamClosed
@@ -167,7 +198,7 @@ func TestParkedReadCleanCloseRacingPeerErrorReturnsIOEOF(t *testing.T) {
 	c := newTestSchedConn(t)
 	st := registerTestStream(c, 1)
 	buf := make([]byte, 1)
-	resultCh := parkedRead(st, buf)
+	resultCh := parkedRead(t, st, buf)
 
 	st.mu.Lock()
 	st.remoteClosed = true
@@ -188,7 +219,7 @@ func TestParkedReadCleanCloseRacingLocalFailReturnsIOEOF(t *testing.T) {
 	c := newTestSchedConn(t)
 	st := registerTestStream(c, 1)
 	buf := make([]byte, 1)
-	resultCh := parkedRead(st, buf)
+	resultCh := parkedRead(t, st, buf)
 
 	st.mu.Lock()
 	st.remoteClosed = true

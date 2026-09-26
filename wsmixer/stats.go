@@ -10,12 +10,12 @@ import "sync/atomic"
 type Stats struct {
 	// UnknownFrameTypes counts frames whose type byte this side doesn't
 	// recognize (FrameType.Known() false): ignored and counted, never a
-	// protocol error (OVERVIEW.md section 2.2: "unknown types MUST NOT
-	// trigger special behaviour").
+	// protocol error (WIRE.md §2.2: "Unknown `type` → ignore and
+	// count").
 	UnknownFrameTypes int64
 	// StaleFrames counts frames for a stream id at or below highest_opened
 	// with no live *Stream anymore (already fully closed): discarded and
-	// logged, not an error (OVERVIEW.md section 2.10 rule 10).
+	// logged, not an error (WIRE.md §2.10 rule 10).
 	StaleFrames int64
 	// DuplicatePongs counts pong control messages whose id was already
 	// acknowledged (or pruned as stale by the watchdog) before this one

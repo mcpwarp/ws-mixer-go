@@ -289,7 +289,7 @@ func settleGoroutines(t *testing.T) int {
 }
 
 // TestResetUnblocksBlockedWrite is the regression test for RESET's
-// out-of-band handling (OVERVIEW.md section 2.5: RESET is abortive -- it
+// out-of-band handling (WIRE.md §2.5: RESET is abortive -- it
 // discards buffered data and unblocks writers). It exhausts the peer's
 // receive window so a queued "write" blocks indefinitely inside
 // WriteContext (waiting for send credit that will never arrive), then
@@ -951,6 +951,82 @@ func TestConnectHonoursReconnectBaseCapMs(t *testing.T) {
 			seen++
 		case <-deadline:
 			t.Fatalf("only %d connection(s) accepted within 3s; reconnect.baseMs/capMs was not honoured", seen)
+		}
+	}
+}
+
+// TestOpenStreamInHandshakeGapWaitsForConn is the regression test for the
+// go-server window_exhaustion_then_resume flake ("open_stream before
+// listen/connect completed"): the peer has already read welcome, but OnConn
+// -- and so setConn -- has not run yet (see awaitConn). OnConn is held
+// behind a gate so that gap stays open, open_stream is issued inside it,
+// and the gate is released only afterwards: the command must wait for the
+// conn and open the stream, not fail at once.
+func TestOpenStreamInHandshakeGapWaitsForConn(t *testing.T) {
+	st := newState(testAcceptBackend{})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	gate := make(chan struct{})
+	releaseGate := sync.OnceFunc(func() { close(gate) })
+	defer releaseGate()
+	onConnEntered := make(chan struct{})
+	listener := testAcceptBackend{}.Handler(ServerConfig{
+		Options: st.options(),
+		Authenticate: func(_ context.Context, h *wsmixer.Hello) (wsmixer.WelcomeMeta, error) {
+			return wsmixer.WelcomeMeta{}, nil
+		},
+		OnConn: func(c *wsmixer.Conn) {
+			close(onConnEntered)
+			<-gate
+			st.setConn(c)
+		},
+	})
+	mux := http.NewServeMux()
+	mux.Handle("/v1/tunnel", listener)
+	srv := &http.Server{Handler: mux}
+	go func() { _ = srv.Serve(ln) }()
+	defer srv.Close()
+
+	streamOpened := make(chan *wsmixer.Stream, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	clientConn, err := wsmixer.Dial(ctx, "ws://"+ln.Addr().String()+"/v1/tunnel", wsmixer.ClientOptions{
+		Options:  st.options(),
+		Token:    "race-test-token",
+		Agent:    wsmixer.AgentInfo{SDK: "race-test", SDKVersion: "0.0.0"},
+		OnStream: func(s *wsmixer.Stream) { streamOpened <- s },
+	})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer clientConn.Close(0, "")
+
+	select {
+	case <-onConnEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server OnConn never ran")
+	}
+	if st.getConn() != nil {
+		t.Fatal("conn already set: the handshake gap this test needs is not open")
+	}
+
+	events := captureEmittedEvents(t, func() {
+		time.AfterFunc(50*time.Millisecond, releaseGate)
+		handleCommand(st, "open_stream", 1, nil)
+		select {
+		case <-streamOpened:
+		case <-time.After(5 * time.Second):
+			t.Error("client never saw the stream open_stream should have opened")
+		}
+	})
+	for _, e := range events {
+		if e["event"] == "error" {
+			t.Errorf("open_stream issued in the handshake gap failed: %v", e)
 		}
 	}
 }

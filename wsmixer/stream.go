@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// streamState is one node of the state machine in OVERVIEW.md section 2.5.
+// streamState is one node of the state machine in WIRE.md §2.5.
 type streamState uint8
 
 const (
@@ -35,17 +35,17 @@ func (s streamState) String() string {
 	}
 }
 
-// maxChunk is the recommended DATA chunk size (OVERVIEW.md section 2.4): a
+// maxChunk is the recommended DATA chunk size (WIRE.md §2.4): a
 // sender-side default that bounds head-of-line blocking, not a wire limit.
 const maxChunk = 16384
 
 // maxSendWindow is the largest legal cumulative send-credit window: 2^31-1
-// (OVERVIEW.md section 2.6 decision 1).
+// (WIRE.md §2.6 decision 1).
 const maxSendWindow = (1 << 31) - 1
 
 // pendingChunk is one outbound DATA chunk queued on its stream's outQueue,
 // from which the connection's writer loop takes at most one per turn,
-// round-robin across ready streams (OVERVIEW.md section 2.6 rule 3).
+// round-robin across ready streams (WIRE.md §2.6 rule 3).
 type pendingChunk struct {
 	streamID uint32
 	data     []byte
@@ -57,12 +57,12 @@ type pendingChunk struct {
 // ahead of the writer loop. Kept small (rather than unbounded, as a shared
 // connection-wide queue would invite) so a fast writer's Write still blocks
 // and backpressure holds, and so the writer's round-robin actually rotates at
-// the 16 KiB chunk granularity OVERVIEW.md section 2.6 promises instead of
+// the 16 KiB chunk granularity WIRE.md §2.6 promises instead of
 // one stream being able to race ahead of the others between rotations.
 const streamOutQueueCap = 2
 
 // Stream is one ws-mixer byte stream: io.Reader + io.Writer + Close +
-// CloseWrite + Reset, per OVERVIEW.md section 3.2.
+// CloseWrite + Reset, per README.md's API table.
 type Stream struct {
 	id   uint32
 	conn *Conn
@@ -226,8 +226,8 @@ func (s *Stream) ReadContext(ctx context.Context, p []byte) (int, error) {
 	return n, nil
 }
 
-// creditConsumed implements the receiver-side half of OVERVIEW.md section
-// 2.6's flow-control pseudocode: on app read of n, credit half the window
+// creditConsumed implements the receiver-side half of WIRE.md
+// §2.6's flow-control pseudocode: on app read of n, credit half the window
 // back to the peer once unacked reaches window/2.
 func (s *Stream) creditConsumed(n int64) {
 	s.mu.Lock()
@@ -252,7 +252,7 @@ func (s *Stream) creditConsumed(n int64) {
 
 // Write implements io.Writer. It blocks in the application (never on the
 // socket read loop) while the send credit window is exhausted, per
-// OVERVIEW.md section 2.6.
+// WIRE.md §2.6.
 func (s *Stream) Write(p []byte) (int, error) { return s.WriteContext(context.Background(), p) }
 
 // WriteContext is Write with an explicit, cancelable context.
@@ -420,7 +420,7 @@ func (s *Stream) Close() error {
 // Reset aborts the stream in both directions with the given error code and an
 // optional human-readable message, discarding any buffered data. It is a
 // no-op if the stream is already fully closed. Never call Reset in answer to
-// a received RESET (loop prevention, OVERVIEW.md section 2.5).
+// a received RESET (loop prevention, WIRE.md §2.5).
 func (s *Stream) Reset(code ErrorCode, msg string) error {
 	s.mu.Lock()
 	if s.state == streamClosed {
@@ -441,7 +441,7 @@ func (s *Stream) Reset(code ErrorCode, msg string) error {
 // --- inbound frame handling (called from the connection's read loop) -------
 
 // handleData applies a received DATA frame. n > remaining recv credit is a
-// connection-fatal FLOW_CONTROL_ERROR (OVERVIEW.md section 2.6 decision 1);
+// connection-fatal FLOW_CONTROL_ERROR (WIRE.md §2.6 decision 1);
 // the caller is responsible for turning this into a full connection error.
 func (s *Stream) handleData(payload []byte) error {
 	s.mu.Lock()
@@ -471,8 +471,8 @@ func (s *Stream) handleWindow(increment uint32) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// WINDOW must be tolerated on a half-closed or fully-closed stream: it is
-	// the one race the ordered transport does not remove (OVERVIEW.md section
-	// 2.5). Only reject the cumulative overflow case.
+	// the one race the ordered transport does not remove (WIRE.md
+	// §2.5). Only reject the cumulative overflow case.
 	newWindow := s.sendWindow + int64(increment)
 	if newWindow > maxSendWindow {
 		return newConnErrorf(FlowControlError, "stream %d: WINDOW would push the send window to %d, past 2^31-1", s.id, newWindow)
@@ -528,7 +528,7 @@ func (s *Stream) isTerminal() bool {
 
 // sendDone reports whether this stream must no longer send DATA -- CLOSE
 // already sent (half-closed local or fully closed) or RESET either way, per
-// OVERVIEW.md section 2.5's sending table -- and if so, the error a chunk
+// WIRE.md §2.5's sending table -- and if so, the error a chunk
 // still queued for it should be completed with instead of being written.
 func (s *Stream) sendDone() (bool, error) {
 	s.mu.Lock()

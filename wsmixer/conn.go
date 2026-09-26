@@ -15,7 +15,7 @@ import (
 )
 
 // Role identifies which side of the connection this process is playing. Only
-// the server opens streams (OVERVIEW.md section 2.5).
+// the server opens streams (WIRE.md §2.5).
 type Role uint8
 
 const (
@@ -31,7 +31,7 @@ func (r Role) String() string {
 }
 
 // Options are the tunables shared by the server Listener and the Dial client
-// (OVERVIEW.md section 3.2's Config).
+// (README.md's API table).
 type Options struct {
 	Window       int64         // this peer's own receive window; default 262144
 	MaxStreams   int64         // streams this peer is willing to accept; default 64
@@ -48,13 +48,13 @@ type Options struct {
 	// (welcome.max_streams / hello.max_streams), inside a trailing
 	// RefusedOpenWindow, escalate from a per-stream RESET to a full
 	// connection ENHANCE_YOUR_CALM. A refusal caused only by this side
-	// unilaterally lowering its own effective cap further (OVERVIEW.md
-	// section 2.7) never counts toward this. Defaults: 20 within 10s.
+	// unilaterally lowering its own effective cap further (WIRE.md
+	// §2.7) never counts toward this. Defaults: 20 within 10s.
 	RefusedOpenLimit  int
 	RefusedOpenWindow time.Duration
 
 	// Stream0RateLimit/Stream0Burst: a token bucket bounding stream-0 control
-	// message throughput (OVERVIEW.md section 2.7: "app is ... subject to the
+	// message throughput (WIRE.md §2.7: "app is ... subject to the
 	// same stream-0 rate limit as everything else"). Exceeding it is
 	// ENHANCE_YOUR_CALM. Defaults: 50 messages/s, burst 100.
 	Stream0RateLimit float64
@@ -62,8 +62,8 @@ type Options struct {
 
 	// allowSubfloorTiming is a test-only escape hatch: when true, the client
 	// handshake (applyWelcome, client.go) skips the wire's ping_interval
-	// >= 5000ms and ping_timeout >= 2x ping_interval floor checks (OVERVIEW.md
-	// section 2.9/2.10), so a scaled-clock test harness (e.g. the conformance
+	// >= 5000ms and ping_timeout >= 2x ping_interval floor checks (WIRE.md
+	// §2.7), so a scaled-clock test harness (e.g. the conformance
 	// runner's --time-scale) can run a real Dial against a welcome carrying
 	// values below those floors. Mirrors the JS SDK's ConnOptions._timing.
 	// Unexported and settable only through the conformance-hooks.go
@@ -225,7 +225,7 @@ type Conn struct {
 
 	controlQueue chan []byte
 
-	// sched is the round-robin DATA scheduler (OVERVIEW.md section 2.6 rule
+	// sched is the round-robin DATA scheduler (WIRE.md §2.6 rule
 	// 3), split out into sched.go along with markStreamReady/nextChunk/
 	// writerLoop. Its lock is intentionally separate from both openMu and
 	// c.mu: the writer loop must never need either of those to pick its next
@@ -235,7 +235,7 @@ type Conn struct {
 	writeTimeout time.Duration // 0 = defaultWriteTimeout; test-only override
 
 	// deliveryQueue decouples OnApp/OnDrain callback invocation from the read
-	// loop (OVERVIEW.md section 2.6 rule 1: "the read loop never blocks on
+	// loop (WIRE.md §2.6 rule 1: "the read loop never blocks on
 	// application delivery"). One goroutine drains it in order, so app and
 	// drain callbacks still fire in the order their frames arrived, but a slow
 	// or blocked handler cannot stall frame parsing/dispatch.
@@ -243,7 +243,7 @@ type Conn struct {
 
 	connNotifyCh chan struct{} // broadcast: a stream slot freed up, or the conn is closing
 
-	stream0Bucket *tokenBucket // rate limit on stream-0 messages (OVERVIEW.md section 2.7)
+	stream0Bucket *tokenBucket // rate limit on stream-0 messages (WIRE.md §2.7)
 
 	// refusedOpenCount/refusedOpenWindowStart: the refused-OPEN repeat-offence
 	// escalation counter (see repeatRefusedOpen). Both fields are
@@ -435,7 +435,7 @@ func (c *Conn) Run() {
 // a separate goroutine well after readerLoop stopped reading) -- so whatever
 // is still sitting in the queue at that point was enqueued from a frame that
 // arrived strictly before whatever ended the connection. A real peer's
-// error{} is always the LAST message it sends (OVERVIEW.md section 2.8), so
+// error{} is always the LAST message it sends (WIRE.md §2.8), so
 // an app/drain/open event queued ahead of it was received before error{} --
 // dropping it here would violate OnApp's "called for every incoming app
 // message" promise (and OnStream/OnDrain's equivalent) for an event that has
@@ -599,7 +599,7 @@ func (c *Conn) repeatRefusedOpen() bool {
 // --- outbound plumbing -------------------------------------------------------
 
 // sendControlFrame enqueues a pre-encoded frame on the control-priority queue
-// (WINDOW, CLOSE, RESET, stream-0 DATA): OVERVIEW.md section 2.6 rule 3.
+// (WINDOW, CLOSE, RESET, stream-0 DATA): WIRE.md §2.6 rule 3.
 func (c *Conn) sendControlFrame(b []byte) {
 	select {
 	case c.controlQueue <- b:
@@ -650,7 +650,7 @@ func (c *Conn) writeMessage(b []byte) error {
 	defer cancel()
 	// Gate the write loop on the socket send buffer: coder/websocket's Write
 	// is synchronous and context-bounded, so this blocking call *is* rule 2 of
-	// OVERVIEW.md section 2.6.
+	// WIRE.md §2.6.
 	err := c.ws.Write(ctx, websocket.MessageBinary, b)
 	if err == nil {
 		c.stats.bytesOut.Add(int64(len(b)))
@@ -695,7 +695,7 @@ func wsCloseCode(code int) websocket.StatusCode {
 }
 
 // fail is the connection-error path: send error{} on stream 0, then close the
-// WebSocket with 4000+code (OVERVIEW.md section 2.8's three steps).
+// WebSocket with 4000+code (WIRE.md §2.8's three steps).
 func (c *Conn) fail(e *ConnError) {
 	c.closeOnce.Do(func() {
 		c.mu.Lock()
@@ -744,7 +744,7 @@ func (c *Conn) fail(e *ConnError) {
 				// Best-effort flush window: give the writer loop a moment to
 				// send the error{} frame before the socket goes away. Do not
 				// wait more than ~2s for the peer's close handshake
-				// (OVERVIEW.md section 2.8).
+				// (WIRE.md §2.8).
 				time.Sleep(50 * time.Millisecond)
 			}
 			_ = c.ws.Close(wsCloseCode(e.CloseCode()), truncateCloseReason(e.Message))
@@ -849,7 +849,7 @@ func (c *Conn) Close(code uint32, msg string) error {
 }
 
 // truncateCloseReason trims s to <=123 UTF-8 bytes on a character boundary
-// (OVERVIEW.md section 2.4).
+// (WIRE.md §2.4).
 func truncateCloseReason(s string) string {
 	if len(s) <= 123 {
 		return s
