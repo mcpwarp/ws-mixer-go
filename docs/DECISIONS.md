@@ -857,3 +857,18 @@ links its own spec counterpart explicitly, so read the link, not the number.
   consistent with CONFORMANCE.md (§1.2 lists `connected` as an event, not a gate) and needs no spec change,
   though awaiting it after an observed `welcome` would make the runner robust to other adapters with the
   same gap.
+
+## 2026-10-13
+
+- **D-2026-10-13-01** — Header-less upgrades (`accept.go`): implements
+  [`ws-mixer-spec`'s `D-2026-10-13-01`](https://github.com/mcpwarp/ws-mixer-spec/blob/main/docs/DECISIONS.md),
+  which makes the upgrade's `Authorization` header optional so browser-class clients can connect.
+  `runServerHandshake` used to reject an empty `bearer` outright; it now treats `bearer == ""` as "the upgrade
+  carried no header" and lets `hello.token` alone reach `Authenticate`. A non-empty `bearer` must still equal
+  `hello.token` (`UNAUTHORIZED`/4011, same message as before), and an empty `hello.token` is answered with
+  `UNAUTHORIZED` "missing hello.token" -- in practice unreachable over the wire, since `parseHello` already
+  rejects a token outside 1..4096 bytes as `PROTOCOL_ERROR`, but it keeps `AcceptConn` from ever calling
+  `Authenticate` with an empty credential. Telling an absent header from a malformed one (HTTP 401) is the
+  caller's job: `AcceptConn` only ever sees the extracted token. The client side is unchanged -- `Dial`
+  always sends the header, which Go can. Test: `TestAcceptConnBearerRule` (`wsmixer/accept_test.go`).
+  `spec.pin` → `v0.5.0`, `version.SDK` → `0.8.0`.

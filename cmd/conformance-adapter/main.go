@@ -64,7 +64,8 @@ func (acceptBackend) Handler(cfg adapter.ServerConfig) http.Handler {
 // case-insensitively on the scheme. This harness has no pre-upgrade rejection
 // policy (that lives in the separate HTTP/upgrade/auth layer): an
 // empty/malformed header just yields an empty bearer, which
-// wsmixer.AcceptConn's own hello.token check rejects.
+// wsmixer.AcceptConn treats as a header-less upgrade (hello.token alone
+// decides, WIRE.md §2.1). The runner always sends a well-formed header.
 func bearerToken(header string) string {
 	const prefix = "bearer "
 	if len(header) <= len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {

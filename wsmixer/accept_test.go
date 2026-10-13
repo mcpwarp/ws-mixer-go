@@ -105,3 +105,78 @@ func TestAcceptConnSessionIDOverride(t *testing.T) {
 		t.Errorf("welcome.session = %q, want %q", welcome.Session, "fixed-session-id")
 	}
 }
+
+// TestAcceptConnBearerRule pins WIRE.md §2.1's Auth row on the server side:
+// an empty bearer (the upgrade carried no Authorization header) leaves
+// hello.token as the sole credential and still reaches Authenticate, while a
+// non-empty bearer must equal hello.token. An empty hello.token never gets
+// that far: hello validation rejects it as PROTOCOL_ERROR (§2.7).
+func TestAcceptConnBearerRule(t *testing.T) {
+	cases := []struct {
+		name         string
+		bearer       string
+		token        string
+		rejectAuth   bool
+		wantErr      bool
+		wantClose    int
+		wantAuthCall bool
+	}{
+		{name: "header matches hello.token", bearer: "test-token", token: "test-token", wantAuthCall: true},
+		{name: "no header, hello.token authenticates", bearer: "", token: "test-token", wantAuthCall: true},
+		{name: "no header, Authenticate rejects hello.token", bearer: "", token: "bad-token", rejectAuth: true, wantErr: true, wantClose: 4011, wantAuthCall: true},
+		{name: "no header, empty hello.token", bearer: "", token: "", wantErr: true, wantClose: 4001},
+		{name: "header does not match hello.token", bearer: "test-token", token: "other-token", wantErr: true, wantClose: 4011},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ws := newFakeWS()
+			done := make(chan struct{})
+			var c *Conn
+			var err error
+			var authToken string
+			var authCalled bool
+			go func() {
+				defer close(done)
+				c, err = AcceptConn(context.Background(), ws, tc.bearer, AcceptOptions{
+					Authenticate: func(_ context.Context, h *Hello) (WelcomeMeta, error) {
+						authCalled, authToken = true, h.Token
+						if tc.rejectAuth {
+							return WelcomeMeta{}, Unauthorized("token rejected")
+						}
+						return WelcomeMeta{}, nil
+					},
+				})
+			}()
+
+			hello, _ := json.Marshal(map[string]any{
+				"t": "hello", "v": 1, "token": tc.token,
+				"agent": map[string]string{"sdk": "test", "sdk_version": "0.0.0"},
+			})
+			ws.feedInbound(EncodeData(0, hello))
+
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("AcceptConn never returned")
+			}
+			if authCalled != tc.wantAuthCall {
+				t.Errorf("Authenticate called = %v, want %v", authCalled, tc.wantAuthCall)
+			}
+			if authCalled && authToken != tc.token {
+				t.Errorf("Authenticate saw token %q, want %q", authToken, tc.token)
+			}
+			if !tc.wantErr {
+				if err != nil {
+					t.Fatalf("AcceptConn: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("AcceptConn succeeded, want a handshake failure")
+			}
+			if got := c.CloseCode(); got != tc.wantClose {
+				t.Errorf("CloseCode() = %d, want %d", got, tc.wantClose)
+			}
+		})
+	}
+}

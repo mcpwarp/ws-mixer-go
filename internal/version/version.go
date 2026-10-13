@@ -4,4 +4,4 @@
 package version
 
 // SDK is this module's release version.
-const SDK = "0.7.0"
+const SDK = "0.8.0"

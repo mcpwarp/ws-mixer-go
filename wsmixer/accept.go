@@ -71,7 +71,12 @@ type AcceptOptions struct {
 // AcceptConn runs the post-upgrade server-side wire handshake on an already
 // upgraded socket: hello-with-timeout, validation, Authenticate, welcome.
 // bearer is the token the caller already extracted from the Authorization
-// header (the caller owns the pre-upgrade checks). A zero-value AcceptOptions
+// header (the caller owns the pre-upgrade checks), or "" when the upgrade
+// carried none: WIRE.md §2.1 lets a client that cannot set upgrade headers
+// authenticate on hello.token alone. A non-empty bearer must equal
+// hello.token. Since "" means "no header", a caller must itself answer HTTP
+// 401 for a present but malformed Authorization header and never pass "" for
+// one. A zero-value AcceptOptions
 // is usable as-is: AcceptConn applies Options.SetDefaults() itself. On
 // failure it performs the error{}+close teardown itself and waits for it, so
 // the caller only reports; the returned *Conn is still valid to inspect
@@ -94,8 +99,9 @@ func AcceptConn(ctx context.Context, ws WSConn, bearer string, opts AcceptOption
 }
 
 // runServerHandshake runs the post-upgrade half of the server-side handshake
-// (WIRE.md §2.1/2.7): read hello with a timeout, validate it,
-// call Authenticate, and send welcome — or return an error on failure, which
+// (WIRE.md §2.1/2.7): read hello with a timeout, validate it, require a
+// non-empty hello.token that equals bearer when bearer is set (UNAUTHORIZED
+// otherwise), call Authenticate, and send welcome — or return an error on failure, which
 // AcceptConn turns into the error{}+close teardown. It operates purely
 // through c.ws (the WSConn interface both *websocket.Conn and the sequence
 // test harness's fake transport satisfy), so this is the one implementation
@@ -159,7 +165,10 @@ func runServerHandshake(ctx context.Context, c *Conn, bearer string, opts Accept
 	if !ok {
 		return newConnErrorf(ProtocolErrorCode, "first stream-0 message must be hello")
 	}
-	if bearer == "" || hello.Token != bearer {
+	if hello.Token == "" {
+		return &ConnError{Code: UnauthorizedCode, Message: "missing hello.token"}
+	}
+	if bearer != "" && hello.Token != bearer {
 		return &ConnError{Code: UnauthorizedCode, Message: "hello.token does not match the Authorization bearer token"}
 	}
 
