@@ -872,3 +872,108 @@ links its own spec counterpart explicitly, so read the link, not the number.
   caller's job: `AcceptConn` only ever sees the extracted token. The client side is unchanged -- `Dial`
   always sends the header, which Go can. Test: `TestAcceptConnBearerRule` (`wsmixer/accept_test.go`).
   `spec.pin` → `v0.5.0`, `version.SDK` → `0.8.0`.
+
+## 2026-10-14
+
+- **D-2026-10-14-01** — New package `mcpwarp` (`github.com/mcpwarp/ws-mixer-go/mcpwarp`): implements
+  [`ws-mixer-spec`'s `D-2026-10-14-01`](https://github.com/mcpwarp/ws-mixer-spec/blob/main/docs/DECISIONS.md)
+  (the mcpwarp layer, `docs/MCPWARP.md`) at spec `v0.6.1` (`D-2026-10-14-06`), both tiers: Tier 1 (§2
+  envelope, §3 identity/registration/take-over, §4 request bridging, §8 runtime) and Tier 2 (§5 `Expose`, §6
+  `NewTunnel`, §7 `DescribeStatus`, Go names per §9). `wsmixer` stays free of mcpwarp types; the layer uses
+  its public API only. Layout: `envelope.go` (codec, code tables), `errors.go` (`*Error`), `session.go`
+  (registration state machine, timers injected), `http1.go` + `bridge.go` (HTTP/1.1 over a stream,
+  `http.Handler` and target proxy), `transport.go` (a `transport` seam over `wsmixer.Client`), `agent.go`
+  (one exposed service: session + bridge + transport, every wait a timer or a callback), `options.go`
+  (`ExposeOptions`, §5.2 validation), `expose.go` (`Handle`, events), `tunnel.go` (controller),
+  `statustext.go` + generated `statustext_tables.go` (`go generate ./mcpwarp/` runs
+  `internal/genstatustext` over the pinned `spec/fixtures/mcpwarp/status-text/*.json`; a test fails when the
+  checked-in tables drift). `spec.pin` → `v0.6.1`. Fixture runners: `TestEnvelopeFixtures*` (§10.2),
+  `TestBridgingFixtures` (§10.3, a real agent over a loopback fake edge built on `AcceptConn`, the way
+  §10.3 reaches `sdkState`), `TestTunnelFixtures` (§10.4, the real controller over a scripted ws-mixer
+  client and a fake clock: tunnel/README.md's "runner that fakes the ws-mixer client itself"),
+  `TestStatusTextFixtures` (§10.5). They run in `go.yml`'s `test`/`race` jobs and verbosely in the new
+  `mcpwarp-fixtures` job; under `CI` a missing corpus fails instead of skipping. Counts at `v0.6.1`:
+  envelope valid 17/17, invalid 34 pass + 9 skipped (agent→edge `SCHEMA_*` hints: the edge's verdict, not
+  the agent's, §10.2); bridging 13 + 1 skipped (`body_413_streamed_reset`: a streaming-adapter fixture, this
+  bridge buffers, §10.3); tunnel 33 + 1 skipped (`07_invalid_config` sets `token`/`name` to `null`, which
+  Go's string fields cannot hold; its `kind` case is `TestTunnelInvalidKindAtStart`); status text 33/33.
+  `schema_valid` is not re-checked (no JSON Schema dependency); `check-fixtures.mjs` holds that verdict.
+
+- **D-2026-10-14-02** — Additive `wsmixer` API, each the minimum the layer needed:
+  `ClientOptions.HTTPClient` / `ClientConfig.HTTPClient *http.Client`, passed to coder/websocket's
+  `DialOptions.HTTPClient`: MCPWARP.md §8's caller-supplied connector (dialer, proxy, TLS), surfaced as
+  `ExposeOptions.WebSocket` / `TunnelConfig.WebSocket`. `ClientConfig.OnReconnect func(ReconnectInfo)`,
+  `ReconnectInfo{Attempt, Delay, Cause}`, `ReconnectDrain`, `ReconnectTokenRefresh`: §5.9 needs `onRetry`
+  before every scheduled redial (backoff incl. zero delays, drain replacement, the token-refresh redial),
+  which the layer cannot see otherwise; queued on the callback goroutine after the disconnect it answers
+  and before the redial's `OnConnect`, so a zero-delay dial may already be under way when it runs.
+  `DisconnectReason.Superseded`: marks the end of a drained connection whose replacement has received
+  welcome, the §2.7/§6.8 "superseded" test, decided by the client that knows connection identity.
+  `Client.CloseImmediately(ctx)`: error{NO_ERROR} + close 1000 at once, no `drain{client_requested}`, no
+  grace; the take-over close of spec v0.6.2 R4 (`Close` drains, `CloseWith` sends `APPLICATION_CLOSE`), and
+  called from `OnDrain` it marks the client closed before the drain's replacement dial can start.
+
+- **D-2026-10-14-03** — Rulings implemented ahead of their spec tags (v0.6.2 final / v0.6.3 draft, ruled by
+  the spec session, approved for v0.9.0), each with its test:
+  an OPEN crossing this side's own `drain{client_requested}` is RESET `REFUSED_STREAM` for that stream only,
+  never a connection error; the `last_stream_id` rule applies only after the server's drain
+  (`TestClientOwnDrainRefusesLateOpen`).
+  Drain hand-over: the drained connection keeps serving after its replacement's welcome and is retired at
+  the drain's `deadline_ms` + 1000 ms (30 s without one), or as soon as no stream is left on it; survivors
+  RESET `CANCEL`, then error{NO_ERROR} + close 1000; its end is reported once with `Superseded`, and its
+  counters are folded into `Client.Stats()` once (`TestClientRetiresDrainedConnAtDeadline`,
+  `TestClientRetiresDrainedConnWhenEmpty`, `TestClientStatsAfterHandoverCountEachConnOnce`). This replaces
+  closing it at the replacement's welcome.
+  Integer control fields accept any integral JSON number (`1.0`, `1e3`), parsed exactly; fractions, bools and
+  strings are rejected (`TestControlIntegerFieldsAcceptIntegralNumbers`).
+  `token` 4096, `error.message` 1024, `drain.message` 256 and `session` 64 count Unicode code points, as JSON
+  Schema `maxLength` (`TestControlStringLimitsCountCodePoints`).
+  Take-over close (`conflict` op or `drain{replaced}`): RESET `CANCEL` on streams being served, then
+  `CloseImmediately`: no drain frame, no grace, no unregister (`TestClientCloseImmediately`,
+  `TestAgentStickyConflictClosesClient`, `TestAgentDrainReplacedIsTakeOver`); the close's disconnect is
+  reported after the conflict (`TestAgentReplacedConflictBeforeDisconnect`).
+  A request net/http cannot carry (an unparsable URL, a control byte in `Host` or a forwarded header) is 400
+  `request cannot be represented as a web Request` in target mode as in handler mode, never 502
+  (`TestBridgeUnrepresentable400`).
+  The forwarded target is percent-encoded once from the received bytes: bytes outside RFC 3986's allowed set
+  become `%XX`, every `%` is kept as is (a valid escape and a lone `%` alike), `#` drops the fragment and
+  everything after it; `RequestURI` stays as received (`TestBridgeTargetEscapedOnce`,
+  `TestBridgeTargetLonePercentKept`, `TestBridgeTargetFragmentDropped`).
+  A final handler or target status outside 200–599 is the 500 `handler error` reply plus an error event
+  (`TestBridgeStatusOutOfRange500`).
+  The 64 KiB head cap counts the terminating blank line (`TestReadHeadCapCountsBlankLine`).
+  Once the request line parsed as `HEAD`, every SDK-generated reply is head-only, head-parse errors (400,
+  431) included; without a parsable request line the reply keeps its body (`TestBridgeHeadRepliesHeadOnly`).
+
+- **D-2026-10-14-04** — Remaining Go choices and deviations in `mcpwarp`:
+  the request body is buffered whole (≤ `MaxRequestBodyBytes`, default 4 MiB) before the app runs, so a body
+  over the cap is always a 413 before any response byte and §4.2's streaming rows never apply.
+  `""` means absent: `Conflict.ServerID` (JS omits `serverId`), `ServiceError.ID` (an explicit `"id":""` is
+  treated as absent), empty `TunnelStatus` fields.
+  Header casing: the handler sees net/http-canonical request headers; response headers go out as the
+  handler spelled them, sorted like net/http.
+  Edge cancellation: `wsmixer.Stream` has no close notification, so a RESET is polled every 100 ms beside
+  the connection's `Done`.
+  Connection identity: `Client`'s `OnApp` carries no connection, so each connection's own `OnApp` is bound
+  in `OnConnect`; messages before that are attributed to the newest connection; a connection's end is
+  observed through its `Done` plus `Client.Conn()`.
+  `Configure` never yields `INVALID_CONFIG` in Go: §6.2 checks 1, 2 and 4–7 are dynamic-type checks Go's
+  types rule out; an invalid config surfaces at start (T7/T8).
+  `ExposeOptions.Token string` plus `TokenProvider` (the provider wins); the token-refresh redial exists
+  only with a provider, a static token is fatal on its first rejection (CLIENT-SDK.md).
+  `ReconnectOptions` zero values take the defaults (JS `base: 0` means 0); `MaxAttempts` 0 is unlimited;
+  negatives are validation errors.
+  `WebSocket` is an `*http.Client`, compared by identity in `TunnelConfig`, not a factory function.
+  `Dispose(ctx)` bounds its wait by ctx's deadline (5 s without one), clamps a passed deadline to 0, always
+  returns nil; `Configure`/`Stop` return `ctx.Err()` only when ctx ends first.
+  `Handle.Events()` buffers without bound; its pump starts on the first call and closes the channel after
+  `EventClose`. Tunnel callbacks (listeners, `OnRetry`, `Logger`) run on one deliverer, outside the lock and
+  after the work queue, so a callback may call `Configure`/`Stop`/`Dispose`; `Subscribe`'s first call goes
+  through that deliverer (immediate when idle, else right after the current callback).
+  `ExposeState` with `Expose*` constants and `Registration() (Registration, bool)` (§9 names neither shape).
+  Validation messages keep §5.2's JS option names verbatim; `URL` must be ws/wss (not a §5.2 row).
+  Spots where `v0.6.1` is silent and the v0.6.2 draft was followed: `hello.meta.client` `"sdk-go"`,
+  `version` = `version.SDK` (R2); envelope defects checked in the order name, id, url, created (R8);
+  `Target` must be http/https at validation (R3); the drain `onRetry` delay is the real one, including a
+  `retry_after_ms` hint (R6). `ExposeOptions.Logger` is passed to `wsmixer.Options.Logger`.
+  `version.SDK` → `0.9.0`.

@@ -33,7 +33,8 @@ func parseHello(top map[string]json.RawMessage) (*HelloMsg, error) {
 	if m.Token, err = fieldString(tokRaw, "token"); err != nil {
 		return nil, connErr(err)
 	}
-	if l := len(m.Token); l < 1 || l > maxTokenLen {
+	// String limits count Unicode code points, as JSON Schema's maxLength.
+	if l := utf8.RuneCountInString(m.Token); l < 1 || l > maxTokenLen {
 		return nil, newConnErrorf(ProtocolErrorCode, "hello.token length %d out of range 1..%d", l, maxTokenLen)
 	}
 
@@ -134,8 +135,8 @@ func parseWelcome(top map[string]json.RawMessage) (*WelcomeMsg, error) {
 	if m.Session, err = requireString(top, "session"); err != nil {
 		return nil, connErr(err)
 	}
-	if len(m.Session) > maxSessionLen {
-		return nil, newConnErrorf(ProtocolErrorCode, "welcome.session length %d exceeds %d", len(m.Session), maxSessionLen)
+	if l := utf8.RuneCountInString(m.Session); l > maxSessionLen {
+		return nil, newConnErrorf(ProtocolErrorCode, "welcome.session length %d exceeds %d", l, maxSessionLen)
 	}
 	if m.Window, err = requireInt(top, "window"); err != nil {
 		return nil, connErr(err)
@@ -268,8 +269,8 @@ func parseDrain(top map[string]json.RawMessage) (*DrainMsg, error) {
 		if m.Message, err = fieldString(raw, "message"); err != nil {
 			return nil, connErr(err)
 		}
-		if len(m.Message) > maxDrainMessage {
-			return nil, newConnErrorf(ProtocolErrorCode, "drain.message length %d exceeds %d", len(m.Message), maxDrainMessage)
+		if l := utf8.RuneCountInString(m.Message); l > maxDrainMessage {
+			return nil, newConnErrorf(ProtocolErrorCode, "drain.message length %d exceeds %d", l, maxDrainMessage)
 		}
 	}
 	return m, nil
@@ -307,8 +308,8 @@ func parseError(top map[string]json.RawMessage) (*ErrorMsg, error) {
 	if m.Message, err = requireString(top, "message"); err != nil {
 		return nil, connErr(err)
 	}
-	if len(m.Message) > maxErrorMessage {
-		return nil, newConnErrorf(ProtocolErrorCode, "error.message length %d exceeds %d", len(m.Message), maxErrorMessage)
+	if l := utf8.RuneCountInString(m.Message); l > maxErrorMessage {
+		return nil, newConnErrorf(ProtocolErrorCode, "error.message length %d exceeds %d", l, maxErrorMessage)
 	}
 
 	if raw, ok := top["stream_id"]; ok {

@@ -39,8 +39,9 @@ func TestClientDrainFlagStuck(t *testing.T) {
 	if _, err := c1.OpenStream(context.Background()); err != nil {
 		t.Fatalf("OpenStream: %v", err)
 	}
-	// Long deadline: c1 stays alive until the replacement lands and supersedes it.
-	go func() { _ = c1.Drain(context.Background(), "rollout", DrainOptions{Deadline: 10 * time.Second}) }()
+	// c1 stays alive until the replacement lands (no drain jitter here), then
+	// keeps serving its stream until the server's own 300ms deadline ends it.
+	go func() { _ = c1.Drain(context.Background(), "rollout", DrainOptions{Deadline: 300 * time.Millisecond}) }()
 
 	c2 := <-connCh // the parallel reconnect
 	for i := 0; i < 300 && onConnectCount.Load() < 2; i++ {

@@ -30,6 +30,10 @@ type ClientOptions struct {
 	Meta         any
 	Capabilities []string
 	HTTPHeader   http.Header
+	// HTTPClient, if set, performs the upgrade request (its Transport
+	// carries the dialer, proxy and TLS configuration); nil uses
+	// http.DefaultClient. Passed to coder/websocket's DialOptions.HTTPClient.
+	HTTPClient *http.Client
 
 	// OnStream is called whenever the server opens a new stream.
 	OnStream func(*Stream)
@@ -73,6 +77,7 @@ func Dial(ctx context.Context, url string, opts ClientOptions) (*Conn, error) {
 	ws, resp, err := websocket.Dial(ctx, url, &websocket.DialOptions{
 		Subprotocols:    []string{Subprotocol},
 		HTTPHeader:      header,
+		HTTPClient:      opts.HTTPClient,
 		CompressionMode: websocket.CompressionDisabled,
 	})
 	if err != nil {

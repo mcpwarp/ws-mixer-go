@@ -50,6 +50,7 @@ func (c *Conn) Drain(ctx context.Context, reason string, opts DrainOptions) erro
 		return nil
 	}
 	c.draining = true
+	c.selfDrained = true
 	lastID := c.highestOpened
 	if c.hasAnnouncedLast && c.announcedLastID < lastID {
 		// Endpoints MUST NOT increase last_stream_id across multiple drains;
@@ -112,6 +113,19 @@ func (c *Conn) Drain(ctx context.Context, reason string, opts DrainOptions) erro
 		closeCode = opts.CloseCode
 	}
 	return c.Close(uint32(closeCode), fmt.Sprintf("draining: %s", reason))
+}
+
+// resetSurvivors RESETs every stream still open with CANCEL.
+func (c *Conn) resetSurvivors(msg string) {
+	c.mu.Lock()
+	survivors := make([]*Stream, 0, len(c.streams))
+	for _, st := range c.streams {
+		survivors = append(survivors, st)
+	}
+	c.mu.Unlock()
+	for _, st := range survivors {
+		st.Reset(CancelCode, msg)
+	}
 }
 
 // waitForDrainedOrEmpty returns a channel closed once the stream table is

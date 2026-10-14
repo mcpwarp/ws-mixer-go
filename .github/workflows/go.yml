@@ -16,7 +16,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.24"
-      - run: go vet ./wsmixer/... ./cmd/...
+      - run: go vet ./wsmixer/... ./mcpwarp/... ./cmd/...
       - run: go vet -tags conformance ./...
 
   test:
@@ -44,6 +44,23 @@ jobs:
       - name: Checkout ws-mixer-spec @ pin
         run: git clone --depth 1 --branch "$(cat spec.pin)" https://github.com/mcpwarp/ws-mixer-spec.git .spec
       - run: go test -race -count=1 ./...
+        env:
+          WSMIXER_SPEC_DIR: ${{ github.workspace }}/.spec
+
+  # The mcpwarp layer's spec fixtures (MCPWARP.md §10.2/§10.3) on their own,
+  # verbose, so the per-fixture pass/skip list is in the log. They also run
+  # in `test`/`race` above; a missing corpus fails here (CI is set), it
+  # never skips.
+  mcpwarp-fixtures:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: Checkout ws-mixer-spec @ pin
+        run: git clone --depth 1 --branch "$(cat spec.pin)" https://github.com/mcpwarp/ws-mixer-spec.git .spec
+      - run: go test -count=1 -v -run 'TestEnvelopeFixtures|TestBridgingFixtures|TestTunnelFixtures|TestStatusTextFixtures' ./mcpwarp/
         env:
           WSMIXER_SPEC_DIR: ${{ github.workspace }}/.spec
 

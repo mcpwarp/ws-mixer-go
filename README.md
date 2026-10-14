@@ -206,7 +206,90 @@ Running the server side yourself (no production policy layer): accept the WebSoc
 `ws-mixer-server`'s `Listener` instead, which adds subprotocol/bearer-token pre-upgrade checks and
 production auth policy on top of `AcceptConn`.
 
+## mcpwarp layer
+
+Package `mcpwarp` (`github.com/mcpwarp/ws-mixer-go/mcpwarp`) is the
+[mcpwarp application layer](https://github.com/mcpwarp/ws-mixer-spec/blob/main/docs/MCPWARP.md) on top of
+`wsmixer.Client`: the `app.body.mcpwarp` envelope, service registration and take-over, and HTTP/1.1 request
+bridging from ws-mixer streams to an `http.Handler` or a local target URL. The `wsmixer` package itself stays free
+of mcpwarp types.
+
+`Expose` publishes one service and returns once it is registered (or disabled from the dashboard); the
+handle's `Events()` channel carries `EventRegistered` … `EventClose`, and cancelling the `ctx` passed to
+`Expose` closes it later too:
+
+```go
+h, err := mcpwarp.Expose(ctx, mcpwarp.ExposeOptions{
+	Token:       os.Getenv("MCPWARP_TOKEN"),        // or TokenProvider, called on every dial
+	Name:        "notes",
+	Integration: "0f8fad5b-d9cb-469f-a165-70867728950e",
+	Handler:     mcpHandler,                        // or Target: "http://127.0.0.1:3000/mcp"
+	OnRetry:     func(r mcpwarp.RetryInfo) { log.Printf("retry #%d in %v: %s", r.Attempt, r.Delay, r.Reason) },
+})
+if err != nil {
+	log.Fatal(err) // validation (errors.Is ErrInvalidOptions), or a fatal *mcpwarp.Error
+}
+defer h.Close(context.Background()) // unregister, then a graceful close
+log.Printf("online at %s", h.URL())
+```
+
+`NewTunnel` is the long-lived controller for hosts with a settings UI: call `Configure` on every settings
+change (idempotent on the trimmed token, serialized, last call wins), render `Status()` / `Subscribe` with
+`DescribeStatus` in the user's locale, `Dispose` on shutdown:
+
+```go
+tun, err := mcpwarp.NewTunnel(mcpwarp.TunnelOptions{Integration: id, Handler: mcpHandler, Logger: slog.Default()})
+unsubscribe := tun.Subscribe(func(s mcpwarp.TunnelStatus) {
+	text := mcpwarp.DescribeStatus(s, mcpwarp.DescribeOptions{Locale: "de"})
+	showStatus(text.Label, text.Detail, s.URL)
+})
+_ = tun.Configure(ctx, mcpwarp.TunnelConfig{Enabled: true, Token: token, Name: "notes"})
+```
+
+`DescribeStatus(status, DescribeOptions{Locale, Messages})` turns a `TunnelStatus` into `{Label, Detail}` in
+one of `StatusLocales` (en, de, es, fr, ja, zh-CN; unknown locales fall back by language, then to en). Its
+tables are generated from the pinned spec's `spec/fixtures/mcpwarp/status-text/*.json` (`go generate
+./mcpwarp/` after `make fetch-spec`); a test fails when the checked-in tables drift from them.
+
+The envelope codec and its tables are public too:
+
+```go
+body := mcpwarp.EncodeRegister("notes", mcpwarp.KindHTTP)  // {"mcpwarp":{"v":1,"op":"register",...}}
+env, err := mcpwarp.DecodeEnvelope(appBody)                // *RegisteredMsg, *DisableMsg, ..., *UnknownMsg;
+                                                           // err is a *mcpwarp.Error, Code "MALFORMED_ENVELOPE"
+mcpwarp.IsValidServiceName("notes")                        // ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$, <= 30 chars
+mcpwarp.IsTransientRegisterError(mcpwarp.RegisterTimeout)  // retried with backoff, never fatal
+```
+
+Bridging buffers each request body whole (up to the 4 MiB default cap) before the handler runs, so a body
+over the cap is always a `413` before any response byte; the handler gets a server-style `*http.Request`
+(`URL` `https://<Host><target>`, `Host`, canonicalised headers minus hop-by-hop, `Expect` and
+`Content-Length`) and an `http.ResponseWriter` that is also an `http.Flusher` and writes each `Write` as one
+chunk.
+
+The layer needed three small, additive core hooks, usable on their own:
+
+`ClientConfig.HTTPClient` (and `ClientOptions.HTTPClient` on `Dial`) performs the WebSocket upgrade, so a caller
+can supply its own dialer, proxy or TLS configuration; `ExposeOptions.WebSocket` and `TunnelConfig.WebSocket`
+pass it through.
+
+`ClientConfig.OnReconnect func(ReconnectInfo)` fires once for every reconnect `Client` schedules -- a backoff
+redial (zero delays included), a drain's replacement dial (`Cause` `ReconnectDrain`, `Attempt` 0) and the one
+token-refresh redial (`ReconnectTokenRefresh`) -- queued after the disconnect it answers and before the
+redial's `OnConnect`. `DisconnectReason.Superseded` marks the end of a drained connection whose replacement
+has already received welcome: it keeps serving its streams until they finish, the server closes it, or
+`Client` retires it at the drain's `deadline_ms` + 1 s.
+
+`Client.CloseImmediately(ctx)` ends the client for good with `error{NO_ERROR}` and close 1000 at once -- no
+`drain{client_requested}`, no grace -- for an application that has decided the connection is no longer its
+own (mcpwarp's take-over close).
+
 ## Tests
+
+`go test ./mcpwarp/` runs the mcpwarp envelope, bridging, tunnel and status-text fixtures
+(`spec/fixtures/mcpwarp/`, spec `v0.6.0` or later) from the same spec checkout, plus the layer's own unit tests
+over a loopback fake edge. The tunnel fixtures run the real controller over a scripted ws-mixer client and a fake
+clock (tunnel/README.md's "runner that fakes the ws-mixer client itself").
 
 `go test ./wsmixer/` runs the fixture-driven suites (`frame_test.go`, `control_test.go`,
 `sequence_test.go`) against a checkout of [`ws-mixer-spec`](https://github.com/mcpwarp/ws-mixer-spec),

@@ -3,6 +3,7 @@ package wsmixer
 import (
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"regexp"
 	"strconv"
 	"strings"
@@ -210,19 +211,19 @@ func fieldInt(raw json.RawMessage, name string) (int64, error) {
 	if _, ok := v.(float64); !ok {
 		return 0, fmt.Errorf("field %q must be an integer", name)
 	}
-	// Reject floats: WIRE.md §2.7 "No floats anywhere in the
-	// control channel". Re-render the raw bytes and check they parse cleanly
-	// as a base-10 integer literal, rather than trusting float64 (which loses
-	// precision above 2^53 and silently accepts "1.0").
+	// Any JSON number with an integral value is an integer ("1", "1.0",
+	// "1e3"), as JSON Schema's "integer" type; a fraction is not. Parsed
+	// exactly from the raw bytes, never through float64, which loses
+	// precision above 2^53.
 	s := strings.TrimSpace(string(raw))
-	if strings.ContainsAny(s, ".eE") {
-		return 0, fmt.Errorf("field %q must be an integer, not a float", name)
+	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return n, nil
 	}
-	n, err := strconv.ParseInt(s, 10, 64)
-	if err != nil {
+	r, ok := new(big.Rat).SetString(s)
+	if !ok || !r.IsInt() || !r.Num().IsInt64() {
 		return 0, fmt.Errorf("field %q must be an integer", name)
 	}
-	return n, nil
+	return r.Num().Int64(), nil
 }
 
 func fieldObject(raw json.RawMessage, name string) (map[string]json.RawMessage, error) {

@@ -125,13 +125,22 @@ func (c *Conn) handleRemoteOpen(id uint32) bool {
 	// already promised -- connection-fatal, not a stream-scoped
 	// REFUSED_STREAM, because only the server opens streams and this is
 	// therefore always a peer protocol violation, never self-inflicted.
-	if c.draining && id > c.peerLastStreamID {
+	if c.peerDrained && id > c.peerLastStreamID {
 		lastStreamID := c.peerLastStreamID
 		c.mu.Unlock()
 		c.failProtocol(newConnErrorf(ProtocolErrorCode, "OPEN for id %d exceeds drain last_stream_id %d", id, lastStreamID))
 		return true
 	}
 	c.highestOpened = id
+	// This side's own drain{client_requested}: the server may not have seen
+	// it yet, so an OPEN crossing it is no violation. Refuse that stream
+	// only; nothing on it was processed.
+	if c.selfDrained {
+		c.mu.Unlock()
+		c.sendControlFrame(EncodeReset(id, RefusedStreamCode, "connection is draining, refusing new streams"))
+		c.stats.refusedOpens.Add(1)
+		return false
+	}
 	overLimit := int64(len(c.streams)) >= c.maxStreams
 	declared := c.declaredMaxStreams
 	if declared <= 0 {
@@ -425,6 +434,7 @@ func (c *Conn) handleDrainMsg(m *DrainMsg) (fatal bool) {
 		c.peerRequestedDrain = true
 	} else {
 		c.draining = true
+		c.peerDrained = true
 		c.peerLastStreamID = m.LastStreamID
 	}
 	c.mu.Unlock()

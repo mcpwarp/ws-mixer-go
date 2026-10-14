@@ -189,7 +189,9 @@ func TestClientDrainRaceWinnerReportsSupersededDisconnect(t *testing.T) {
 	if _, err := c1.OpenStream(context.Background()); err != nil {
 		t.Fatalf("OpenStream: %v", err)
 	}
-	go func() { _ = c1.Drain(context.Background(), "rollout", DrainOptions{Deadline: 10 * time.Second}) }()
+	// The drained c1 keeps serving after the replacement's welcome; the
+	// server's own 300ms deadline ends it, and that end is the superseded report.
+	go func() { _ = c1.Drain(context.Background(), "rollout", DrainOptions{Deadline: 300 * time.Millisecond}) }()
 
 	<-connCh // the parallel reconnect (the replacement)
 	deadline := time.Now().Add(3 * time.Second)
@@ -204,7 +206,7 @@ func TestClientDrainRaceWinnerReportsSupersededDisconnect(t *testing.T) {
 	for time.Now().Before(deadline) {
 		found := false
 		for _, r := range rec.snapshotAll() {
-			if r.Message == supersededMessage {
+			if r.Superseded {
 				found = true
 				if r.Fatal {
 					t.Errorf("superseded-conn reason.Fatal = true, want false: %+v", r)

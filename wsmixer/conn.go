@@ -204,6 +204,8 @@ type Conn struct {
 	announcedLastID    uint32
 	hasAnnouncedLast   bool
 	peerLastStreamID   uint32              // client-only: last_stream_id from the server's drain message
+	peerDrained        bool                // client-only: the server's drain arrived (peerLastStreamID is set)
+	selfDrained        bool                // this side ran its own Drain()
 	outstandingPings   map[int64]time.Time // ids in [lowestUnacked, nextPingID) still awaiting a pong
 	lowestUnacked      int64               // watermark: every id below this has been acked at least once
 	nextPingID         int64

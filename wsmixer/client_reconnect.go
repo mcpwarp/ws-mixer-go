@@ -178,6 +178,12 @@ type DisconnectReason struct {
 	// Cause is set only when a token provider threw/rejected: its error,
 	// verbatim.
 	Cause error
+	// Superseded marks the end of a drained connection whose replacement has
+	// already received welcome: it kept serving its in-flight streams until
+	// they finished, the server closed it, or Client retired it at the
+	// drain's deadline_ms + 1 s. Such a disconnect is no loss: the
+	// replacement is live, nothing redials.
+	Superseded bool
 }
 
 // Error lets a DisconnectReason be used directly as an error (e.g. returned
@@ -534,8 +540,18 @@ type ClientConfig struct {
 	Meta         any
 	Capabilities []string
 	HTTPHeader   http.Header
+	// HTTPClient performs every dial's upgrade request (ClientOptions.HTTPClient).
+	HTTPClient *http.Client
 
 	Reconnect ReconnectOptions
+
+	// OnReconnect fires once for every reconnect Client schedules, before
+	// the redial can start: a backoff redial after a failed dial or a lost
+	// connection (zero delays included), a drain's replacement dial, and the
+	// one immediate token-refresh redial. It is queued on the same callback
+	// goroutine as OnConnect/OnDisconnect, after the disconnect it answers
+	// and before the OnConnect of the dial it announces.
+	OnReconnect func(ReconnectInfo)
 
 	// OnConnect fires once per successful welcome -- the first connection
 	// and every reconnect after it -- with the live *Conn and the server's
@@ -564,6 +580,32 @@ type ClientConfig struct {
 	OnStream func(*Stream)
 	OnApp    func(json.RawMessage)
 	OnDrain  func(*DrainMsg)
+}
+
+// ReconnectInfo describes one scheduled reconnect (ClientConfig.OnReconnect).
+type ReconnectInfo struct {
+	// Attempt is the backoff attempt counter the redial counts as; 0 for a
+	// drain's replacement dial (not a failure), 1 for the token-refresh redial.
+	Attempt int
+	// Delay is the wait before the redial: the backoff, the drain jitter or
+	// its retry_after_ms hint, or 0.
+	Delay time.Duration
+	// Cause is ReconnectDrain, ReconnectTokenRefresh, or the message of the
+	// disconnect being answered.
+	Cause string
+}
+
+// ReconnectInfo.Cause values for the two redials that answer no failure.
+const (
+	ReconnectDrain        = "drain"
+	ReconnectTokenRefresh = "token-refresh"
+)
+
+func (cl *Client) announceReconnect(info ReconnectInfo) {
+	if cl.opts.OnReconnect == nil {
+		return
+	}
+	cl.enqueueCb(func() { cl.opts.OnReconnect(info) })
 }
 
 type clientState int
@@ -602,8 +644,13 @@ type Client struct {
 	everConnected           bool
 	closing                 bool
 	drainReconnectScheduled bool
-	drainedNoReconnect      bool
-	keepaliveRetryUsed      bool
+	// retireWait is how long retiringConn may keep serving after its
+	// replacement's welcome (its drain's deadline_ms + 1 s, or 30 s); retired
+	// holds the drained conns retire is ending.
+	retireWait         time.Duration
+	retired            map[*Conn]bool
+	drainedNoReconnect bool
+	keepaliveRetryUsed bool
 	// refreshRetryUsed is dialAndHandshake's one-time 401/4011
 	// refresh-retry budget: a once-only flag like keepaliveRetryUsed,
 	// re-armed only at stability (armStability), not per dial attempt and
@@ -1088,6 +1135,32 @@ func (cl *Client) CloseWith(ctx context.Context, message string) error {
 	return err
 }
 
+// CloseImmediately ends the client for good like Close, but without the
+// graceful part: no drain{client_requested}, no grace for in-flight streams
+// -- every connection it still owns is closed at once with error{NO_ERROR}
+// and WS close 1000 (streams still open end with the connection). For an
+// application that has decided the connection is no longer its own, e.g. a
+// take-over. Idempotent and safe to race Close/CloseWith like those; ctx is
+// accepted for symmetry and not consulted. Called from OnDrain, it marks the
+// client closed before the drain's replacement dial can start.
+func (cl *Client) CloseImmediately(ctx context.Context) error {
+	conn, retiring, ok := cl.closeStart()
+	if !ok {
+		cl.closeAlreadyClosing()
+		return nil
+	}
+	if retiring != nil && retiring != conn {
+		go func() { _ = retiring.Close(uint32(NoError), "client closing") }()
+	}
+	var err error
+	if conn != nil {
+		err = conn.Close(uint32(NoError), "client closing")
+	}
+	cl.wg.Wait()
+	cl.closeCbCh()
+	return err
+}
+
 // tryTrack registers one more goroutine with cl.wg, guarded by the same
 // cl.mu used elsewhere to synchronize with cl.closing. Every Wait call is
 // preceded (happens-before) by a cl.mu critical section in which cl.closing
@@ -1324,6 +1397,7 @@ func (cl *Client) dialAndHandshake() (*Conn, *WelcomeMsg, error) {
 		return nil, nil, markFatal(err)
 	}
 
+	cl.announceReconnect(ReconnectInfo{Attempt: 1, Delay: 0, Cause: ReconnectTokenRefresh})
 	tok2, err2 := cl.token(ctx)
 	if err2 != nil {
 		return nil, nil, &providerError{cause: err2}
@@ -1369,6 +1443,7 @@ func (cl *Client) dialOnce(ctx context.Context, token string) (*Conn, *WelcomeMs
 		Meta:         cl.opts.Meta,
 		Capabilities: cl.opts.Capabilities,
 		HTTPHeader:   cl.opts.HTTPHeader,
+		HTTPClient:   cl.opts.HTTPClient,
 		OnStream:     cl.opts.OnStream,
 		OnApp:        cl.opts.OnApp,
 		OnDrain: func(d *DrainMsg) {
@@ -1450,37 +1525,21 @@ func (cl *Client) onAttemptSucceeded(conn *Conn, welcome *WelcomeMsg) {
 	cl.mu.Unlock()
 
 	if wonDrainRace {
-		// The old connection doesn't need to wait for the server's own
-		// drain deadline any more. Its in-flight streams weren't wrong, the
-		// *connection* they were riding on was replaced -- NO_ERROR, not a
-		// stream-scoped cancel (the streams' own CANCEL, if any, is the
-		// server's job at its drain deadline).
-		go func() { _ = retiring.Close(uint32(NoError), supersededMessage) }()
-		// Nit 3: CLIENT-SDK.md's disconnect reason shape is unconditional --
-		// every disconnect is reported, exactly once. When the drain race's
-		// *loser* ends first (old closes naturally before the replacement
-		// lands), watchConn's own drainSched branch already reports it. When
-		// the race is won here instead (the replacement lands first), old's
-		// watchConn call will find cl.conn already pointing at the new conn
-		// by the time old.Close() above lands (wasActive false) and stays
-		// silent by design (see watchConn's !wasActive branch) -- so without
-		// this, the winning case silently got no report at all, unlike the
-		// losing case. Report it here instead, once, mirroring the
-		// semantics of the JS SDK's own retiring-conn teardown (client.ts
-		// wireConn's `old.fail(WsMixerError(NO_ERROR, "superseded by a new
-		// connection"), ...)`), even though JS's own close handler happens
-		// to swallow this particular report too (its `!wasActive` return
-		// fires first there as well) -- CLIENT-SDK.md's unconditional
-		// promise wins over matching that particular gap.
-		cl.report(DisconnectReason{
-			Phase:        PhaseConnected,
-			WSCode:       NoError.CloseCode(),
-			ErrorCode:    NoError,
-			HasErrorCode: true,
-			ErrorName:    NoError.String(),
-			Fatal:        false,
-			Message:      supersededMessage,
-		})
+		// The drained connection keeps serving its in-flight streams after
+		// the replacement's welcome; retire (below) ends it at the drain's
+		// deadline_ms + 1000 ms, or as soon as no stream is left on it.
+		cl.mu.Lock()
+		wait := cl.retireWait
+		if cl.retired == nil {
+			cl.retired = map[*Conn]bool{}
+		}
+		cl.retired[retiring] = true
+		cl.mu.Unlock()
+		cl.wg.Add(1)
+		go func() {
+			defer cl.wg.Done()
+			cl.retire(retiring, wait)
+		}()
 	}
 
 	if cl.opts.OnConnect != nil {
@@ -1500,6 +1559,48 @@ func (cl *Client) onAttemptSucceeded(conn *Conn, welcome *WelcomeMsg) {
 	}()
 
 	cl.finishFirstResult(nil)
+}
+
+// Retiring a drained connection once its replacement has received welcome:
+// at the drain's deadline_ms plus retireMargin, or retireDefault when the
+// drain carried no deadline_ms.
+const (
+	retireMargin  = 1000 * time.Millisecond
+	retireDefault = 30 * time.Second
+)
+
+// retire ends old, a drained connection whose replacement has received
+// welcome: after wait, or as soon as no stream is left on it, whichever
+// comes first, its surviving streams are RESET with CANCEL and it closes
+// with error{NO_ERROR} + close 1000. If the server ends it first, or the
+// client closes, that end is the one reported. Either way the disconnect is
+// reported once, non-fatal and Superseded: the replacement is live and
+// nothing redials. old's own watchConn stays silent (cl.conn moved on).
+func (cl *Client) retire(old *Conn, wait time.Duration) {
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	msg := supersededMessage
+	select {
+	case <-old.waitForDrainedOrEmpty():
+	case <-timer.C:
+	case <-old.Done():
+	case <-cl.closeCh:
+		msg = "client closing"
+	}
+	select {
+	case <-old.Done():
+	default:
+		old.resetSurvivors(msg)
+		_ = old.Close(uint32(NoError), msg)
+	}
+	// old's counters are folded into cl.cumulative by its own watchConn.
+	cl.mu.Lock()
+	delete(cl.retired, old)
+	cl.mu.Unlock()
+	reason := cl.buildConnectedDisconnectReason(old)
+	reason.Fatal = false
+	reason.Superseded = true
+	cl.report(reason)
 }
 
 // armStability re-arms the backoff attempt counter and every once-only
@@ -1658,6 +1759,7 @@ func (cl *Client) reportAndSchedule(reason DisconnectReason, computeDelay func(n
 	reason.Fatal = false
 	cl.report(reason)
 	delay := computeDelay(next)
+	cl.announceReconnect(ReconnectInfo{Attempt: next, Delay: delay, Cause: reason.Message})
 	cl.wg.Add(1)
 	go func() {
 		defer cl.wg.Done()
@@ -1739,7 +1841,7 @@ func (cl *Client) handleServerDrain(conn *Conn, d *DrainMsg) {
 		// happened. conn is not necessarily already tracked as the conn
 		// being retired either, so make sure it still gets closed here
 		// instead of leaking it.
-		alreadyRetiring := cl.retiringConn == conn
+		alreadyRetiring := cl.retiringConn == conn || cl.retired[conn]
 		cl.mu.Unlock()
 		if !alreadyRetiring {
 			go func() { _ = conn.Close(uint32(NoError), "superseded before its drain reconnect could start") }()
@@ -1776,6 +1878,10 @@ func (cl *Client) handleServerDrain(conn *Conn, d *DrainMsg) {
 	}
 	cl.drainReconnectScheduled = true
 	cl.retiringConn = conn
+	cl.retireWait = retireDefault
+	if d.DeadlineMS != nil {
+		cl.retireWait = time.Duration(*d.DeadlineMS)*time.Millisecond + retireMargin
+	}
 	cl.mu.Unlock()
 
 	// WIRE.md section 2.9's drain field table: "retry_after_ms: reconnect
@@ -1801,6 +1907,7 @@ func (cl *Client) handleServerDrain(conn *Conn, d *DrainMsg) {
 	if !cl.tryTrack() {
 		return
 	}
+	cl.announceReconnect(ReconnectInfo{Attempt: 0, Delay: delay, Cause: ReconnectDrain})
 	go func() {
 		defer cl.wg.Done()
 		cl.attemptLoop(delay, "drain")
