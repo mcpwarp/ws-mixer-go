@@ -245,14 +245,17 @@ func TestSessionOverloadedResend(t *testing.T) {
 	h.clock.advance(10 * time.Second)
 	h.wantSent(c)
 
+	// The second consecutive OVERLOADED backs off 2 s (v0.7.1 ruling 1).
 	h.app(c, overloaded)
-	h.clock.advance(time.Second)
+	h.clock.advance(1999 * time.Millisecond)
+	h.wantSent(c)
+	h.clock.advance(time.Millisecond)
 	h.wantSent(c, registerAnki)
 
 	r := h.retries("overloaded")
-	if len(r) != 2 || r[0].Attempt != 1 || r[1].Attempt != 2 || r[0].Delay != time.Second ||
+	if len(r) != 2 || r[0].Attempt != 1 || r[1].Attempt != 2 || r[0].Delay != time.Second || r[1].Delay != 2*time.Second ||
 		r[0].Reason != "register failed: OVERLOADED: too many app messages in flight" {
-		t.Fatalf("overloaded retries = %+v, want attempts 1, 2 with delay 1s", r)
+		t.Fatalf("overloaded retries = %+v, want attempts 1, 2 with delays 1s, 2s", r)
 	}
 	if n := len(h.log.of(evError)); n != 0 {
 		t.Fatalf("OVERLOADED raised %d error events, want none", n)
@@ -322,6 +325,103 @@ func TestSessionOverloadedResendCancelledBySuccess(t *testing.T) {
 	h.wantSent(c)
 }
 
+// v0.7.1 rulings 2, 4 and 6a for one service: an empty registered is an
+// all-transient reply, re-sent after the backoff with no state change; a
+// whole-frame error op answers the outstanding register (nothing re-sent);
+// an enable during an OVERLOADED pause folds into the one re-send.
+func TestSessionEmptyReplyAndWholeFrameError(t *testing.T) {
+	h := newSessionHarness(t)
+	c := &fakeConn{}
+	h.s.onWelcome(c)
+	h.wantSent(c, registerAnki)
+	h.app(c, `{"mcpwarp":{"v":1,"op":"registered","services":[],"errors":[]}}`)
+	if st := h.s.currentState(); st != stateRegistering {
+		t.Fatalf("state %s after an empty reply, want registering", st)
+	}
+	if r := h.retries("register"); len(r) != 1 || r[0].Delay != time.Second || r[0].Reason != "register failed: INTERNAL: unlisted in reply" {
+		t.Fatalf("register retries %+v", r)
+	}
+	h.clock.advance(time.Second)
+	h.wantSent(c, registerAnki)
+
+	h.app(c, `{"mcpwarp":{"v":1,"op":"error","code":"UNKNOWN_OP","message":"x"}}`)
+	h.app(c, `{"mcpwarp":{"v":1,"op":"error","code":"OVERLOADED"}}`) // nothing outstanding any more
+	h.clock.advance(time.Minute)
+	h.wantSent(c)
+	if n := len(h.log.of(evError)); n != 1 {
+		t.Fatalf("%d error events, want 1 (the UNKNOWN_OP)", n)
+	}
+
+	h2 := newSessionHarness(t)
+	c2 := &fakeConn{}
+	h2.s.onWelcome(c2)
+	h2.wantSent(c2, registerAnki)
+	h2.app(c2, `{"mcpwarp":{"v":1,"op":"error","code":"OVERLOADED"}}`)
+	h2.app(c2, `{"mcpwarp":{"v":1,"op":"enable","id":"srv_anki","name":"anki"}}`)
+	h2.wantSent(c2) // folded
+	h2.clock.advance(time.Second)
+	h2.wantSent(c2, registerAnki)
+	h2.app(c2, registeredAnki)
+	h2.clock.advance(time.Minute)
+	h2.wantSent(c2)
+}
+
+// v0.7.1 ruling 7: close()'s unregister wait ends on the reply to the
+// unregister's own frame -- unregistered or a whole-frame error op -- not
+// after the 2000 ms budget; a reply to a register still in flight when the
+// close began continues the wait, and a register dropped by OVERLOADED then
+// is abandoned, never re-sent.
+func TestSessionCloseWaitEndsOnItsOwnReply(t *testing.T) {
+	isDone := func(ch chan struct{}) bool {
+		select {
+		case <-ch:
+			return true
+		default:
+			return false
+		}
+	}
+	for _, reply := range []string{
+		`{"mcpwarp":{"v":1,"op":"error","code":"BAD_REQUEST","message":"x"}}`,
+		`{"mcpwarp":{"v":1,"op":"unregistered","services":[]}}`,
+	} {
+		h := newSessionHarness(t)
+		c := &fakeConn{}
+		h.s.onWelcome(c)
+		h.app(c, registeredAnki)
+		c.take()
+		done := make(chan struct{})
+		h.s.beginCloseAsync(context.Background(), unregisterBudget, func() { close(done) })
+		h.wantSent(c, unregisterAnki)
+		h.app(c, reply)
+		if !isDone(done) {
+			t.Fatalf("%s did not end the close's wait", reply)
+		}
+	}
+	for _, first := range []string{
+		registeredAnki,
+		`{"mcpwarp":{"v":1,"op":"error","code":"BAD_REQUEST","message":"x"}}`,
+		`{"mcpwarp":{"v":1,"op":"error","code":"OVERLOADED","message":"x"}}`,
+	} {
+		h := newSessionHarness(t)
+		c := &fakeConn{}
+		h.s.onWelcome(c)
+		h.wantSent(c, registerAnki) // in flight when the close begins
+		done := make(chan struct{})
+		h.s.beginCloseAsync(context.Background(), unregisterBudget, func() { close(done) })
+		h.wantSent(c, unregisterAnki)
+		h.app(c, first)
+		h.clock.advance(time.Second)
+		h.wantSent(c)
+		if isDone(done) {
+			t.Fatalf("%s, the earlier register's reply, ended the close's wait", first)
+		}
+		h.app(c, `{"mcpwarp":{"v":1,"op":"unregistered","services":[]}}`)
+		if !isDone(done) {
+			t.Fatalf("after %s the unregister's own reply did not end the wait", first)
+		}
+	}
+}
+
 // disable stops a pending transient retry and a pending OVERLOADED re-send.
 func TestSessionTimersCancelledByDisable(t *testing.T) {
 	for _, disable := range []string{
@@ -376,12 +476,22 @@ func TestSessionDisableWithUnknownIDIsHeld(t *testing.T) {
 	if st := h.s.currentState(); st != stateDisabled || len(h.log.of(evDisabled)) != 1 {
 		t.Fatalf("after registered with the held id: state %s, %d disabled events", st, len(h.log.of(evDisabled)))
 	}
-	if n := len(h.log.of(evRegistered)); n != 0 {
-		t.Fatalf("%d registered events before the held disable, want 0 (disabled directly)", n)
+	// §5.9 Held disable (spec ruling 2026-10-19, §5.9 over §5.4): registered,
+	// then disabled, back to back; the registration is kept.
+	var kinds []eventKind
+	for _, ev := range h.log.all() {
+		if ev.kind == evRegistered || ev.kind == evDisabled {
+			kinds = append(kinds, ev.kind)
+		}
 	}
-	// §5.4: expose() resolves disabled with no registration.
-	if u, id, known, reg := h.s.snapshot(); reg != nil || !known || id != "srv_anki" || u == "" {
-		t.Fatalf("after the held disable: url %q, id %q (known %v), registration %+v; want url and id, no registration", u, id, known, reg)
+	if len(kinds) != 2 || kinds[0] != evRegistered || kinds[1] != evDisabled {
+		t.Fatalf("events %v, want registered then disabled", kinds)
+	}
+	if reg := h.log.of(evRegistered)[0]; !reg.heldDisable {
+		t.Fatal("the registered event does not say a held disable follows (the tunnel collapses the pair)")
+	}
+	if u, id, known, reg := h.s.snapshot(); reg == nil || reg.ServerID != "srv_anki" || !known || id != "srv_anki" || u == "" {
+		t.Fatalf("after the held disable: url %q, id %q (known %v), registration %+v; want all three", u, id, known, reg)
 	}
 
 	h2 := newSessionHarness(t)

@@ -143,6 +143,17 @@ type fixtureService struct {
 	Kind ServiceKind `json:"kind"`
 }
 
+func allServices(t *testing.T, msg json.RawMessage) []fixtureService {
+	t.Helper()
+	var m struct {
+		Services []fixtureService `json:"services"`
+	}
+	if err := json.Unmarshal(msg, &m); err != nil || len(m.Services) == 0 {
+		t.Fatalf("no services in %s", msg)
+	}
+	return m.Services
+}
+
 func firstService(t *testing.T, msg json.RawMessage) fixtureService {
 	t.Helper()
 	var m struct {
@@ -182,19 +193,38 @@ func TestEnvelopeFixturesValid(t *testing.T) {
 				t.Fatalf("valid fixture with schema_valid=%v wire_valid=%v", f.SchemaValid, f.WireValid)
 			}
 			if isAgentToEdge(f.Op) {
-				svc := firstService(t, f.Message)
+				svcs := allServices(t, f.Message)
 				var enc json.RawMessage
 				if f.Op == "register" {
-					enc = EncodeRegister(svc.Name, svc.Kind)
+					entries := make([]RegisterEntry, len(svcs))
+					for i, s := range svcs {
+						entries[i] = RegisterEntry{Name: s.Name, Kind: s.Kind}
+					}
+					enc = EncodeRegisterList(entries)
+					if len(svcs) == 1 && string(EncodeRegister(svcs[0].Name, svcs[0].Kind)) != string(enc) {
+						t.Fatal("EncodeRegister and EncodeRegisterList disagree on one entry")
+					}
 				} else {
-					enc = EncodeUnregister(svc.Name)
+					names := make([]string, len(svcs))
+					for i, s := range svcs {
+						names[i] = s.Name
+					}
+					enc = EncodeUnregisterList(names)
+					if len(svcs) == 1 && string(EncodeUnregister(svcs[0].Name)) != string(enc) {
+						t.Fatal("EncodeUnregister and EncodeUnregisterList disagree on one entry")
+					}
 				}
 				want := `{"mcpwarp":` + compactJSON(t, f.Message) + `}`
 				if string(enc) != want {
 					t.Fatalf("encoder output\n got %s\nwant %s", enc, want)
 				}
-				if !IsValidServiceName(svc.Name) {
-					t.Fatalf("IsValidServiceName(%q) = false", svc.Name)
+				if len(svcs) > MaxServicesPerMessage {
+					t.Fatalf("%d entries in a valid fixture, over MaxServicesPerMessage", len(svcs))
+				}
+				for _, svc := range svcs {
+					if !IsValidServiceName(svc.Name) {
+						t.Fatalf("IsValidServiceName(%q) = false", svc.Name)
+					}
 				}
 				// The agent's own decoder does not know its outbound ops.
 				requireUnknown(t, f.Message)
@@ -228,6 +258,15 @@ func TestEnvelopeFixturesInvalid(t *testing.T) {
 					}
 				case code == "UNSUPPORTED_VERSION" || code == "UNKNOWN_OP":
 					requireUnknown(t, f.Message)
+				case code == string(AppTooManyServices):
+					// The edge's whole-frame answer; the agent's side is never
+					// sending it: the group splits into frames of at most 100.
+					if n := len(allServices(t, f.Message)); n <= MaxServicesPerMessage {
+						t.Fatalf("%d entries, want more than MaxServicesPerMessage", n)
+					}
+					if frames := splitFrames(make([]string, len(allServices(t, f.Message)))); len(frames) < 2 {
+						t.Fatalf("splitFrames kept %d entries in one frame", len(frames[0]))
+					}
 				case strings.HasPrefix(code, "SCHEMA_"):
 					t.Skipf("agent→edge %s: the edge's verdict, not the agent's (§10.2)", code)
 				default:

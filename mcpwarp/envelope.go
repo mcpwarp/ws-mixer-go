@@ -202,6 +202,38 @@ func EncodeUnregister(name string) json.RawMessage {
 	return encodeBody(unregisterEnvelope{V: envelopeVersion, Op: "unregister", Services: []unregisterService{{Name: name}}})
 }
 
+// MaxServicesPerMessage is the most entries one register/unregister may
+// carry (§2.1 Batch); the edge answers a larger register with the
+// whole-frame error{TOO_MANY_SERVICES}.
+const MaxServicesPerMessage = 100
+
+// RegisterEntry is one services[] entry of a register.
+type RegisterEntry struct {
+	Name string
+	Kind ServiceKind
+}
+
+// EncodeRegisterList returns the `app` body announcing entries in order, in
+// §2.2's canonical key order. It does not validate the entries, their count
+// (1..MaxServicesPerMessage) or their uniqueness.
+func EncodeRegisterList(entries []RegisterEntry) json.RawMessage {
+	svcs := make([]registerService, len(entries))
+	for i, e := range entries {
+		svcs[i] = registerService{Name: e.Name, Kind: e.Kind}
+	}
+	return encodeBody(registerEnvelope{V: envelopeVersion, Op: "register", Services: svcs})
+}
+
+// EncodeUnregisterList returns the `app` body withdrawing names in order. It
+// does not validate the names or their count.
+func EncodeUnregisterList(names []string) json.RawMessage {
+	svcs := make([]unregisterService, len(names))
+	for i, n := range names {
+		svcs[i] = unregisterService{Name: n}
+	}
+	return encodeBody(unregisterEnvelope{V: envelopeVersion, Op: "unregister", Services: svcs})
+}
+
 func encodeBody(env any) json.RawMessage {
 	return json.RawMessage(marshalNoEscape(struct {
 		Mcpwarp any `json:"mcpwarp"`

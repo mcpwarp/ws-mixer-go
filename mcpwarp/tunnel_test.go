@@ -248,6 +248,30 @@ func TestTunnelSubscribe(t *testing.T) {
 
 // §6.9: every error line is "<CODE>: <message>", and the token is never
 // logged, not even through a refused register's server message.
+// T50: a registered that brings a held disable's id is one disabled
+// snapshot, and the log says disabled only, never "online at".
+func TestTunnelHeldDisableLogsNoOnline(t *testing.T) {
+	logs := &logCapture{}
+	r, tun := newFakeTunnel(t, func(o *TunnelOptions) { o.Logger = slog.New(logs) })
+	tun.configureAsync(notesConfig)
+	r.quiesce()
+	r.ev("connected", nil)
+	r.ev("welcome", nil)
+	r.ev("disabled", map[string]any{"id": "srv_notes"})
+	r.registered()
+	requireSnaps(t, r, snapOff, snapConnecting, problemStatus(StateDisabled, CodeDisabled, lastDisabled))
+	var disabled bool
+	for _, l := range logs.all() {
+		if strings.HasPrefix(l.msg, "online at") {
+			t.Fatalf("logged %q for a held disable that never went online", l.msg)
+		}
+		disabled = disabled || strings.Contains(l.msg, "disabled")
+	}
+	if !disabled {
+		t.Fatal("no disabled log line")
+	}
+}
+
 func TestTunnelLoggingPrefixAndTokenRedaction(t *testing.T) {
 	const token = "secret-token-4711"
 	logs := &logCapture{}

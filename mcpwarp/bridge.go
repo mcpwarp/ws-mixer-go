@@ -48,17 +48,55 @@ type bridge struct {
 	handler       http.Handler
 	target        *url.URL
 	targetTimeout time.Duration
-	targetClient  *http.Client
 	onError       func(error)
 	headDeadline  time.Duration
+
+	// route, when set, selects the application per stream after the path
+	// check (§4.8) and replaces availability and handler/target.
+	route func(st bridgeStream, head *requestHead) routeResult
+
+	single *app
+}
+
+// app is where one service's requests go: a handler, or a target URL with
+// its client and timeout.
+type app struct {
+	name          string // a group's service name; "" for a single service
+	handler       http.Handler
+	target        *url.URL
+	targetTimeout time.Duration
+	targetClient  *http.Client
+}
+
+// routeResult is a multi-service selection (§4.8 Precedence with
+// selection): reset (row 3c), unavailable (a 503 message, rows 3a, 3b,
+// 3d, 3e), or the app to call.
+type routeResult struct {
+	app         *app
+	reset       bool
+	unavailable string
+}
+
+func newApp(handler http.Handler, target *url.URL, targetTimeout time.Duration, transport http.RoundTripper) *app {
+	a := &app{handler: handler, target: target, targetTimeout: targetTimeout}
+	if a.targetTimeout <= 0 {
+		a.targetTimeout = defaultTargetTimeout
+	}
+	if target != nil {
+		if transport == nil {
+			transport = http.DefaultTransport
+		}
+		a.targetClient = &http.Client{
+			Transport:     transport,
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		}
+	}
+	return a
 }
 
 func newBridge(b bridge, transport http.RoundTripper) *bridge {
 	if b.maxBodyBytes <= 0 {
 		b.maxBodyBytes = defaultMaxBodyBytes
-	}
-	if b.targetTimeout <= 0 {
-		b.targetTimeout = defaultTargetTimeout
 	}
 	if b.headDeadline <= 0 {
 		b.headDeadline = headDeadline
@@ -66,14 +104,8 @@ func newBridge(b bridge, transport http.RoundTripper) *bridge {
 	if b.onError == nil {
 		b.onError = func(error) {}
 	}
-	if b.target != nil {
-		if transport == nil {
-			transport = http.DefaultTransport
-		}
-		b.targetClient = &http.Client{
-			Transport:     transport,
-			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-		}
+	if b.route == nil {
+		b.single = newApp(b.handler, b.target, b.targetTimeout, transport)
 	}
 	return &b
 }
@@ -82,9 +114,11 @@ func newBridge(b bridge, transport http.RoundTripper) *bridge {
 // CLOSE or RESET (or leaves it to a connection that is already gone).
 // connDone is the connection's Done channel, for edge cancellation.
 func (b *bridge) serve(st bridgeStream, connDone <-chan struct{}) {
-	if conflict, _ := b.availability(); conflict {
-		_ = st.Reset(wsmixer.CancelCode, takenOverMessage)
-		return
+	if b.route == nil {
+		if conflict, _ := b.availability(); conflict {
+			_ = st.Reset(wsmixer.CancelCode, takenOverMessage)
+			return
+		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -121,11 +155,17 @@ func (b *bridge) serve(st bridgeStream, connDone <-chan struct{}) {
 		b.refuse(st, r, http.StatusNotFound, "not_found", head.method)
 		return
 	}
-	if conflict, unavailable := b.availability(); conflict {
+	sel := routeResult{app: b.single}
+	if b.route != nil {
+		sel = b.route(st, head)
+	} else {
+		sel.reset, sel.unavailable = b.availability()
+	}
+	if sel.reset {
 		_ = st.Reset(wsmixer.CancelCode, takenOverMessage)
 		return
-	} else if unavailable != "" {
-		b.refuse(st, r, http.StatusServiceUnavailable, unavailable, head.method)
+	} else if sel.unavailable != "" {
+		b.refuse(st, r, http.StatusServiceUnavailable, sel.unavailable, head.method)
 		return
 	}
 	body, err := readRequestBody(r, head, b.maxBodyBytes)
@@ -143,10 +183,10 @@ func (b *bridge) serve(st bridgeStream, connDone <-chan struct{}) {
 		return
 	}
 	go b.watchEdgeCancel(ctx, cancel, st, connDone)
-	if b.handler != nil {
-		b.serveHandler(ctx, st, head, target, body)
+	if sel.app.handler != nil {
+		b.serveHandler(ctx, st, sel.app, head, target, body)
 	} else {
-		b.serveTarget(ctx, st, head, target, body)
+		b.serveTarget(ctx, st, sel.app, head, target, body)
 	}
 }
 
@@ -257,7 +297,7 @@ func (b *bridge) watchEdgeCancel(ctx context.Context, cancel context.CancelFunc,
 }
 
 // serveHandler is §4.6 Request → handler plus §4.5's handler rows.
-func (b *bridge) serveHandler(ctx context.Context, st bridgeStream, head *requestHead, target string, body []byte) {
+func (b *bridge) serveHandler(ctx context.Context, st bridgeStream, a *app, head *requestHead, target string, body []byte) {
 	req, err := handlerRequest(ctx, head, target, body)
 	if err != nil {
 		b.reply(st, http.StatusBadRequest, unrepresentable, head.method)
@@ -268,7 +308,7 @@ func (b *bridge) serveHandler(ctx context.Context, st bridgeStream, head *reques
 	var panicked any
 	func() {
 		defer func() { panicked = recover() }()
-		b.handler.ServeHTTP(w, req)
+		a.handler.ServeHTTP(w, req)
 	}()
 	if panicked != nil {
 		b.onError(fmt.Errorf("mcpwarp: handler panicked: %v", panicked))
@@ -326,8 +366,8 @@ func handlerRequest(ctx context.Context, head *requestHead, target string, body 
 }
 
 // serveTarget is §4.6 Request → target URL plus §4.5's target rows.
-func (b *bridge) serveTarget(ctx context.Context, st bridgeStream, head *requestHead, target string, body []byte) {
-	u := *b.target
+func (b *bridge) serveTarget(ctx context.Context, st bridgeStream, a *app, head *requestHead, target string, body []byte) {
+	u := *a.target
 	if q := targetQuery(target); q != "" {
 		if u.RawQuery == "" {
 			u.RawQuery = q
@@ -358,11 +398,11 @@ func (b *bridge) serveTarget(ctx context.Context, st bridgeStream, head *request
 	// targetTimeout bounds only the wait for response headers; the body may
 	// stream past it.
 	var timedOut atomic.Bool
-	timer := time.AfterFunc(b.targetTimeout, func() {
+	timer := time.AfterFunc(a.targetTimeout, func() {
 		timedOut.Store(true)
 		tcancel()
 	})
-	resp, err := b.targetClient.Do(req)
+	resp, err := a.targetClient.Do(req)
 	if !timer.Stop() || timedOut.Load() {
 		if resp != nil {
 			_ = resp.Body.Close()
@@ -376,6 +416,11 @@ func (b *bridge) serveTarget(ctx context.Context, st bridgeStream, head *request
 			msg += " (" + code + ")"
 		}
 		b.reply(st, http.StatusBadGateway, msg, head.method)
+		if a.name != "" {
+			// A group's service: logged with its name and target (§6A.4 has
+			// no lastError for an active service, so the log is the only place).
+			b.onError(fmt.Errorf("mcpwarp: service %q: %s at %s", a.name, msg, a.target.Redacted()))
+		}
 		return
 	}
 	defer resp.Body.Close()

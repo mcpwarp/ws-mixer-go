@@ -279,7 +279,10 @@ func TestClientMarkedRefreshRetryThenLaterFatal(t *testing.T) {
 		t.Fatal("Connect should fail: the second (post-refresh-retry-budget) 401 rejection is fatal")
 	}
 
-	// First report: the refresh-retry's own call came back marked -- non-fatal.
+	// The first 401 itself, reported non-fatal before the refresh-retry.
+	rec.waitFirstRejection(t, PhaseDial)
+
+	// Next report: the refresh-retry's own call came back marked -- non-fatal.
 	first := rec.waitNext(t)
 	if first.Fatal {
 		t.Errorf("first reason.Fatal = true, want false (a marked refresh-retry failure is not itself fatal)")

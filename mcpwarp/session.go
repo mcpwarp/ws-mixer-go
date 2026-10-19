@@ -3,6 +3,7 @@ package mcpwarp
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -43,7 +44,6 @@ const (
 const (
 	registerRetryBase  = 1000 * time.Millisecond
 	registerRetryCap   = 30 * time.Second
-	overloadPause      = 1000 * time.Millisecond
 	unregisterBudget   = 2000 * time.Millisecond
 	sendAppTimeout     = 5 * time.Second
 	registerRetryLabel = "register failed"
@@ -93,6 +93,9 @@ const (
 	evRetry
 	evDisconnect
 	evClose
+	evGroup           // group: the services changed, or a connection-level effect
+	evServiceConflict // group: one name taken over (§3.3 Per name)
+	evLog             // group: a §6A.10 log line
 )
 
 // errorOrigin says where a non-fatal error event came from; "" is a handler
@@ -128,6 +131,13 @@ type event struct {
 	retry        retryInfo                // evRetry
 	retryKind    string                   // evRetry: "register" or "overloaded"
 	disconnect   wsmixer.DisconnectReason // evDisconnect
+
+	heldDisable   bool                     // evRegistered: a held disable's evDisabled follows at once (§5.9)
+	groupServices map[string]ServiceStatus // evGroup, and a group's evConflict (G6)
+	groupEffect   groupEffect              // evGroup
+	serviceName   string                   // evServiceConflict
+	logLevel      slog.Level               // evLog
+	logMsg        string                   // evLog
 }
 
 type outstandingOp int
@@ -175,7 +185,9 @@ type session struct {
 	outstanding      outstandingOp
 
 	transientFailures int
-	overloadedResends int
+	overloadedResends int  // consecutive OVERLOADED, the re-send backoff's n (v0.7.1 ruling 1)
+	registerQueued    bool // a register asked for while one was in flight goes out after its reply (ruling 3)
+	closePreReply     bool // closing: the reply to the register in flight when the close began is still due
 	retryStop         func() bool
 	retryGen          int
 	overloadStop      func() bool
@@ -269,8 +281,10 @@ func (s *session) onWelcome(c appConn) {
 	s.conn = c
 	s.connected = true
 	s.sentRegisterConn = false
-	s.outstanding = opNone
-	s.heldDisables = nil // a held disable belongs to the connection it arrived on
+	s.outstanding, s.registerQueued = opNone, false
+	// A held disable belongs to the connection it arrived on; a drain
+	// replacement's welcome clears it too (v0.7.1 ruling 8).
+	s.heldDisables = nil
 	s.cancelTimersLocked()
 	if s.takenOver {
 		return
@@ -291,7 +305,7 @@ func (s *session) onConnEnd(c appConn) {
 	}
 	s.connected = false
 	s.sentRegisterConn = false
-	s.outstanding = opNone
+	s.outstanding, s.registerQueued = opNone, false
 	s.heldDisables = nil
 	s.cancelTimersLocked()
 	if !s.takenOver {
@@ -329,6 +343,7 @@ func (s *session) onApp(c appConn, body []byte) {
 	switch m := env.(type) {
 	case *RegisteredMsg:
 		s.onRegisteredLocked(m)
+		s.flushQueuedRegisterLocked()
 	case *UnregisteredMsg:
 		match := s.outstanding == opUnregister
 		for _, svc := range m.Services {
@@ -338,7 +353,7 @@ func (s *session) onApp(c appConn, body []byte) {
 		}
 		if match {
 			if s.outstanding == opUnregister {
-				s.outstanding = opNone
+				s.settleLocked()
 			}
 			s.releaseUnregLocked()
 		}
@@ -368,7 +383,7 @@ func (s *session) onApp(c appConn, body []byte) {
 		s.emitLocked(event{kind: evEnabled, serverID: m.ID})
 		s.setStateLocked(stateRegistering)
 		if s.connected {
-			s.sendRegisterLocked()
+			s.registerLocked()
 		}
 	case *ConflictMsg:
 		if s.endingLocked() || s.takenOver {
@@ -407,7 +422,30 @@ func (s *session) onReplaced() bool {
 }
 
 func (s *session) onRegisteredLocked(m *RegisteredMsg) {
+	if s.state == stateClosing {
+		// It answers the register in flight when the close began, if any;
+		// never the unregister: the close keeps waiting for its own reply.
+		s.closePreReply = false
+		return
+	}
 	if s.endingLocked() || s.takenOver {
+		return
+	}
+	ours := false
+	for _, svc := range m.Services {
+		ours = ours || svc.Name == s.deps.name
+	}
+	for _, e := range m.Errors {
+		ours = ours || e.Name == s.deps.name
+	}
+	if !ours {
+		// §2.3 Empty reply (v0.7.1 ruling 2): it answers the outstanding
+		// register as an all-transient reply, re-sent after the backoff; no
+		// handle state changes.
+		if s.outstanding == opRegister {
+			s.settleLocked()
+			s.scheduleRegisterRetryLocked(string(RegisterInternal), "unlisted in reply")
+		}
 		return
 	}
 	for _, svc := range m.Services {
@@ -423,24 +461,26 @@ func (s *session) onRegisteredLocked(m *RegisteredMsg) {
 		s.everRegister = true
 		held := s.heldDisables[svc.ID]
 		delete(s.heldDisables, svc.ID)
-		if held != nil {
-			// The held disable applies: disabled directly, never registered
-			// in between (tunnel/42_disable_unknown_id_held), so no
-			// registration either (§5.4).
-			s.disableLocked(held)
-			return
-		}
 		reg := Registration{URL: svc.URL, ServerID: svc.ID, Created: svc.Created}
 		s.registration = &reg
 		s.setStateLocked(stateRegistered)
-		s.emitLocked(event{kind: evRegistered, registration: reg})
+		s.emitLocked(event{kind: evRegistered, registration: reg, heldDisable: held != nil})
+		if held != nil {
+			// §5.9 Held disable: registered, then the held disable, back to
+			// back; the tunnel collapses the pair into one disabled snapshot
+			// (T50, tunnel/42_disable_unknown_id_held).
+			s.disableLocked(held)
+		}
 		return
 	}
 	for _, e := range m.Errors {
 		if e.Name != s.deps.name {
 			continue
 		}
-		s.outstanding = opNone
+		s.settleLocked()
+		if !IsTransientRegisterError(e.Code) {
+			s.transientFailures = 0 // a non-transient entry is a successful reply (§3.2)
+		}
 		switch {
 		case e.Code == RegisterServerDisabled:
 			if e.ID != "" {
@@ -451,32 +491,74 @@ func (s *session) onRegisteredLocked(m *RegisteredMsg) {
 			s.emitLocked(event{kind: evDisabled, serverID: s.serverID, reason: "disabled", refused: true})
 		case IsTransientRegisterError(e.Code):
 			s.emitLocked(event{kind: evError, err: &Error{Code: string(e.Code), Message: e.Message, ServiceName: s.deps.name}, origin: originRegisterTransient})
-			delay := registerRetryDelay(s.transientFailures)
-			s.transientFailures++
-			s.emitLocked(event{kind: evRetry, retryKind: "register", retry: retryInfo{
-				Attempt: s.transientFailures, Delay: delay,
-				Reason: fmt.Sprintf("%s: %s: %s", registerRetryLabel, e.Code, e.Message),
-			}})
-			s.clearRetryLocked()
-			s.retryGen++
-			gen, conn := s.retryGen, s.conn
-			s.retryStop = s.deps.after(delay, func() {
-				s.mu.Lock()
-				defer s.unlockAndFlush()
-				if gen != s.retryGen {
-					return
-				}
-				s.retryStop = nil
-				if !s.endingLocked() && !s.takenOver && s.state != stateDisabled && s.connected && s.conn == conn {
-					s.sendRegisterLocked()
-				}
-			})
+			s.scheduleRegisterRetryLocked(string(e.Code), e.Message)
 		case !s.everRegister:
 			s.fatalLocked(&Error{Code: string(e.Code), Message: e.Message, Fatal: true, ServiceName: s.deps.name})
 		default:
 			s.emitLocked(event{kind: evError, err: &Error{Code: string(e.Code), Message: e.Message, ServiceName: s.deps.name}, origin: originRegisterRefusal})
 		}
 		return
+	}
+}
+
+// scheduleRegisterRetryLocked re-sends the register after §3.2's
+// transient backoff, on this connection only.
+func (s *session) scheduleRegisterRetryLocked(code, msg string) {
+	delay := registerRetryDelay(s.transientFailures)
+	s.transientFailures++
+	s.emitLocked(event{kind: evRetry, retryKind: "register", retry: retryInfo{
+		Attempt: s.transientFailures, Delay: delay,
+		Reason: fmt.Sprintf("%s: %s: %s", registerRetryLabel, code, msg),
+	}})
+	s.clearRetryLocked()
+	s.retryGen++
+	gen, conn := s.retryGen, s.conn
+	s.retryStop = s.deps.after(delay, func() {
+		s.mu.Lock()
+		defer s.unlockAndFlush()
+		if gen != s.retryGen {
+			return
+		}
+		s.retryStop = nil
+		if !s.endingLocked() && !s.takenOver && s.state != stateDisabled && s.connected && s.conn == conn {
+			s.registerLocked()
+		}
+	})
+}
+
+// settleLocked ends the outstanding frame: its OVERLOADED re-send is
+// cancelled (v0.7.1 ruling 5) and the OVERLOADED streak reset (ruling 1).
+func (s *session) settleLocked() {
+	s.outstanding = opNone
+	s.overloadedResends = 0
+	if s.overloadStop != nil {
+		s.overloadStop()
+		s.overloadStop = nil
+	}
+	s.overloadGen++
+}
+
+// registerLocked sends a register, one in flight (§2.6): while the
+// outstanding register waits out an OVERLOADED pause it folds into that
+// re-send (ruling 6a); while one is in flight it goes out after its reply
+// (ruling 3).
+func (s *session) registerLocked() {
+	switch {
+	case s.outstanding == opRegister && s.overloadStop != nil:
+	case s.outstanding != opNone:
+		s.registerQueued = true
+	default:
+		s.sendRegisterLocked()
+	}
+}
+
+func (s *session) flushQueuedRegisterLocked() {
+	if !s.registerQueued || s.outstanding != opNone {
+		return
+	}
+	s.registerQueued = false
+	if s.connected && !s.endingLocked() && !s.takenOver && s.retryStop == nil {
+		s.sendRegisterLocked()
 	}
 }
 
@@ -494,16 +576,25 @@ func registerRetryDelay(n int) time.Duration {
 
 func (s *session) onAppErrorLocked(m *ErrorMsg) {
 	switch m.Code {
-	case AppUnsupportedVersion:
-		s.fatalLocked(&Error{Code: string(m.Code), Message: m.Message, Fatal: true, ServiceName: s.deps.name})
 	case AppOverloaded:
+		if s.closePreReply {
+			// It drops the register in flight when the close began: that
+			// register is abandoned, never re-sent; the close waits on.
+			s.closePreReply = false
+			return
+		}
 		op := s.outstanding
 		if op == opNone || s.overloadStop != nil {
 			return
 		}
+		// The frame was dropped; its slot stays reserved for the re-send
+		// after min(1000 × 2^(n−1), 30000) ms, n counting consecutive
+		// OVERLOADED only (v0.7.1 rulings 1, 6a).
+		s.overloadedResends++
+		delay := registerRetryDelay(s.overloadedResends - 1)
 		s.overloadGen++
 		gen, conn := s.overloadGen, s.conn
-		s.overloadStop = s.deps.after(overloadPause, func() {
+		s.overloadStop = s.deps.after(delay, func() {
 			s.mu.Lock()
 			defer s.unlockAndFlush()
 			if gen != s.overloadGen {
@@ -519,6 +610,7 @@ func (s *session) onAppErrorLocked(m *ErrorMsg) {
 			}
 			switch {
 			case op == opRegister && !s.endingLocked() && !s.takenOver && s.state != stateDisabled:
+				s.registerQueued = false // folded into this re-send
 				s.sendRegisterLocked()
 			case op == opUnregister && s.state == stateClosing:
 				name := s.deps.name
@@ -526,14 +618,32 @@ func (s *session) onAppErrorLocked(m *ErrorMsg) {
 			}
 		})
 		if op == opRegister && !s.endingLocked() {
-			s.overloadedResends++
 			s.emitLocked(event{kind: evRetry, retryKind: "overloaded", retry: retryInfo{
-				Attempt: s.overloadedResends, Delay: overloadPause,
+				Attempt: s.overloadedResends, Delay: delay,
 				Reason: fmt.Sprintf("%s: %s: %s", registerRetryLabel, m.Code, m.Message),
 			}})
 		}
-	default:
+	case AppConnectionLimit:
+		// Names no frame; the 4014 close follows.
 		s.emitLocked(event{kind: evError, err: &Error{Code: string(m.Code), Message: m.Message, ServiceName: s.deps.name}, origin: originApp})
+	default:
+		// v0.7.1 ruling 4: any other code answers the outstanding frame,
+		// a close's unregister included (ruling 7).
+		switch op := s.outstanding; {
+		case s.closePreReply:
+			s.closePreReply = false // it answers the register in flight when the close began
+		case op != opNone:
+			s.settleLocked()
+			if op == opUnregister {
+				s.releaseUnregLocked()
+			}
+		}
+		if m.Code == AppUnsupportedVersion {
+			s.fatalLocked(&Error{Code: string(m.Code), Message: m.Message, Fatal: true, ServiceName: s.deps.name})
+			return
+		}
+		s.emitLocked(event{kind: evError, err: &Error{Code: string(m.Code), Message: m.Message, ServiceName: s.deps.name}, origin: originApp})
+		s.flushQueuedRegisterLocked()
 	}
 }
 
@@ -621,6 +731,8 @@ func (s *session) beginCloseAsync(ctx context.Context, budget time.Duration, don
 	}
 	wasRegistered := s.connected && s.sentRegisterConn
 	conn := s.conn
+	// A register still in flight (not dropped by OVERLOADED) gets the next reply.
+	s.closePreReply = s.outstanding == opRegister && s.overloadStop == nil
 	s.setStateLocked(stateClosing)
 	s.cancelTimersLocked()
 	if !wasRegistered {
@@ -660,6 +772,8 @@ func (s *session) markClosed() {
 	s.releaseUnregLocked()
 	s.setStateLocked(stateClosed)
 }
+
+func (s *session) closingNow() bool { return s.currentState() == stateClosing }
 
 func (s *session) currentState() exposeState {
 	s.mu.Lock()

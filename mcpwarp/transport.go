@@ -33,8 +33,13 @@ type transportConfig struct {
 	reconnect   wsmixer.ReconnectOptions
 	httpClient  *http.Client
 	name        string // the service; fakes use it to answer for the agent
+	group       bool   // a ServiceGroup's connection; fakes answer differently
 	events      transportEvents
 }
+
+// closeFrameKey marks the context of a group close's unregister send
+// (fakes answer those themselves, tunnel/README.md runner rule 5).
+type closeFrameKey struct{}
 
 // transport is the ws-mixer client under one agent: wsmixer.Client in
 // production, a scripted fake in the tunnel fixture runner.

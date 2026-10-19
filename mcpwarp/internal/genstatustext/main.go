@@ -1,8 +1,9 @@
 // Command genstatustext writes mcpwarp's status-text tables
 // (statustext_tables.go) from ws-mixer-spec's
 // spec/fixtures/mcpwarp/status-text/*.json (MCPWARP.md §7): the locale
-// order and colon joiners from rules.json, and per locale the state labels
-// and code sentences derived from <locale>.json. Run through
+// order and colon joiners from rules.json, and per locale the state labels,
+// code sentences, service-state labels and the no-service-registered detail
+// (§6A.9) derived from <locale>.json. Run through
 // `go generate ./mcpwarp/` against the spec checkout at spec.pin.
 package main
 
@@ -56,16 +57,20 @@ func main() {
 	}
 	b.WriteString("}\n\nvar statusTables = map[string]statusTable{\n")
 	for _, l := range r.Locales {
-		states, codes := derive(filepath.Join(*in, l+".json"))
+		t := derive(filepath.Join(*in, l+".json"))
 		fmt.Fprintf(&b, "\t%q: {\n\t\tstates: map[TunnelState]string{\n", l)
-		for _, k := range sortedKeys(states) {
-			fmt.Fprintf(&b, "\t\t\t%q: %q,\n", k, states[k])
+		for _, k := range sortedKeys(t.states) {
+			fmt.Fprintf(&b, "\t\t\t%q: %q,\n", k, t.states[k])
 		}
 		b.WriteString("\t\t},\n\t\tcodes: map[StatusCode]string{\n")
-		for _, k := range sortedKeys(codes) {
-			fmt.Fprintf(&b, "\t\t\t%q: %q,\n", k, codes[k])
+		for _, k := range sortedKeys(t.codes) {
+			fmt.Fprintf(&b, "\t\t\t%q: %q,\n", k, t.codes[k])
 		}
-		b.WriteString("\t\t},\n\t},\n")
+		b.WriteString("\t\t},\n\t\tservices: map[ServiceState]string{\n")
+		for _, k := range sortedKeys(t.services) {
+			fmt.Fprintf(&b, "\t\t\t%q: %q,\n", k, t.services[k])
+		}
+		fmt.Fprintf(&b, "\t\t},\n\t\tnoServiceRegistered: %q,\n\t},\n", t.noServiceRegistered)
 	}
 	b.WriteString("}\n")
 	src, err := format.Source(b.Bytes())
@@ -77,17 +82,42 @@ func main() {
 	}
 }
 
+type derived struct {
+	states, codes, services map[string]string
+	noServiceRegistered     string
+}
+
 // derive is rules.json's keyFormat: a state's string is the label of any
 // key with that state, a code's sentence the detail (else label) of any key
-// with that code; every key of one state or code must agree.
-func derive(path string) (states, codes map[string]string) {
+// with that code; every key of one state or code must agree. The
+// multi-service keys (§6A.9) are apart: service.<state> is that service
+// state's label, lastError.NO_SERVICE_REGISTERED's detail the group's fatal
+// detail (its label must be the error label).
+func derive(path string) derived {
 	var table map[string]entry
 	readJSON(path, &table)
-	states, codes = map[string]string{}, map[string]string{}
+	states, codes := map[string]string{}, map[string]string{}
+	d := derived{states: states, codes: codes, services: map[string]string{}}
+	var noService *entry
 	for key, e := range table {
 		state, code, ok := strings.Cut(key, ".")
 		if !ok {
 			log.Fatalf("%s: bad key %q", path, key)
+		}
+		switch state {
+		case "service":
+			if e.Detail != nil {
+				log.Fatalf("%s: %q has a detail", path, key)
+			}
+			put(path, d.services, code, e.Label)
+			continue
+		case "lastError":
+			if code != "NO_SERVICE_REGISTERED" || e.Detail == nil {
+				log.Fatalf("%s: bad key %q", path, key)
+			}
+			e := e
+			noService = &e
+			continue
 		}
 		put(path, states, state, e.Label)
 		if code != "none" {
@@ -98,7 +128,14 @@ func derive(path string) (states, codes map[string]string) {
 			put(path, codes, code, sentence)
 		}
 	}
-	return states, codes
+	if noService == nil || len(d.services) != 6 {
+		log.Fatalf("%s: lacks the multi-service keys (§6A.9)", path)
+	}
+	if noService.Label != states["error"] {
+		log.Fatalf("%s: lastError.NO_SERVICE_REGISTERED label %q is not the error label %q", path, noService.Label, states["error"])
+	}
+	d.noServiceRegistered = *noService.Detail
+	return d
 }
 
 func put(path string, m map[string]string, k, v string) {

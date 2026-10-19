@@ -688,6 +688,7 @@ func TestClientRefreshRetryRetryDialHTTPFailureNotFatal(t *testing.T) {
 	go func() { _ = cl.Connect(ctx) }()
 	defer cl.Close(context.Background())
 
+	rec.waitFirstRejection(t, PhaseDial) // req#1's 401, reported before the refresh-retry
 	r := rec.waitNext(t)
 	if r.Fatal {
 		t.Fatalf("reason.Fatal = true, want false (the refresh-retry's own dial failed non-rejection): %+v", r)
@@ -760,6 +761,7 @@ func TestClientRefreshRetryRetryDialTransportFailureNotFatal(t *testing.T) {
 	go func() { _ = cl.Connect(ctx) }()
 	defer cl.Close(context.Background())
 
+	rec.waitFirstRejection(t, PhaseDial) // req#1's 401, reported before the refresh-retry
 	r := rec.waitNext(t)
 	if r.Fatal {
 		t.Fatalf("reason.Fatal = true, want false (the refresh-retry's own dial failed at the transport level): %+v", r)
@@ -843,6 +845,7 @@ func TestClientRefreshRetryRetryDialWelcomeTimeoutNotFatal(t *testing.T) {
 	go func() { _ = cl.Connect(ctx) }()
 	defer cl.Close(context.Background())
 
+	rec.waitFirstRejection(t, PhaseDial) // req#1's 401, reported before the refresh-retry
 	r := rec.waitNext(t)
 	if r.Fatal {
 		t.Fatalf("reason.Fatal = true, want false (a welcome timeout on the refresh-retry's own dial is not a rejection): %+v", r)
@@ -914,6 +917,7 @@ func TestClientRefreshRetryRetryDialBareClose4010Fatal(t *testing.T) {
 	}
 	defer cl.Close(context.Background())
 
+	rec.waitFirstRejection(t, PhaseDial) // req#1's 401, reported before the refresh-retry
 	r := rec.waitNext(t)
 	if !r.Fatal {
 		t.Errorf("reason.Fatal = false, want true (4010 is fatal regardless of what rejected the primary dial)")

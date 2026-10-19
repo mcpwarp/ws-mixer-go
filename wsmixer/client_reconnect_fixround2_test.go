@@ -10,7 +10,6 @@ package wsmixer
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"runtime"
 	"sync/atomic"
 	"testing"
@@ -62,19 +61,11 @@ func TestClientFatalTerminationDoesNotLeakCallbackLoop(t *testing.T) {
 		// fatal code -- goFatal runs from watchConn, asynchronously, so
 		// wait for State() to reach "closed" (goFatal already ran and set
 		// cl.closing directly, without a Close() call) before calling
-		// Close(), the exact precondition F1 pins.
-		//
-		// Connect can itself return the fatal reason: onAttemptSucceeded
-		// starts watchConn before it resolves Connect's first result, so the
-		// immediate server close can reach goFatal's finishFirstResult first
-		// (as TestClientFatalStateExactlyClosed notes). Either outcome
-		// reaches the fatal termination this test pins.
+		// Close(), the exact precondition F1 pins. The welcome landed, so
+		// Connect returns nil whatever the close's timing.
 		if err := cl.Connect(ctx); err != nil {
-			var r DisconnectReason
-			if !errors.As(err, &r) || !r.Fatal || r.ErrorCode != UnauthorizedCode {
-				cancel()
-				t.Fatalf("client #%d: Connect: %v, want nil or the fatal UNAUTHORIZED reason", i, err)
-			}
+			cancel()
+			t.Fatalf("client #%d: Connect: %v", i, err)
 		}
 		cancel()
 		deadline := time.Now().Add(2 * time.Second)

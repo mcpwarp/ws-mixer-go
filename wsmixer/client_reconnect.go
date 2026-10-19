@@ -796,6 +796,8 @@ func (cl *Client) scheduleCbChClose() {
 // call observes the same first result -- nit 6) and blocks until the first
 // welcome lands, or the connection attempt(s) end fatally/exhausted, or ctx
 // is done first (the background loop keeps running regardless of ctx).
+// Once a welcome landed it returns nil, even when the connection ends
+// fatally right after: that end is reported through OnDisconnect.
 func (cl *Client) Connect(ctx context.Context) error {
 	cl.startOnce.Do(func() {
 		// tryTrack, not a bare wg.Add: this runs on the caller's own
@@ -1277,6 +1279,11 @@ func (cl *Client) attemptLoop(delay time.Duration, cause string) {
 // instead of relying on scheduler luck.
 var probeWidenWindow func()
 
+// probeBeforeTokenRefresh is a test-only seam (nil in production) run
+// between a first rejected token and its refresh, so a test can land a
+// Close() exactly there.
+var probeBeforeTokenRefresh func()
+
 func (cl *Client) waitBackoff(delay time.Duration) bool {
 	if delay <= 0 {
 		return true
@@ -1396,7 +1403,25 @@ func (cl *Client) dialAndHandshake() (*Conn, *WelcomeMsg, error) {
 	if budgetAlreadySpent {
 		return nil, nil, markFatal(err)
 	}
+	if probeBeforeTokenRefresh != nil {
+		probeBeforeTokenRefresh()
+	}
 
+	// CLIENT-SDK.md's Rejected token row: the first rejection is reported as
+	// a non-fatal disconnect like any other (phase dial for the 401,
+	// handshake for the 4011), then the token-refresh reconnect notice, then
+	// the redial -- both queued on callbackLoop, so in that order.
+	first := classifyFailureErr(err).toReason()
+	first.Fatal = false
+	cl.report(first)
+	// A Close() that landed since: the rejection is reported, but no
+	// refresh redial is announced or made (attemptLoop drops the result).
+	cl.mu.Lock()
+	closing := cl.closing
+	cl.mu.Unlock()
+	if closing {
+		return nil, nil, err
+	}
 	cl.announceReconnect(ReconnectInfo{Attempt: 1, Delay: 0, Cause: ReconnectTokenRefresh})
 	tok2, err2 := cl.token(ctx)
 	if err2 != nil {
@@ -1498,6 +1523,12 @@ func (cl *Client) onAttemptSucceeded(conn *Conn, welcome *WelcomeMsg) {
 	cl.everConnected = true
 	cl.state = clientConnected
 	cl.conn = conn
+	// Connect's first result is this welcome, resolved under cl.mu before
+	// watchConn starts: every other finishFirstResult caller (goFatal,
+	// onAttemptFailed, reportAndSchedule, closeStart) sets cl.closing under
+	// cl.mu first, so none of them can win once this ran. A fatal close
+	// right after welcome is reported through OnDisconnect only.
+	cl.finishFirstResult(nil)
 	retiring := cl.retiringConn
 	cl.retiringConn = nil
 	wonDrainRace := retiring != nil && retiring != conn
@@ -1557,8 +1588,6 @@ func (cl *Client) onAttemptSucceeded(conn *Conn, welcome *WelcomeMsg) {
 		defer cl.wg.Done()
 		cl.armStability(conn)
 	}()
-
-	cl.finishFirstResult(nil)
 }
 
 // Retiring a drained connection once its replacement has received welcome:

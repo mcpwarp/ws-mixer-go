@@ -76,13 +76,33 @@ func TestStatusTextFixtures(t *testing.T) {
 			enKeys = keys
 		}
 		t.Run(locale+".json", func(t *testing.T) {
-			if !reflect.DeepEqual(keys, enKeys) || len(keys) != 17 {
-				t.Fatalf("key set %v, want the 17 keys of en.json", keys)
+			if !reflect.DeepEqual(keys, enKeys) || len(keys) != 24 {
+				t.Fatalf("key set %v, want the 24 keys of en.json (17 pairs, 7 multi-service)", keys)
 			}
 			states, codes := map[TunnelState]string{}, map[StatusCode]string{}
+			services, noService := map[ServiceState]string{}, ""
 			for _, k := range keys {
 				e := file[k]
 				state, code, _ := strings.Cut(k, ".")
+				want := StatusText{Label: e.Label}
+				if e.Detail != nil {
+					want.Detail = *e.Detail
+				}
+				switch state {
+				case "service": // §6A.9: the service state's label only (a code-less rejected still gets a detail)
+					services[ServiceState(code)] = e.Label
+					if got := DescribeServiceStatus(ServiceStatus{State: ServiceState(code)}, DescribeOptions{Locale: locale}); got.Label != e.Label || e.Detail != nil {
+						t.Errorf("%s: DescribeServiceStatus label %q, want %q (entry detail %v)", k, got.Label, e.Label, e.Detail)
+					}
+					continue
+				case "lastError": // §6A.9: the group's fatal status
+					noService = want.Detail
+					st := TunnelStatus{State: StateError, Code: CodeInternal, LastError: lastNoServiceRegistered}
+					if got := DescribeStatus(st, DescribeOptions{Locale: locale}); got != want {
+						t.Errorf("%s: DescribeStatus = %+v, want %+v", k, got, want)
+					}
+					continue
+				}
 				states[TunnelState(state)] = e.Label
 				if code != "none" {
 					s := e.Label
@@ -95,16 +115,13 @@ func TestStatusTextFixtures(t *testing.T) {
 				if code != "none" {
 					st.Code = StatusCode(code)
 				}
-				want := StatusText{Label: e.Label}
-				if e.Detail != nil {
-					want.Detail = *e.Detail
-				}
 				if got := DescribeStatus(st, DescribeOptions{Locale: locale}); got != want {
 					t.Errorf("%s: DescribeStatus = %+v, want %+v", k, got, want)
 				}
 			}
 			table := statusTables[locale]
-			if !reflect.DeepEqual(table.states, states) || !reflect.DeepEqual(table.codes, codes) {
+			if !reflect.DeepEqual(table.states, states) || !reflect.DeepEqual(table.codes, codes) ||
+				!reflect.DeepEqual(table.services, services) || table.noServiceRegistered != noService {
 				t.Fatalf("generated tables drifted from %s.json; run `go generate ./mcpwarp/`", locale)
 			}
 		})
@@ -120,6 +137,13 @@ func TestStatusTextFixtures(t *testing.T) {
 					Code      string `json:"code"`
 					LastError string `json:"lastError"`
 				} `json:"status"`
+				Service *struct {
+					State     string `json:"state"`
+					ID        string `json:"id"`
+					URL       string `json:"url"`
+					Code      string `json:"code"`
+					LastError string `json:"lastError"`
+				} `json:"service"`
 				Locale *string `json:"locale"`
 			} `json:"input"`
 			Expect statusEntry `json:"expect"`
@@ -133,7 +157,12 @@ func TestStatusTextFixtures(t *testing.T) {
 			if c.Input.Locale != nil {
 				opts.Locale = *c.Input.Locale
 			}
-			got := DescribeStatus(TunnelStatus{State: TunnelState(s.State), URL: s.URL, Code: StatusCode(s.Code), LastError: s.LastError}, opts)
+			var got StatusText
+			if sv := c.Input.Service; sv != nil { // §10.6: describeServiceStatus
+				got = DescribeServiceStatus(ServiceStatus{State: ServiceState(sv.State), ID: sv.ID, URL: sv.URL, Code: sv.Code, LastError: sv.LastError}, opts)
+			} else {
+				got = DescribeStatus(TunnelStatus{State: TunnelState(s.State), URL: s.URL, Code: StatusCode(s.Code), LastError: s.LastError}, opts)
+			}
 			want := StatusText{Label: c.Expect.Label}
 			if c.Expect.Detail != nil {
 				want.Detail = *c.Expect.Detail
@@ -158,5 +187,22 @@ func TestDescribeStatusOverrides(t *testing.T) {
 	}
 	if got := DescribeStatus(TunnelStatus{State: "weird"}, DescribeOptions{}); got != (StatusText{Label: "weird"}) {
 		t.Fatalf("unknown state: %+v", got)
+	}
+}
+
+// §6A.9: messages override service-state labels only; the rejected detail
+// stays the table's, and lastError is never shown.
+func TestDescribeServiceStatusOverrides(t *testing.T) {
+	got := DescribeServiceStatus(ServiceStatus{State: ServiceRejected, Code: "QUOTA_EXCEEDED", LastError: "x"}, DescribeOptions{
+		Messages: StatusMessages{
+			Services: map[ServiceState]string{ServiceRejected: "Nope", "bogus": "x"},
+			Codes:    map[StatusCode]string{CodeQuotaExceeded: "ignored"},
+		},
+	})
+	if got != (StatusText{Label: "Nope", Detail: "Plan limit reached"}) {
+		t.Fatalf("got %+v", got)
+	}
+	if got := DescribeServiceStatus(ServiceStatus{State: ServiceDisabled}, DescribeOptions{}); got != (StatusText{Label: "Disabled"}) {
+		t.Fatalf("locally disabled: %+v", got)
 	}
 }

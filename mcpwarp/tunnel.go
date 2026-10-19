@@ -637,6 +637,9 @@ func (t *Tunnel) onAgentEvent(gen int, cfg *TunnelConfig, ev event) {
 	cur := t.status
 	switch ev.kind {
 	case evRegistered:
+		if ev.heldDisable {
+			return // T50: the disabled that follows is the one snapshot and log line, no online in between
+		}
 		t.logLocked(slog.LevelInfo, "online at "+ev.registration.URL)
 		t.setStatusLocked(TunnelStatus{State: StateOnline, URL: ev.registration.URL})
 	case evDisabled:
@@ -673,12 +676,6 @@ func (t *Tunnel) onAgentEvent(gen int, cfg *TunnelConfig, ev event) {
 		// While online or disabled this is a drain replacement's register; the old connection still serves.
 		if (ev.retryKind == "register" || ev.retryKind == "overloaded") && cur.State == StateConnecting {
 			t.setStatusLocked(problemStatus(StateConnecting, CodeRetrying, lastRetryRegister))
-		}
-		// The token-refresh redial answers a rejected token before welcome,
-		// which is a failed dial (§6.2, T48 as T27-T29 by state); the client
-		// reports no disconnect for that first rejection, only this redial.
-		if ev.retryKind == "token-refresh" && cur.State == StateConnecting && cur.Code != CodeDisconnected {
-			t.setStatusLocked(problemStatus(StateConnecting, CodeRetrying, lastRetryDial))
 		}
 	case evDisconnect:
 		r := ev.disconnect

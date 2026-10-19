@@ -107,13 +107,14 @@ func TestClientCloseFromOnDisconnectAsync(t *testing.T) {
 	}})
 	fa := &fakeAfter{}
 	done := make(chan struct{})
+	doneOnce := onceCloser(done)
 	var cl *Client
 	cl = NewClient(url, StaticToken("tok"), ClientConfig{
 		Reconnect: testReconnectOptions(fa, 0),
 		OnDisconnect: func(DisconnectReason) {
 			go func() {
 				_ = cl.Close(context.Background())
-				close(done)
+				doneOnce()
 			}()
 		},
 	})
@@ -138,12 +139,13 @@ func TestClientCloseFromOnDisconnectSync(t *testing.T) {
 	}})
 	fa := &fakeAfter{}
 	done := make(chan struct{})
+	doneOnce := onceCloser(done)
 	var cl *Client
 	cl = NewClient(url, StaticToken("tok"), ClientConfig{
 		Reconnect: testReconnectOptions(fa, 0),
 		OnDisconnect: func(DisconnectReason) {
 			_ = cl.Close(context.Background()) // the natural thing a user writes
-			close(done)
+			doneOnce()
 		},
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -165,12 +167,13 @@ func TestClientCloseFromOnConnectSync(t *testing.T) {
 	_, url := startTestServer(t, testAcceptHandler{})
 	fa := &fakeAfter{}
 	done := make(chan struct{})
+	doneOnce := onceCloser(done)
 	var cl *Client
 	cl = NewClient(url, StaticToken("tok"), ClientConfig{
 		Reconnect: testReconnectOptions(fa, 0),
 		OnConnect: func(*Conn, *WelcomeMsg) {
 			_ = cl.Close(context.Background())
-			close(done)
+			doneOnce()
 		},
 	})
 	go func() { _ = cl.Connect(context.Background()) }()
@@ -193,9 +196,10 @@ func TestClientCloseAfterServerDrain(t *testing.T) {
 	rc := testReconnectOptions(fa, 0)
 	rc.Disabled = true // keep the drained conn as the active one
 	drained := make(chan struct{})
+	drainedOnce := onceCloser(drained)
 	cl := NewClient(url, StaticToken("tok"), ClientConfig{
 		Reconnect: rc,
-		OnDrain:   func(*DrainMsg) { close(drained) },
+		OnDrain:   func(*DrainMsg) { drainedOnce() },
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

@@ -1036,3 +1036,145 @@ links its own spec counterpart explicitly, so read the link, not the number.
   skipped.
   README: a "Migrating to v0.9.0" note on `DisconnectReason.Superseded` and per-connection `(*Conn).OnApp`.
   `version.SDK` → `0.9.1`.
+
+## 2026-10-19
+
+- **D-2026-10-19-01** — v0.10.0: `spec.pin` → `v0.7.0` (the multi-service profile, MCPWARP.md §2.1-§2.7,
+  §4.8, §6A, §9.2, §10.6), plus the binding v0.7.1 rulings of D-2026-10-19-04. Package `mcpwarp` additions:
+  `MaxServicesPerMessage` (100), `RegisterEntry{Name, Kind}`, `EncodeRegisterList`, `EncodeUnregisterList`
+  (the §9.2 list encoders; `EncodeRegister`/`EncodeUnregister` stay as the one-entry forms and must agree with
+  them, which the envelope runner checks); `ServerIDHeader`, `ServerNameHeader`; the service group
+  (`NewServiceGroup`, `ServiceGroupOptions`, `ServiceGroupConfig`, `ServiceConfig`, `ServiceGroup` with
+  `Configure`, `Stop`, `Dispose`, `AddService`, `RemoveService`, `Enable`, `Disable`, `Status`, `Subscribe`);
+  `ServiceState` and its six constants, `ServiceStatus`, `ServiceGroupStatus`; `DescribeServiceStatus` and
+  `StatusMessages.Services`; status-text tables with `service.*` and `lastError.NO_SERVICE_REGISTERED`
+  (regenerated; the drift test covers them). `DecodeEnvelope` needed no change: it already validated and kept
+  every entry of a list. `register_two_services` and `register_batch_valid` are compared through
+  `EncodeRegisterList`; `register_batch_101_invalid` checks that the group never builds a frame over 100.
+- **D-2026-10-19-02** — The service group (§6A) is its own controller over its own registration state machine
+  (`group.go`, `group_session.go`), sharing the agent, transport, bridge, codec and the tunnel's status
+  constants; `Expose` and `NewTunnel` are not rebuilt on top of it. Their §5/§6 semantics differ from §6A's in
+  ways a group of one cannot express without special cases (a whole-connection sticky `conflict` versus a
+  per-name `taken_over`, a refusal fatal before the first registration versus G5, `disabled` as a connection
+  state versus a per-service one), and their fixtures and tests pin them; a group of one observes the same
+  wire, which is §6A's "conforming subset". The agent runs either machine behind one `registrar` interface;
+  the bridge gained a per-stream `route` hook and a per-service `app` (handler or target).
+  Choices: one snapshot per processed input (the session reports services and the connection-level effect
+  together; a reply that is also G2/G3/G5 is one snapshot); a conflict needs a name this connection *holds*
+  (got a `services[]` entry since), not merely one it *may hold* in §6A.2's sense (sent a register), which
+  `tunnel/ms_05` requires for the refused `zeta`; the §6A.2 checks (duplicate name, name syntax, §5.2 rows
+  1-4 and 8) run at start and before a services-only diff, as the tunnel's run at start; a validation error
+  shows no services, a fatal error keeps them (as G5 does); a local `Disable` lives in the controller, so it
+  survives restarts and services-only diffs and is cleared by `Enable`, removal, `Stop`, `Dispose` or a fatal
+  error; reply entries apply only to names of the outstanding frame that may still go out (removed, locally
+  disabled and taken-over names are ignored); a group's token is `Token`/`TokenSource` as in `TunnelConfig`;
+  handlers are compared with `==` behind the same `reflect.Value.Comparable` guard as `TokenSource` (a
+  `HandlerFunc` never compares equal, so such a reconfigure is applied as a no-op swap: no frame, no
+  snapshot). A close's unregister frames carry a context mark (`closeFrameKey`) only so the fixtures' fake
+  edge can answer them itself (tunnel/README.md runner rule 5). On a per-name `conflict` the agent also RESETs
+  that service's in-flight streams with CANCEL (the edge already has); the other names and the connection go
+  on (`TestGroupPerNameConflictResetsOnlyThatService`, real transport).
+- **D-2026-10-19-03** — §4.8 routing: after the path check, the group selects the service per stream: with
+  `TrustServerIDHeader` the first `X-Mcpwarp-Server-Id` (name case-insensitive) matched exactly against the
+  last id learned per name, no `Host` fallback; else the `Host` label (port dropped, lowercased, first label)
+  split at its last `-`, name and username checked against their grammars. No service → `503 service
+  unavailable`; `taken_over` → RESET CANCEL; dashboard-disabled → `503 service disabled`; locally disabled,
+  rejected, unregistered, or pending and never active → `503 service unavailable`; closing → `503 service
+  closing`. `X-Mcpwarp-Server-Name` is forwarded and never routed by. The trust option defaults off.
+- **D-2026-10-19-04** — v0.7.1 rulings applied ahead of their tag (binding for v0.10.0; they override v0.7.0's
+  wording), in both the single-service session and the group: (1) the OVERLOADED backoff has its own counter,
+  `min(1000·2^(n−1), 30000)` ms over consecutive OVERLOADED only, reset by any other reply; transient refusals
+  keep §3.2's counter, reset by a successful register (a single service's second consecutive OVERLOADED now
+  waits 2 s, not 1 s; `TestSessionOverloadedResend` updated); (2) a `registered` listing none of the frame's
+  names is re-sent after the transient backoff (`register failed: INTERNAL: unlisted in reply`; no state
+  change for a single service); (3) one frame in flight: an `enable` or subset register during a pending frame
+  queues until its reply, and `close()` may unregister while a register is outstanding; (4) any whole-frame
+  error op other than OVERLOADED and CONNECTION_LIMIT answers the outstanding frame (a group's register names
+  → `rejected`, G7; UNSUPPORTED_VERSION then fatal); (5) a reply settling the frame cancels its re-send timer;
+  (6) after OVERLOADED the slot stays reserved and triggers during the pause fold into the one re-send; (7)
+  `close()`'s unregister wait ends early on the reply to the unregister's own frame (an `unregistered`, or a
+  whole-frame error op), not at the 2000 ms budget; per the spec session's ruling of 2026-10-19 a reply to a
+  register still in flight when the close began continues the wait, and a register dropped by OVERLOADED then
+  is abandoned, never re-sent. Replies are matched to frames by op, an error op (which names no frame) by
+  frame order, so a close of more than 100 names keeps one frame in flight; (8) a held disable is cleared by
+  a replacement connection's `welcome` too (both machines clear holds on every `welcome`). No `ms_` fixture contradicts them: none mixes OVERLOADED with all-transient
+  replies. The v0.7.0 texts that do — §2.6 OVERLOADED re-send, §3.2 Transient retry, §6A.7 Backoff counter
+  and tunnel/README.md's group-fixture streak line ("counts only OVERLOADEDs and all-transient registereds")
+  — describe one shared counter; the runner follows ruling 1 (its expected OVERLOADED attempt resets on any
+  non-OVERLOADED reply). Tests: `TestGroupOverloadedCounterSeparate`, `TestGroupSettlingCancelsResend`,
+  `TestGroupQueueAndFoldBehindInFlight`, `TestGroupCloseWhileRegisterOutstanding`,
+  `TestGroupCloseFramesOfAHundred`, `TestGroupEmptyReplyResends`, `TestSessionEmptyReplyAndWholeFrameError`,
+  `TestSessionCloseWaitEndsOnAnyAnswer`.
+- **D-2026-10-19-05** — Core (`wsmixer`, no API change): `onAttemptSucceeded` resolves `Connect`'s first
+  result under `cl.mu`, before `watchConn` starts, so `Connect` returns nil once a welcome landed and a fatal
+  close right after is reported through `OnDisconnect` only (the race of 2026-10-18's flake;
+  `TestClientFatalStateExactlyClosed` and `TestClientFatalTerminationDoesNotLeakCallbackLoop` now require
+  nil). CLIENT-SDK.md v0.7.0's Rejected token row: with a real provider the first rejection before welcome is
+  reported as a non-fatal `OnDisconnect` (`PhaseDial`/`HTTPStatus` 401, or `PhaseHandshake`/`WSCode`
+  4011/`UNAUTHORIZED`), then `OnReconnect{1, 0, token-refresh}`, then the redial (MCPWARP.md §11 row 53).
+  This closes D-2026-10-15-01's open item: `Expose`'s `EventDisconnect` sees that dial, and the tunnel's
+  compensation (a `token-refresh` retry read as a failed dial) is gone, the disconnect now drives T48. Tests
+  moved to the new contract: `TestClientSecond401Fatal`,
+  `TestClientHandshakePhaseBareClose4011OneRetryThenFatal`,
+  `TestClientRefreshRetryRetryDialHTTPFailureNotFatal`, `…TransportFailureNotFatal`,
+  `…WelcomeTimeoutNotFatal`, `…BareClose4010Fatal`, `TestClientMarkedRefreshRetryThenLaterFatal` (each now
+  takes the first report first), and `TestClient401RefreshRetrySuccess` pins the order disconnect, reconnect,
+  connect. The tunnel fixtures' fake client reports that disconnect too. `isRealProvider` stays.
+- **D-2026-10-19-06** — Held `disable` at the handle (spec ruling of 2026-10-19: §5.9 wins over §5.4): the
+  `registered` that brings a held disable's id records the registration (url, id, `Registration()`), emits
+  `EventRegistered`, then applies the disable (`EventDisabled`, state `disabled`), back to back. This reverts
+  v0.9.1's "no registration" path. The tunnel collapses the pair into one `disabled`/`DISABLED` snapshot, no
+  `online` in between (T50; the registered event says a held disable follows; `tunnel/42` unchanged).
+  `version.SDK` → `0.10.0`; README: a service-group section and "Migrating to v0.10.0".
+- **D-2026-10-19-07** — r1 and the CLI's integration check. Fixes: `AddService`/`RemoveService` read, edit
+  and store the desired config under one lock (concurrent edits no longer lose each other,
+  `TestServiceGroupConcurrentAddService`); a stray `registered` resets the OVERLOADED streak (ruling 1); the
+  close frame matching above (`TestGroupCloseFramesMatchTheirReplies`); `wsmixer`: a Close that lands
+  between a first rejected token and its refresh still reports the rejection but announces no
+  token-refresh reconnect and makes no redial (`TestClient401RefreshSkippedWhenClosing`, via the test-only
+  seam `probeBeforeTokenRefresh`, like `probeWidenWindow`). The flake root cause: `TestClient401RefreshRetrySuccess`'s
+  `OnConnect` closed a channel bare, so a second `OnConnect` (a reconnect under `-race` load) panicked and
+  killed the binary; it and every other bare close in a client callback now go through `onceCloser`
+  (`client_reconnect_test.go`, `client_closewith_test.go`, `client_reconnect_regression_test.go` ×4).
+  Additions: `ServiceGroupOptions.Metrics` (passed to `wsmixer.Options.Metrics`) and `(*ServiceGroup).Client()`
+  (the running connection's client; one per configuration, the same across reconnects, replaced on a restart;
+  the session id is `Client().Conn().Session()`, no new accessor). A dashboard-disabled service has `Code`
+  `DISABLED` (disable op and `SERVER_DISABLED` alike), a locally disabled one `Code` `""`. A group service
+  whose target is unreachable is logged warn with its name and target URL; §6A.4 gives an active service no
+  `lastError`, so it is not in its status. `CONNECTION_LIMIT` is unchanged pending a spec ruling: a
+  non-fatal error (logged warn; `connecting`/`INTERNAL` if the group was still connecting, else unchanged),
+  then the 4014 close is an ordinary lost connection (`connecting`/`DISCONNECTED`, backoff redial, the full
+  list re-registered on the next welcome).
+- **D-2026-10-19-08** — `spec.pin` → `v0.7.1` (8ea3790), which tags D-2026-10-19-04's rulings and adds:
+  (i) only register triggers fold into a dropped register's re-send, within 100 names, the dropped names
+  first, then the folded ones in trigger order; a name removed or locally disabled during the pause is left
+  out and, if the connection may hold it, its `unregister` is the next frame once the re-send is answered
+  (`TestGroupPauseFoldOrderAndOwedUnregister`, `tunnel/ms_12`); (ii) a whole-frame error op answering an
+  outstanding `unregister` settles it like `unregistered`, with a warn line (`TestGroupErrorOpSettlesUnregister`);
+  (iii) a restart through `Configure`/`Stop` starts a new transient counter (each generation has its own
+  session), and a reply mixing transient and non-transient entries resets it, so the transient names wait
+  1000 ms (`TestServiceGroupRestartResetsTransientCounter`, `TestGroupMixedReplyTransientCounterResets`,
+  `tunnel/ms_13`); (iv) a single-service handle applies a `registered` naming its service with no frame
+  outstanding (already so; `tunnel/18`); (v) `CONNECTION_LIMIT` answers no frame, the 4014 close frees the slot
+  (`TestGroupConnectionLimitAnswersNoFrame`); (vi) a re-send with no names left is not sent and frees the slot,
+  and a connecting group with nothing else to send is then G1's "nothing to send" (online unless G5)
+  (`TestGroupEmptyResendIsNothingToSend`, `tunnel/ms_14`); (vii) a register dropped by OVERLOADED was never
+  processed, so a name only it carried is not "may hold" and owes no unregister (the frame remembers which
+  names it made "may hold" and an OVERLOADED takes that back), and G7 excludes `UNSUPPORTED_VERSION`: it answers
+  the frame, names keep their state, then T24 (`TestGroupUnsupportedVersionNotRejected`). Before this the group
+  unregistered such names, rejected names on `UNSUPPORTED_VERSION`, left a freed empty re-send unevaluated and
+  logged nothing for an error op answering an unregister. Two more rulings (spec v0.7.2, binding now):
+  (viii) a scheduled transient re-send counts as queued, so a paused re-send that empties out while one is
+  pending leaves a connecting group at `connecting`/`RETRYING` (G3) until it is answered; G1's "nothing to
+  send" needs nothing outstanding, queued or scheduled (`TestGroupEmptyResendWithTransientPendingStaysRetrying`;
+  `tunnel/ms_14` unchanged); (ix) a name that owes an unregister from a disable or removal during an
+  OVERLOADED pause and is enabled or added again in the same pause folds into the re-send, and the owed
+  unregister is dropped from the queue, so the edge never gets an unregister after the register of a name
+  the group shows active (`TestGroupPauseUndoDropsOwedUnregister`: disable+enable and remove+add).
+  A Remove+Add within a pause carries the old entry's may-hold/holds marks, so a later removal still owes
+  the unregister (`TestGroupReaddInPauseKeepsHold`). A transient re-send whose names were all disabled or
+  removed before its timer fires sends nothing, frees itself and re-evaluates the group like an empty
+  OVERLOADED re-send (`TestGroupEmptyTransientResendReevaluates`). Likewise a frame settled by `registered`,
+  `unregistered` or a whole-frame error op re-evaluates the group (G1/G5) when nothing is left outstanding,
+  queued or scheduled, so a connecting group never stays `RETRYING` with nothing to send
+  (`TestGroupSettleReevaluatesWhenNothingLeft`).

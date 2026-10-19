@@ -168,6 +168,32 @@ func TestExposeRegistersAndCloses(t *testing.T) {
 	}
 }
 
+// §5.9 Held disable at the handle: the registered that brings a held
+// disable's id is EventRegistered then EventDisabled, back to back; the
+// handle keeps the registration and ends disabled.
+func TestExposeHeldDisableRegisteredThenDisabled(t *testing.T) {
+	edge := newFakeEdge(t)
+	res := exposeAsync(context.Background(), exposeOpts(edge.url))
+	ec := edge.nextConn(t)
+	ec.expectRegister(t, "notes")
+	ec.send(t, `{"mcpwarp":{"v":1,"op":"disable","id":"srv_notes","reason":"disabled"}}`)
+	ec.send(t, registeredNotes)
+	r := await(t, res)
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	h := r.h
+	ev := nextEvent(t, h, EventRegistered)
+	if ev.Registration.ServerID != "srv_notes" {
+		t.Fatalf("EventRegistered %+v", ev.Registration)
+	}
+	nextEvent(t, h, EventDisabled)
+	waitFor(t, func() bool { return h.State() == ExposeDisabled })
+	if reg, ok := h.Registration(); !ok || reg.ServerID != "srv_notes" || h.URL() == "" {
+		t.Fatalf("Registration %+v/%v, url %q; want the registration kept", reg, ok, h.URL())
+	}
+}
+
 func TestExposeRejections(t *testing.T) {
 	t.Run("refusal before registration", func(t *testing.T) {
 		edge := newFakeEdge(t)

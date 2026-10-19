@@ -57,6 +57,17 @@ type bridgingFixture struct {
 	Upstream *upstreamCall       `json:"upstream"`
 	Out      string              `json:"out"`
 	OutReset *struct{ Code int } `json:"outReset"`
+
+	// Multi-service fixtures (§10.6): services replaces sdkState.
+	Services []struct {
+		Name  string `json:"name"`
+		ID    string `json:"id"`
+		URL   string `json:"url"`
+		State string `json:"state"`
+		Code  string `json:"code"`
+	} `json:"services"`
+	RoutedTo          *string `json:"routedTo"`
+	RunnerRequirement string  `json:"runnerRequirement"`
 }
 
 type upstreamCall struct {
@@ -181,10 +192,28 @@ func runBridgingFixture(t *testing.T, f *bridgingFixture) {
 	if f.OutReset != nil {
 		t.Skip("streaming-adapter fixture (outReset): this bridge buffers the request body, so a body over the cap is always a 413 before any response byte; covered by body_413 (§10.3)")
 	}
+	if req := f.RunnerRequirement; req != "" && req != "trust-server-id-header" {
+		t.Skipf("runnerRequirement %q: this runner cannot meet it", req)
+	}
+	multi := f.Services != nil
 	rec := &callRecorder{}
+	recs := map[string]*callRecorder{} // multi-service: one handler instance per service
 	edge := newFakeEdge(t)
 	a, log := newTestAgent(t, edge.url, func(c *agentConfig) {
 		c.maxBodyBytes = f.Limits.MaxRequestBodyBytes
+		switch {
+		case multi && f.Mode == "handler":
+			g := &groupAgentConfig{trustHeader: f.RunnerRequirement == "trust-server-id-header"}
+			for _, s := range f.Services {
+				recs[s.Name] = &callRecorder{}
+				h := fixtureHandler(t, f.Handler.Behaviour, f.Handler.Status, recs[s.Name])
+				g.services = append(g.services, groupServiceInit{name: s.Name, kind: KindHTTP, app: newApp(h, nil, 0, nil)})
+			}
+			c.group = g
+			return
+		case multi:
+			t.Fatalf("multi-service mode %q", f.Mode)
+		}
 		switch f.Mode {
 		case "handler":
 			c.handler = fixtureHandler(t, f.Handler.Behaviour, f.Handler.Status, rec)
@@ -213,9 +242,17 @@ func runBridgingFixture(t *testing.T, f *bridgingFixture) {
 
 	a.start()
 	ec := edge.nextConn(t)
-	ec.expectRegister(t, "notes")
 	closeDone := make(chan struct{})
+	if multi {
+		holdServices(t, a, ec, f)
+	} else {
+		ec.expectRegister(t, "notes")
+	}
 	switch f.SdkState {
+	case "":
+		if !multi {
+			t.Fatal("sdkState missing")
+		}
 	case "online":
 		ec.send(t, registeredNotes)
 		waitState(t, a, stateRegistered)
@@ -250,7 +287,9 @@ func runBridgingFixture(t *testing.T, f *bridgingFixture) {
 		in = strings.ReplaceAll(in, marker, strings.Repeat(ex.Repeat, ex.Count))
 	}
 	headLen, headFirst := strings.Index(in, "\r\n\r\n")+4, 0
-	if f.SdkState != "online" && headLen >= 4 {
+	// A refusal must not wait for the body: not online, or no service selected.
+	refusal := f.SdkState != "online" && !multi || multi && f.RoutedTo == nil
+	if refusal && headLen >= 4 {
 		headFirst = len(f.Out)
 	}
 	out, endErr := ec.roundTrip(t, []byte(in), headLen, headFirst)
@@ -271,6 +310,19 @@ func runBridgingFixture(t *testing.T, f *bridgingFixture) {
 	}
 
 	calls := rec.all()
+	if multi {
+		calls = nil
+		for name, r := range recs {
+			if f.RoutedTo != nil && name == *f.RoutedTo {
+				calls = r.all()
+			} else if n := len(r.all()); n != 0 {
+				t.Fatalf("%s's handler was called %d times, want routedTo %v only", name, n, f.RoutedTo)
+			}
+		}
+		if f.RoutedTo == nil && f.Upstream != nil {
+			t.Fatal("routedTo null with an upstream call")
+		}
+	}
 	if f.Upstream == nil {
 		if len(calls) != 0 {
 			t.Fatalf("the app was called: %+v", calls)
@@ -309,6 +361,48 @@ func runBridgingFixture(t *testing.T, f *bridgingFixture) {
 		if handlerErrs != 1 {
 			t.Fatalf("%d handler error events, want 1", handlerErrs)
 		}
+	}
+}
+
+// holdServices registers a multi-service fixture's services on one
+// connection, in their fixture states: active ones in registered.services[],
+// a dashboard-disabled one as SERVER_DISABLED.
+func holdServices(t *testing.T, a *agent, ec *edgeConn, f *bridgingFixture) {
+	t.Helper()
+	var entries []RegisterEntry
+	var svcs, errs []map[string]any
+	for _, s := range f.Services {
+		entries = append(entries, RegisterEntry{Name: s.Name, Kind: KindHTTP})
+		switch {
+		case s.State == "active":
+			svcs = append(svcs, map[string]any{"name": s.Name, "id": s.ID, "url": s.URL, "created": false})
+		case s.State == "disabled" && s.Code == "DISABLED":
+			errs = append(errs, map[string]any{"name": s.Name, "code": "SERVER_DISABLED", "id": s.ID})
+		default:
+			t.Fatalf("service %s: fixture state %q not supported by this runner", s.Name, s.State)
+		}
+	}
+	if got, want := string(ec.nextApp(t)), string(EncodeRegisterList(entries)); got != want {
+		t.Fatalf("app = %s, want register %s", got, want)
+	}
+	b, _ := json.Marshal(map[string]any{"mcpwarp": map[string]any{"v": 1, "op": "registered", "services": svcs, "errors": errs}})
+	ec.send(t, string(b))
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		view := a.group.snapshotView()
+		ok := true
+		for _, s := range f.Services {
+			if string(view[s.Name].State) != s.State {
+				ok = false
+			}
+		}
+		if ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("services %+v, want the fixture's states", view)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

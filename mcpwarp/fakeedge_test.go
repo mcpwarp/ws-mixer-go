@@ -234,6 +234,12 @@ func (l *eventLog) add(ev event) {
 	l.mu.Unlock()
 }
 
+func (l *eventLog) all() []event {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]event(nil), l.events...)
+}
+
 func (l *eventLog) of(kind eventKind) []event {
 	l.mu.Lock()
 	defer l.mu.Unlock()

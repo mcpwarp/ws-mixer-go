@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -402,6 +403,28 @@ func (r *disconnectRecorder) waitNext(t *testing.T) DisconnectReason {
 	}
 }
 
+// waitFirstRejection consumes the non-fatal report of a provider's first
+// rejected token (CLIENT-SDK.md's Rejected token row): phase dial with HTTP
+// 401, or phase handshake with close 4011, reported before the
+// token-refresh redial.
+func (r *disconnectRecorder) waitFirstRejection(t *testing.T, phase DisconnectPhase) {
+	t.Helper()
+	got := r.waitNext(t)
+	if got.Fatal || got.Phase != phase {
+		t.Fatalf("first rejection reported as %+v, want a non-fatal phase-%s disconnect", got, phase)
+	}
+	switch phase {
+	case PhaseDial:
+		if got.HTTPStatus != http.StatusUnauthorized {
+			t.Fatalf("first rejection HTTPStatus = %d, want 401", got.HTTPStatus)
+		}
+	case PhaseHandshake:
+		if got.WSCode != 4011 {
+			t.Fatalf("first rejection WSCode = %d, want 4011", got.WSCode)
+		}
+	}
+}
+
 // flakyPreUpgrade returns statuses[i] for the i-th HTTP request (before any
 // WebSocket upgrade is attempted) and falls through to inner from then on --
 // used to simulate an HTTP 401 that only fails the first dial attempt.
@@ -432,6 +455,13 @@ func newFlakyServer(t *testing.T, statuses []int, ln testAcceptHandler) (string,
 	return "ws" + srv.URL[len("http"):] + "/tunnel", flaky
 }
 
+// onceCloser returns a func that closes ch the first time only, for a
+// client callback that may run again (a reconnect under load).
+func onceCloser(ch chan struct{}) func() {
+	var once sync.Once
+	return func() { once.Do(func() { close(ch) }) }
+}
+
 func TestClient401RefreshRetrySuccess(t *testing.T) {
 	url, _ := newFlakyServer(t, []int{401}, testAcceptHandler{})
 	var calls atomic.Int32
@@ -439,11 +469,26 @@ func TestClient401RefreshRetrySuccess(t *testing.T) {
 		calls.Add(1)
 		return "tok", nil
 	})
+	// CLIENT-SDK.md's Rejected token row: the first 401 is reported as a
+	// non-fatal phase-dial disconnect, then OnReconnect{1, 0, token-refresh},
+	// then the redial's OnConnect -- all on callbackLoop, in that order.
+	var mu sync.Mutex
+	var order []string
+	note := func(s string) { mu.Lock(); order = append(order, s); mu.Unlock() }
+	connected := make(chan struct{})
+	connectedOnce := onceCloser(connected)
 	rec := newDisconnectRecorder()
 	fa := &fakeAfter{}
 	cl := NewClient(url, token, ClientConfig{
-		Reconnect:    testReconnectOptions(fa, 0),
-		OnDisconnect: rec.onDisconnect,
+		Reconnect: testReconnectOptions(fa, 0),
+		OnDisconnect: func(r DisconnectReason) {
+			note(fmt.Sprintf("disconnect phase=%s fatal=%v http=%d", r.Phase, r.Fatal, r.HTTPStatus))
+			rec.onDisconnect(r)
+		},
+		OnReconnect: func(i ReconnectInfo) {
+			note(fmt.Sprintf("reconnect %d %v %s", i.Attempt, i.Delay, i.Cause))
+		},
+		OnConnect: func(*Conn, *WelcomeMsg) { note("connect"); connectedOnce() },
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -453,6 +498,70 @@ func TestClient401RefreshRetrySuccess(t *testing.T) {
 	defer cl.Close(context.Background())
 	if got := calls.Load(); got != 2 {
 		t.Errorf("token provider called %d times, want 2 (initial + one refresh retry)", got)
+	}
+	select {
+	case <-connected:
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnConnect never ran")
+	}
+	mu.Lock()
+	got := append([]string(nil), order...)
+	mu.Unlock()
+	want := []string{"disconnect phase=dial fatal=false http=401", "reconnect 1 0s token-refresh", "connect"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("callbacks = %q, want %q", got, want)
+	}
+}
+
+// A Close that lands between the first rejected token and its refresh
+// redial: the rejection is still reported, but no token-refresh reconnect is
+// announced and nothing redials.
+func TestClient401RefreshSkippedWhenClosing(t *testing.T) {
+	url, _ := newFlakyServer(t, []int{401}, testAcceptHandler{})
+	var cl *Client
+	closeDone := make(chan struct{})
+	probeBeforeTokenRefresh = func() {
+		go func() { _ = cl.Close(context.Background()); close(closeDone) }()
+		deadline := time.Now().Add(5 * time.Second)
+		for cl.State() != "closed" && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	t.Cleanup(func() { probeBeforeTokenRefresh = nil })
+	var calls atomic.Int32
+	var mu sync.Mutex
+	var order []string
+	note := func(s string) { mu.Lock(); order = append(order, s); mu.Unlock() }
+	cl = NewClient(url, TokenProvider(func(context.Context) (string, error) { calls.Add(1); return "tok", nil }), ClientConfig{
+		Reconnect:    testReconnectOptions(&fakeAfter{}, 0),
+		OnDisconnect: func(r DisconnectReason) { note(fmt.Sprintf("disconnect phase=%s fatal=%v", r.Phase, r.Fatal)) },
+		OnReconnect:  func(i ReconnectInfo) { note("reconnect " + i.Cause) },
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = cl.Connect(ctx)
+	<-closeDone
+	// Callbacks are delivered on callbackLoop, which may still be running
+	// when Close returns: wait for the disconnect, then for anything after it.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		n := len(order)
+		mu.Unlock()
+		if n > 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond)
+	mu.Lock()
+	got := append([]string(nil), order...)
+	mu.Unlock()
+	if want := []string{"disconnect phase=dial fatal=false"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("callbacks = %q, want %q (no token-refresh reconnect once closing)", got, want)
+	}
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("token provider called %d times, want 1 (no refresh once closing)", n)
 	}
 }
 
@@ -476,6 +585,7 @@ func TestClientSecond401Fatal(t *testing.T) {
 	if err == nil {
 		t.Fatal("Connect should have failed after a second 401")
 	}
+	rec.waitFirstRejection(t, PhaseDial)
 	reason := rec.waitNext(t)
 	if !reason.Fatal {
 		t.Errorf("reason.Fatal = false, want true")
@@ -591,9 +701,9 @@ func TestClientHandshakePhaseBareClose4010Fatal(t *testing.T) {
 // TestClientHandshakePhaseBareClose4011OneRetryThenFatal: a peer that closes
 // 4011 (UNAUTHORIZED) before ever sending welcome joins the same one-time
 // immediate refresh-retry as an HTTP 401 or a *ConnError{UnauthorizedCode}
-// (isUnauthorized) -- the first failure is silent (no report, no backoff,
-// straight to a second attempt with a freshly re-fetched token), and only a
-// second 4011 is fatal. Mirrors TestClientSecond401Fatal exactly, one layer
+// (isUnauthorized) -- the first failure is reported non-fatal (phase
+// handshake, CLIENT-SDK.md's Rejected token row) and redialed at once with a
+// freshly re-fetched token, no backoff, and only a second 4011 is fatal. Mirrors TestClientSecond401Fatal exactly, one layer
 // lower on the wire.
 func TestClientHandshakePhaseBareClose4011OneRetryThenFatal(t *testing.T) {
 	var accepts atomic.Int32
@@ -629,6 +739,7 @@ func TestClientHandshakePhaseBareClose4011OneRetryThenFatal(t *testing.T) {
 		t.Errorf("token provider called %d times, want 2", got)
 	}
 
+	rec.waitFirstRejection(t, PhaseHandshake)
 	r := rec.waitNext(t)
 	if r.Phase != PhaseHandshake {
 		t.Errorf("Phase = %v, want handshake", r.Phase)

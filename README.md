@@ -91,7 +91,9 @@ same fixed token can never start working, so retrying it forever only hammers th
 problem. A real `TokenProvider` still gets WIRE.md section 2.9's one-time immediate refresh-retry on the same
 rejections (call the provider again, redial right away, no backoff) — but that refresh-retry is itself a
 once-only budget now, re-armed only once a connection has stayed up `ReconnectOptions.StableAfter` (below),
-not on every dial attempt.
+not on every dial attempt. That first rejection is reported like any failed dial: a non-fatal `OnDisconnect`
+(`Phase` `dial` with `HTTPStatus` 401, or `handshake` with `WSCode` 4011), then `OnReconnect` with
+`ReconnectTokenRefresh`, then the redial.
 
 A `TokenProvider` error is normally fatal too, surfaced verbatim on `DisconnectReason.Cause` -- but a provider
 that could not OBTAIN a token for a temporary reason (the network is briefly down, the auth server is
@@ -206,6 +208,21 @@ Running the server side yourself (no production policy layer): accept the WebSoc
 `ws-mixer-server`'s `Listener` instead, which adds subprotocol/bearer-token pre-upgrade checks and
 production auth policy on top of `AcceptConn`.
 
+### Migrating to v0.10.0
+
+`Client.Connect` returns nil as soon as the first `welcome` has landed. A fatal close right after it (say a
+4011 a moment later) is no longer `Connect`'s result: it arrives through `OnDisconnect` (`Fatal: true`) and
+ends the client as before. Code that relied on `Connect` returning that error must watch `OnDisconnect`.
+
+With a real `TokenProvider`, the first token rejected before `welcome` is now reported as a non-fatal
+`OnDisconnect` (`Phase` `dial`/`HTTPStatus` 401, or `handshake`/`WSCode` 4011), before the token-refresh
+`OnReconnect` and its redial. A host that counts disconnects, or treats every `OnDisconnect` as "connection
+lost", sees one more report there.
+
+In `mcpwarp`: the single-service helpers `EncodeRegister`/`EncodeUnregister` are unchanged; the list forms are
+the new `EncodeRegisterList`/`EncodeUnregisterList`. A second consecutive `OVERLOADED` now waits 2 s (then 4 s,
+… 30 s) instead of 1 s again, and an `EventDisconnect` now also reports the first rejected provider token.
+
 ### Migrating to v0.9.0
 
 Since v0.9.0 a drained connection outlives its replacement's `welcome`: it keeps serving its streams for up
@@ -270,6 +287,48 @@ plain func), when set, wins over `Token` and is called on every dial; `Configure
 the source in a variable and pass that same value -- a fresh `TokenSourceFunc` per call is a new source, and a
 new one restarts the tunnel.
 
+`NewServiceGroup` publishes several services over one connection (the mcpwarp CLI's case): each
+`ServiceConfig` has its own `Handler` or `Target`, every service has its own state, and a partial failure never
+changes the connection's:
+
+```go
+grp, err := mcpwarp.NewServiceGroup(mcpwarp.ServiceGroupOptions{Integration: id, Logger: slog.Default()})
+grp.Subscribe(func(s mcpwarp.ServiceGroupStatus) {
+	for name, svc := range s.Services { // pending, active, disabled, rejected, taken_over, unregistered
+		text := mcpwarp.DescribeServiceStatus(svc, mcpwarp.DescribeOptions{Locale: "en"})
+		showService(name, text.Label, svc.URL)
+	}
+})
+_ = grp.Configure(ctx, mcpwarp.ServiceGroupConfig{Enabled: true, Token: token, Services: []mcpwarp.ServiceConfig{
+	{Name: "notes", Handler: notesHandler},
+	{Name: "my-files", Target: "http://127.0.0.1:3000/mcp"},
+}})
+_ = grp.AddService(ctx, mcpwarp.ServiceConfig{Name: "calendar", Handler: calHandler}) // no redial
+_ = grp.Disable(ctx, "my-files")                                                        // local: unregistered, 503
+```
+
+A change of `Services` alone is applied on the live connection, diffed by name; a change of `Enabled`, the
+token, `URL` or `WebSocket` restarts it, like a tunnel. `register`/`unregister` frames carry at most
+`MaxServicesPerMessage` (100) names, one frame in flight. A conflict takes over one name only (that service's
+streams are RESET, the rest stay live), and `Enable(name)` is the only way to register a taken-over name again
+short of a restart. The group goes `error`/`INTERNAL` ("No service could be registered.") only when nothing was
+ever registered and every service was refused; a dashboard-disabled service keeps it online.
+
+Requests are routed per stream by the `Host` label, split at its last `-` (`my-files-alice.tunnel.…` →
+`my-files`). `ServiceGroupOptions.TrustServerIDHeader` routes by `X-Mcpwarp-Server-Id` instead; leave it off
+unless your edge sets that header and strips client copies, since otherwise any client can pick the service.
+A request for no configured service gets `503` (`404` off `/mcp`).
+
+A `disabled` service says why in `Code`: `DISABLED` from the dashboard, `""` after a local `Disable`. React to
+dashboard disable/enable by diffing `Subscribe` snapshots per name; a re-enabled service shows `pending`, then
+`active` once its `registered` arrives -- the edge may route to it a moment before that snapshot, and the group
+serves such requests if the service was active earlier on the connection, else answers `503`.
+`ServiceGroupOptions.Metrics` and `(*ServiceGroup).Client()` (the running `wsmixer.Client`, nil while none
+runs) give access to the transport.
+
+`DescribeStatus` takes the group's connection fields (`TunnelStatus{State, Code, LastError}`);
+`DescribeServiceStatus` describes one service, with `DescribeOptions.Messages.Services` overriding labels.
+
 `DescribeStatus(status, DescribeOptions{Locale, Messages})` turns a `TunnelStatus` into `{Label, Detail}` in
 one of `StatusLocales` (en, de, es, fr, ja, zh-CN; unknown locales fall back by language, then to en). Its
 tables are generated from the pinned spec's `spec/fixtures/mcpwarp/status-text/*.json` (`go generate
@@ -279,6 +338,7 @@ The envelope codec and its tables are public too:
 
 ```go
 body := mcpwarp.EncodeRegister("notes", mcpwarp.KindHTTP)  // {"mcpwarp":{"v":1,"op":"register",...}}
+batch := mcpwarp.EncodeRegisterList([]mcpwarp.RegisterEntry{{Name: "notes", Kind: mcpwarp.KindHTTP}, {Name: "files", Kind: mcpwarp.KindStdio}})
 env, err := mcpwarp.DecodeEnvelope(appBody)                // *RegisteredMsg, *DisableMsg, ..., *UnknownMsg;
                                                            // err is a *mcpwarp.Error, Code "MALFORMED_ENVELOPE"
 mcpwarp.IsValidServiceName("notes")                        // ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$, <= 30 chars

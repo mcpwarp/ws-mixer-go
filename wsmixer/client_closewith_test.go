@@ -151,11 +151,12 @@ func TestClientFatalStateExactlyClosed(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	// Connect can itself return the 4011 reason: onAttemptSucceeded starts
-	// watchConn before it resolves Connect's first result, so an immediate
-	// server close can reach goFatal's finishFirstResult first. The fatal
-	// OnDisconnect below is what this test asserts on either way.
-	_ = cl.Connect(ctx)
+	// The welcome landed, so Connect returns nil: onAttemptSucceeded resolves
+	// the first result before watchConn starts, and the immediate 4011 is
+	// reported through OnDisconnect only.
+	if err := cl.Connect(ctx); err != nil {
+		t.Fatalf("Connect = %v, want nil (welcome landed before the fatal close)", err)
+	}
 	defer cl.Close(context.Background())
 
 	var got report
@@ -527,12 +528,13 @@ func TestClientCloseWithFromOnDisconnectSync(t *testing.T) {
 	}})
 	fa := &fakeAfter{}
 	done := make(chan struct{})
+	doneOnce := onceCloser(done)
 	var cl *Client
 	cl = NewClient(url, StaticToken("tok"), ClientConfig{
 		Reconnect: testReconnectOptions(fa, 0),
 		OnDisconnect: func(DisconnectReason) {
 			_ = cl.CloseWith(context.Background(), "bye") // the natural thing a user writes
-			close(done)
+			doneOnce()
 		},
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

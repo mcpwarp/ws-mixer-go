@@ -42,6 +42,10 @@ type tunnelRunner struct {
 	overload int         // expected attempt of the next OVERLOADED re-send
 	snaps    []TunnelStatus
 
+	group      bool        // a group fixture (config.services)
+	sentFrames []sentFrame // a group's register/unregister frames not yet matched by a sent event
+	groupSnaps []ServiceGroupStatus
+
 	providers       map[string]TokenSource // one source per token value (token_provider fixtures)
 	providerResults []string               // results of the next provider calls
 	drainRetryAfter time.Duration          // the last drain's retry_after_ms, for its retry event
@@ -160,6 +164,10 @@ func (tr *fakeTransport) endFatal(reason wsmixer.DisconnectReason) {
 func (tr *fakeTransport) tokenRejected(reason wsmixer.DisconnectReason, httpRefusal bool) bool {
 	if tr.cfg.refreshable && !tr.refreshed {
 		tr.refreshed = true
+		// As wsmixer.Client (CLIENT-SDK.md Rejected token row): the first
+		// rejection is a non-fatal disconnect, then the refresh redial.
+		reason.Fatal = false
+		tr.cfg.events.disconnect(reason)
 		tr.cfg.events.retry(wsmixer.ReconnectInfo{Attempt: 1, Delay: 0, Cause: wsmixer.ReconnectTokenRefresh})
 		tr.attemptDial()
 		return true
@@ -288,11 +296,15 @@ func (d *fakeDial) Done() <-chan struct{} {
 	return nil
 }
 
-func (d *fakeDial) SendApp(_ context.Context, body any) error {
+func (d *fakeDial) SendApp(ctx context.Context, body any) error {
 	if d.ended || d.abandoned || !d.welcomed {
 		return errors.New("fake: connection gone")
 	}
 	b, _ := json.Marshal(body)
+	if d.tr.cfg.group {
+		d.tr.r.groupFrame(ctx, d, b)
+		return nil
+	}
 	if string(b) == string(EncodeUnregister(d.tr.cfg.name)) && !d.held {
 		d.tr.cfg.events.app(d, []byte(fmt.Sprintf(`{"mcpwarp":{"v":1,"op":"unregistered","services":[{"name":%q}]}}`, d.tr.cfg.name)))
 	}
@@ -314,7 +326,8 @@ type tunnelFixture struct {
 	Description string            `json:"description"`
 	Config      map[string]any    `json:"config"`
 	Events      []json.RawMessage `json:"events"`
-	Expect      []TunnelStatus    `json:"expect"`
+	ExpectRaw   json.RawMessage   `json:"expect"`
+	Expect      []TunnelStatus    `json:"-"`
 	ExpectDials *int              `json:"expectDials"`
 	// RunnerRequirement names a runner capability the fixture needs.
 	RunnerRequirement string `json:"runnerRequirement"`
@@ -630,7 +643,11 @@ func (r *tunnelRunner) matchRetry(cause string, delay time.Duration) {
 		case "register":
 			return ri.Delay == delay && strings.HasPrefix(ri.Reason, "register failed: ") && !strings.HasPrefix(ri.Reason, "register failed: OVERLOADED: ")
 		case "overloaded":
-			return ri.Delay == time.Second && strings.HasPrefix(ri.Reason, "register failed: OVERLOADED: ")
+			want := time.Second // always 1000 in a single-service fixture
+			if r.group {
+				want = delay
+			}
+			return ri.Delay == want && strings.HasPrefix(ri.Reason, "register failed: OVERLOADED: ")
 		case "drain":
 			return ri.Attempt == 0 && ri.Reason == "drain" && ri.Delay <= delay && ri.Delay >= r.drainRetryAfter
 		case "token-refresh":
@@ -809,12 +826,22 @@ func TestTunnelFixtures(t *testing.T) {
 		if err := json.Unmarshal(b, &f); err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
+		_, group := f.Config["services"]
+		if !group {
+			if err := json.Unmarshal(f.ExpectRaw, &f.Expect); err != nil {
+				t.Fatalf("%s: expect: %v", name, err)
+			}
+		}
 		t.Run(name, func(t *testing.T) {
 			if why, ok := tunnelFixtureSkips[name]; ok {
 				t.Skip(why)
 			}
 			if req := f.RunnerRequirement; req != "" && !runnerCapabilities[req] {
 				t.Skipf("runnerRequirement %q: this runner cannot meet it", req)
+			}
+			if group {
+				runGroupFixture(t, &f)
+				return
 			}
 			runTunnelFixture(t, &f)
 		})
