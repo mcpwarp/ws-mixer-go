@@ -22,6 +22,7 @@ const (
 type agentConfig struct {
 	url         string // "" → DefaultURL
 	token       wsmixer.TokenProvider
+	refreshable bool // token is a caller's provider (a rejected token gets one refresh), not a static token
 	name        string
 	kind        ServiceKind // "" → KindHTTP
 	integration string      // sent lowercased
@@ -125,6 +126,7 @@ func newAgent(cfg agentConfig) *agent {
 	a.tr = newTransport(transportConfig{
 		url:         cfg.url,
 		token:       cfg.token,
+		refreshable: cfg.refreshable,
 		integration: strings.ToLower(cfg.integration),
 		runtime:     rt,
 		os:          osName,

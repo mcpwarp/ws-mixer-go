@@ -81,6 +81,70 @@ func TestTunnelConfigureIdempotentAndSerialized(t *testing.T) {
 	}
 }
 
+// §6.2 Idempotence: a TokenSource is compared with == and wins over Token,
+// so the same source with a different Token is the same config, and another
+// TokenSourceFunc of the same func is a new one.
+func TestTunnelConfigureProviderByIdentity(t *testing.T) {
+	tok := "t1"
+	f := func(context.Context) (string, error) { return tok, nil }
+	p := TokenSourceFunc(f)
+	r, tun := newFakeTunnel(t, nil)
+	cfg := TunnelConfig{Enabled: true, TokenSource: p, Name: "notes"}
+	r.online(tun, cfg)
+	for _, c := range []TunnelConfig{cfg, {Enabled: true, Token: "ignored", TokenSource: p, Name: "notes"}} {
+		if ch := tun.configureAsync(c); !isClosed(ch) {
+			t.Fatal("an identical configure did not resolve at once")
+		}
+		r.quiesce()
+	}
+	if len(r.dials) != 1 {
+		t.Fatalf("%d dials after identical configures, want 1", len(r.dials))
+	}
+
+	r.ev("disconnect", map[string]any{"fatal": false, "wsCode": 1006.0})
+	tok = "t2"
+	tun.configureAsync(TunnelConfig{Enabled: true, TokenSource: TokenSourceFunc(f), Name: "notes"})
+	r.quiesce()
+	if len(r.dials) != 2 {
+		t.Fatalf("%d dials after a configure with a fresh TokenSourceFunc, want 2", len(r.dials))
+	}
+	if got, _ := r.dials[1].tr.cfg.token(context.Background()); got != "t2" {
+		t.Fatalf("the new dial's token = %q, want t2", got)
+	}
+
+	// A non-comparable source never matches, and comparing it does not panic.
+	r.ev("disconnect", map[string]any{"fatal": false, "wsCode": 1006.0})
+	s := sliceSource{"t3"}
+	for range 2 {
+		tun.configureAsync(TunnelConfig{Enabled: true, TokenSource: s, Name: "notes"})
+		r.quiesce()
+		r.ev("disconnect", map[string]any{"fatal": false, "wsCode": 1006.0})
+	}
+	if len(r.dials) != 4 {
+		t.Fatalf("%d dials after two configures with a non-comparable source, want 4", len(r.dials))
+	}
+
+	// A comparable type holding a func in an interface field: == would panic
+	// on the values, so it never matches either.
+	h := ifaceSource{inner: func() {}}
+	for range 2 {
+		tun.configureAsync(TunnelConfig{Enabled: true, TokenSource: h, Name: "notes"})
+		r.quiesce()
+		r.ev("disconnect", map[string]any{"fatal": false, "wsCode": 1006.0})
+	}
+	if len(r.dials) != 6 {
+		t.Fatalf("%d dials after two configures with a func inside an interface field, want 6", len(r.dials))
+	}
+}
+
+type ifaceSource struct{ inner any }
+
+func (ifaceSource) Token(context.Context) (string, error) { return "t4", nil }
+
+type sliceSource []string
+
+func (s sliceSource) Token(context.Context) (string, error) { return s[0], nil }
+
 func isClosed(ch <-chan struct{}) bool {
 	select {
 	case <-ch:

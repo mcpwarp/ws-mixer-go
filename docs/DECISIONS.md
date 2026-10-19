@@ -977,3 +977,62 @@ links its own spec counterpart explicitly, so read the link, not the number.
   `Target` must be http/https at validation (R3); the drain `onRetry` delay is the real one, including a
   `retry_after_ms` hint (R6). `ExposeOptions.Logger` is passed to `wsmixer.Options.Logger`.
   `version.SDK` → `0.9.0`.
+
+## 2026-10-15
+
+- **D-2026-10-15-01** — v0.9.1: `spec.pin` → `v0.6.3` (implements
+  [`ws-mixer-spec`'s `D-2026-10-14-07`](https://github.com/mcpwarp/ws-mixer-spec/blob/main/docs/DECISIONS.md)
+  and the v0.6.3 rulings; two of them landed here at `v0.6.2`, ahead of their tag).
+  At `v0.6.2` the new envelope defect-order fixtures and `tunnel/37` passed unchanged; `tunnel/36` (an
+  observable HTTP 401/403/404 on the upgrade) failed in the runner, not the SDK: the fake ws-mixer client
+  ignored `dial_failed.httpStatus`. It now injects the disconnect reason tunnel/README.md prescribes,
+  `{phase: dial, fatal, httpStatus}`, fatal for 401/403/404 with the static token, as `wsmixer.Client`
+  decides it (`TestClientStaticToken401Fatal`; 403/404 in `newDialError`).
+  WIRE.md §2.5 (v0.6.3): a WINDOW for a retired stream id is discarded and counted stale whatever its
+  increment, 0 included; increment 0 on a live stream is RESET `PROTOCOL_ERROR`. `DecodeFrame` no longer
+  rejects increment 0 (a behaviour change for direct callers); `handleStreamWindow` checks liveness first,
+  then the increment (`zeroWindowIncrement`). The frame-fixture runner applies that same check to a decoded
+  WINDOW, so `frames/window_increment_zero` (a live-stream verdict) stays green
+  (`TestWindowIncrementZeroStaleVersusLive`); `sequences/window_stale_retired_stream` passes.
+  MCPWARP.md §2.7 (v0.6.3): a `disable` carries an id only, so one with an id the handle does not know is
+  held, not adopted, and applied when a later `registered` on the same connection brings that id: the
+  service goes straight to disabled, with no `registered` event (no tunnel `online`) in between
+  (`tunnel/42`); the connection's end, the next `welcome` or an `enable` drops what is held
+  (`TestSessionDisableWithUnknownIDIsHeld`, `TestSessionHeldDisableDroppedWithItsConnection`,
+  `TestSessionEnableClearsHeldDisable`). The bridging runner reaches `sdkState: disabled` that way;
+  `TestSessionTimersCancelledByDisable` now registers first. §2.7 Ended connection: a `registered`,
+  `disable` or `enable` delivered after its connection ended is ignored; `conflict` and `error` still apply
+  (`tunnel/44`, `TestSessionEndedConnectionMessages`). "Ended" is the connection's own `Done()`, not a flag
+  set by `onConnEnd`: `wsmixer` closes `Done` before reporting the disconnect, but runs the transport's `Done`
+  watcher (`onConnEnd`), `OnDisconnect` and the flushed `OnApp` deliveries on three unordered goroutines. The
+  tunnel fake now ends a connection the same way (Done, disconnect, flush, then `connEnd`). The wsmixer
+  transport also tells the session about a connection before binding its `(*Conn).OnApp`, so a message
+  delivered while `OnConnect` runs takes the unattributed path instead of being dropped as superseded
+  (`TestAgentAppMessageDuringOnConnectNotDropped`). Every unknown `disable` id is held, also after a server
+  id is known, several at once (`TestSessionUnknownDisableHeldAfterIDKnown`); the `registered` that applies
+  one sets no registration (§5.4: `expose()` resolves disabled without one).
+  §4.3: `[` and `]` join the allowed set (WHATWG parity, `a[]=1`; `target_allowed_set`). §4.5: `CONNECT`,
+  `TRACE` and `TRACK` are answered 400 `request cannot be represented as a web Request` before the app is
+  called (`handler_connect_400`), as is a request the HTTP client cannot carry (`target_unrepresentable_400`).
+  §6.2 token provider: new `TunnelConfig.TokenSource`, an interface `Token(ctx) (string, error)`, used instead
+  of `Token` when set, plus `TokenSourceFunc(wsmixer.TokenProvider) TokenSource`, which returns a new pointer
+  on every call. Configure's idempotence compares sources with `==` (a pointer gives identity; `Token` is
+  ignored while either config has a source); a source whose value `==` would panic on (a non-comparable type, or a
+  func/map/slice inside an interface field) never matches, guarded with `reflect.Value.Comparable` instead
+  of panicking. A plain func field was rejected: Go
+  funcs are not comparable, and comparing closure pointers needed `unsafe` and still could not tell a method
+  value's receivers apart. The tunnel hands `source.Token` to `wsmixer.Client` as its `TokenProvider`. A
+  pre-`welcome`
+  401/4011 with the refresh unspent: `wsmixer.Client` calls the provider again and redials at once, reporting
+  `OnReconnect{1, 0, "token-refresh"}`; the tunnel takes that report as the failed dial (T48,
+  connecting/`RETRYING`, `tunnel/38`). `ErrTokenUnavailable` is a failed dial with normal backoff (T46,
+  `tunnel/39`), an unmarked provider error `DISCONNECTED_FATAL` (T47, `tunnel/40`). Open: `wsmixer.Client`
+  emits no `OnDisconnect` for that first rejected token (reporting it breaks the refresh-retry contract its
+  tests pin), so `Expose`'s `EventDisconnect` does not see it.
+  Runners: bridging gained handler `status` and the target-mode `echo` local server; the tunnel fake
+  ws-mixer client gained the provider path (`token_provider` events), drain `retry_after_ms` (as
+  `wsmixer.Client` honours it, `tunnel/41`), `disabled` with an `id`, and post-disconnect delivery
+  (`flush_after`, capability `post-disconnect-delivery`). `body_413_streamed_reset` and `tunnel/07` stay
+  skipped.
+  README: a "Migrating to v0.9.0" note on `DisconnectReason.Superseded` and per-connection `(*Conn).OnApp`.
+  `version.SDK` → `0.9.1`.

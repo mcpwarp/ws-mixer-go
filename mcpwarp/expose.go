@@ -106,6 +106,7 @@ func Expose(ctx context.Context, opts ExposeOptions) (*Handle, error) {
 	h.a = newAgent(agentConfig{
 		url:           opts.URL,
 		token:         token,
+		refreshable:   opts.TokenProvider != nil,
 		name:          opts.Name,
 		kind:          opts.Kind,
 		integration:   opts.Integration,

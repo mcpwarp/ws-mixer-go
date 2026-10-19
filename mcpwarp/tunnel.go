@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -79,17 +80,39 @@ type TunnelOptions struct {
 	schedule     func(func())
 }
 
-// TunnelConfig is what may change at runtime (§6.2). Not Enabled, or a
-// Token that trims to "", is off whatever the rest holds. Token is sent
-// trimmed. WebSocket overrides TunnelOptions.WebSocket; it is compared by
-// identity.
+// TokenSource is a tunnel's token provider (§6.2): Token is called on every
+// dial. A temporary failure wraps wsmixer.ErrTokenUnavailable; any other
+// error is fatal.
+type TokenSource interface {
+	Token(ctx context.Context) (string, error)
+}
+
+// TokenSourceFunc adapts a func to a TokenSource. Every call returns a new
+// source, distinct under ==, so wrap once and keep the result.
+func TokenSourceFunc(f wsmixer.TokenProvider) TokenSource { return &funcSource{f: f} }
+
+type funcSource struct{ f wsmixer.TokenProvider }
+
+func (s *funcSource) Token(ctx context.Context) (string, error) { return s.f(ctx) }
+
+// TunnelConfig is what may change at runtime (§6.2). Not Enabled, or no
+// TokenSource and a Token that trims to "", is off whatever the rest holds.
+// Token is sent trimmed. WebSocket overrides TunnelOptions.WebSocket; it is
+// compared by identity.
 type TunnelConfig struct {
-	Enabled   bool
-	Token     string
-	Name      string
-	URL       string
-	Kind      ServiceKind
-	WebSocket *http.Client
+	Enabled bool
+	Token   string
+	// TokenSource, when set, is used instead of Token and called on every
+	// dial (a rejected token gets one immediate refresh, §6.2). For
+	// Configure's idempotence it is compared with ==, so a pointer gives
+	// identity: keep the source in a variable and pass that; a fresh
+	// TokenSourceFunc per Configure call is a new source and redials. A
+	// source whose type is not comparable never matches.
+	TokenSource TokenSource
+	Name        string
+	URL         string
+	Kind        ServiceKind
+	WebSocket   *http.Client
 }
 
 // Tunnel is the long-lived controller of §6: configure it any number of
@@ -365,7 +388,23 @@ func closedChan() chan struct{} {
 	return ch
 }
 
-func willStart(c *TunnelConfig) bool { return c.Enabled && strings.TrimSpace(c.Token) != "" }
+func willStart(c *TunnelConfig) bool {
+	return c.Enabled && (c.TokenSource != nil || strings.TrimSpace(c.Token) != "")
+}
+
+// sameSource is a == b without its panic: == panics on two values of one
+// non-comparable type, and on a comparable type whose interface field holds
+// a func, map or slice. Value.Comparable checks the values themselves; a
+// source it rejects counts as changed.
+func sameSource(a, b TokenSource) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	if !reflect.ValueOf(a).Comparable() || !reflect.ValueOf(b).Comparable() {
+		return false
+	}
+	return a == b
+}
 
 func (t *Tunnel) effectiveWebSocket(c *TunnelConfig) *http.Client {
 	if c.WebSocket != nil {
@@ -375,8 +414,17 @@ func (t *Tunnel) effectiveWebSocket(c *TunnelConfig) *http.Client {
 }
 
 func (t *Tunnel) sameConfig(a *TunnelConfig, b TunnelConfig) bool {
-	return a != nil && a.Enabled == b.Enabled && strings.TrimSpace(a.Token) == strings.TrimSpace(b.Token) &&
+	return a != nil && a.Enabled == b.Enabled && sameToken(a, &b) &&
 		a.Name == b.Name && a.URL == b.URL && a.Kind == b.Kind && t.effectiveWebSocket(a) == t.effectiveWebSocket(&b)
+}
+
+// sameToken compares the token in use: the sources when either config has
+// one (Token is then ignored), else the trimmed strings.
+func sameToken(a, b *TunnelConfig) bool {
+	if a.TokenSource != nil || b.TokenSource != nil {
+		return sameSource(a.TokenSource, b.TokenSource)
+	}
+	return strings.TrimSpace(a.Token) == strings.TrimSpace(b.Token)
 }
 
 // idleLocked: no apply pending, none waiting, nothing closing.
@@ -544,9 +592,14 @@ func (t *Tunnel) startLocked(cfg *TunnelConfig) {
 		t.failLocked(cfg, err)
 		return
 	}
+	token := wsmixer.StaticToken(strings.TrimSpace(cfg.Token))
+	if cfg.TokenSource != nil {
+		token = cfg.TokenSource.Token
+	}
 	a := newAgent(agentConfig{
 		url:           cfg.URL,
-		token:         wsmixer.StaticToken(strings.TrimSpace(cfg.Token)),
+		token:         token,
+		refreshable:   cfg.TokenSource != nil,
 		name:          cfg.Name,
 		kind:          cfg.Kind,
 		integration:   t.opts.Integration,
@@ -620,6 +673,12 @@ func (t *Tunnel) onAgentEvent(gen int, cfg *TunnelConfig, ev event) {
 		// While online or disabled this is a drain replacement's register; the old connection still serves.
 		if (ev.retryKind == "register" || ev.retryKind == "overloaded") && cur.State == StateConnecting {
 			t.setStatusLocked(problemStatus(StateConnecting, CodeRetrying, lastRetryRegister))
+		}
+		// The token-refresh redial answers a rejected token before welcome,
+		// which is a failed dial (§6.2, T48 as T27-T29 by state); the client
+		// reports no disconnect for that first rejection, only this redial.
+		if ev.retryKind == "token-refresh" && cur.State == StateConnecting && cur.Code != CodeDisconnected {
+			t.setStatusLocked(problemStatus(StateConnecting, CodeRetrying, lastRetryDial))
 		}
 	case evDisconnect:
 		r := ev.disconnect

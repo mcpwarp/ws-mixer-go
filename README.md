@@ -206,6 +206,25 @@ Running the server side yourself (no production policy layer): accept the WebSoc
 `ws-mixer-server`'s `Listener` instead, which adds subprotocol/bearer-token pre-upgrade checks and
 production auth policy on top of `AcceptConn`.
 
+### Migrating to v0.9.0
+
+Since v0.9.0 a drained connection outlives its replacement's `welcome`: it keeps serving its streams for up
+to the drain's `deadline_ms` + 1000 ms. Its end is reported through `OnDisconnect` with
+`DisconnectReason.Superseded == true`, after (or around) the replacement's `OnConnect`. A host that maps every
+`OnDisconnect` to a "disconnected" state must ignore `Superseded` reports for its connection state.
+
+`ClientConfig.OnApp` is bound per `Client`, so `app` messages from the retiring connection keep arriving
+through it during that window. A host that needs per-connection delivery binds `(*Conn).OnApp` inside
+`OnConnect(conn, welcome)`, which replaces the handler on that one connection only (as the `mcpwarp`
+package does); messages that arrive before `OnConnect` runs still go to `ClientConfig.OnApp`.
+
+Binding per connection is not enough when the host funnels every connection into one shared handler: the
+retiring connection keeps the handler it was given at its own `OnConnect`. The host must also check each
+message's connection against the newest one -- the connection it bound last, and `Client.Conn()` either nil
+or that same connection -- and drop the rest, as `mcpwarp`'s session does. Store that "current connection"
+marker before calling `conn.OnApp`: a connection's messages are delivered on its own goroutine, so one
+arriving between the bind and a later store is checked against the old marker and dropped.
+
 ## mcpwarp layer
 
 Package `mcpwarp` (`github.com/mcpwarp/ws-mixer-go/mcpwarp`) is the
@@ -245,6 +264,11 @@ unsubscribe := tun.Subscribe(func(s mcpwarp.TunnelStatus) {
 })
 _ = tun.Configure(ctx, mcpwarp.TunnelConfig{Enabled: true, Token: token, Name: "notes"})
 ```
+
+`TunnelConfig.TokenSource` (an interface with `Token(ctx) (string, error)`; `mcpwarp.TokenSourceFunc(f)` wraps a
+plain func), when set, wins over `Token` and is called on every dial; `Configure` compares it with `==`, so keep
+the source in a variable and pass that same value -- a fresh `TokenSourceFunc` per call is a new source, and a
+new one restarts the tunnel.
 
 `DescribeStatus(status, DescribeOptions{Locale, Messages})` turns a `TunnelStatus` into `{Label, Detail}` in
 one of `StatusLocales` (en, de, es, fr, ja, zh-CN; unknown locales fall back by language, then to en). Its

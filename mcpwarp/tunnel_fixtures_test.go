@@ -41,6 +41,36 @@ type tunnelRunner struct {
 	retries  []RetryInfo // onRetry calls not yet matched by a retry event
 	overload int         // expected attempt of the next OVERLOADED re-send
 	snaps    []TunnelStatus
+
+	providers       map[string]TokenSource // one source per token value (token_provider fixtures)
+	providerResults []string               // results of the next provider calls
+	drainRetryAfter time.Duration          // the last drain's retry_after_ms, for its retry event
+}
+
+// providerFor is the source for one token value, the same one on every call
+// so an unchanged configure stays idempotent (§6.2).
+func (r *tunnelRunner) providerFor(token string) TokenSource {
+	if p, ok := r.providers[token]; ok {
+		return p
+	}
+	p := TokenSourceFunc(func(context.Context) (string, error) {
+		result := "ok"
+		if len(r.providerResults) > 0 {
+			result, r.providerResults = r.providerResults[0], r.providerResults[1:]
+		}
+		switch result {
+		case "unavailable":
+			return "", fmt.Errorf("fixture provider: %w", wsmixer.ErrTokenUnavailable)
+		case "error":
+			return "", errors.New("fixture provider failed")
+		}
+		return token, nil
+	})
+	if r.providers == nil {
+		r.providers = map[string]TokenSource{}
+	}
+	r.providers[token] = p
+	return p
 }
 
 func (r *tunnelRunner) quiesce() {
@@ -69,6 +99,7 @@ type fakeTransport struct {
 	conns      []*fakeDial
 	attempt    int
 	serverID   string
+	refreshed  bool // the one token-refresh redial was spent
 }
 
 type fakeDial struct {
@@ -77,14 +108,69 @@ type fakeDial struct {
 	upgraded, welcomed bool
 	ended, abandoned   bool
 	held, drained      bool
+	flushing           bool // delivering flush_after ops after its end
 }
 
 func (r *tunnelRunner) newTransport(cfg transportConfig) transport {
 	return &fakeTransport{r: r, cfg: cfg}
 }
 
-func (tr *fakeTransport) start()                  { tr.dial() }
+func (tr *fakeTransport) start()                  { tr.attemptDial() }
 func (tr *fakeTransport) client() *wsmixer.Client { return nil }
+
+// attemptDial is one dial attempt: the token provider is called first; a
+// failed call ends the attempt before the socket factory (no dial counted),
+// a marked-temporary one as a failed dial with backoff, any other fatally
+// (CLIENT-SDK.md's Provider failure row, as wsmixer.Client decides it).
+func (tr *fakeTransport) attemptDial() {
+	if _, err := tr.cfg.token(context.Background()); err != nil {
+		if errors.Is(err, wsmixer.ErrTokenUnavailable) {
+			tr.cfg.events.disconnect(wsmixer.DisconnectReason{Phase: wsmixer.PhaseDial, Message: err.Error(), Cause: err})
+			tr.backoff(err.Error())
+			return
+		}
+		tr.endFatal(wsmixer.DisconnectReason{Phase: wsmixer.PhaseDial, Fatal: true, Message: err.Error(), Cause: err})
+		return
+	}
+	tr.dial()
+}
+
+// endFatal ends the transport with a fatal disconnect.
+func (tr *fakeTransport) endFatal(reason wsmixer.DisconnectReason) {
+	tr.closed = true
+	tr.stopRedial()
+	for _, o := range tr.live() {
+		o.ended = true
+	}
+	tr.ended = true
+	tr.cfg.events.disconnect(reason)
+	dones := tr.dones
+	tr.dones = nil
+	for _, f := range dones {
+		f()
+	}
+}
+
+// tokenRejected answers a rejected token before welcome (an upgrade 401 or
+// a close 4011): with a provider and the refresh unspent, the provider is
+// called again and the dial retried at once -- wsmixer.Client reports no
+// disconnect for that first rejection, only the token-refresh redial;
+// otherwise it is fatal. false: not handled here (a static token's 4011,
+// whose verdict the fixture states).
+func (tr *fakeTransport) tokenRejected(reason wsmixer.DisconnectReason, httpRefusal bool) bool {
+	if tr.cfg.refreshable && !tr.refreshed {
+		tr.refreshed = true
+		tr.cfg.events.retry(wsmixer.ReconnectInfo{Attempt: 1, Delay: 0, Cause: wsmixer.ReconnectTokenRefresh})
+		tr.attemptDial()
+		return true
+	}
+	if tr.cfg.refreshable || httpRefusal {
+		reason.Fatal = true
+		tr.endFatal(reason)
+		return true
+	}
+	return false
+}
 
 func (tr *fakeTransport) active() appConn {
 	if tr.activeC != nil && !tr.activeC.ended {
@@ -108,7 +194,7 @@ func (tr *fakeTransport) scheduleRedial(cause string, delay time.Duration, attem
 	tr.redialStop = tr.r.clock.after(delay, func() {
 		tr.redialStop = nil
 		if !tr.closed {
-			tr.dial()
+			tr.attemptDial()
 		}
 	})
 }
@@ -195,6 +281,13 @@ func (tr *fakeTransport) checkEnded() {
 	}
 }
 
+func (d *fakeDial) Done() <-chan struct{} {
+	if d.ended {
+		return closedChan()
+	}
+	return nil
+}
+
 func (d *fakeDial) SendApp(_ context.Context, body any) error {
 	if d.ended || d.abandoned || !d.welcomed {
 		return errors.New("fake: connection gone")
@@ -223,6 +316,24 @@ type tunnelFixture struct {
 	Events      []json.RawMessage `json:"events"`
 	Expect      []TunnelStatus    `json:"expect"`
 	ExpectDials *int              `json:"expectDials"`
+	// RunnerRequirement names a runner capability the fixture needs.
+	RunnerRequirement string `json:"runnerRequirement"`
+}
+
+// runnerCapabilities are the tunnel/README.md runner requirements this
+// runner meets: its fake client delivers flush_after ops after the
+// disconnect notification.
+var runnerCapabilities = map[string]bool{"post-disconnect-delivery": true}
+
+// usesTokenProvider: a fixture with a token_provider event passes every
+// config's token as a provider (tunnel/README.md).
+func (f *tunnelFixture) usesTokenProvider() bool {
+	for _, ev := range f.Events {
+		if strings.Contains(string(ev), `"token_provider"`) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *TunnelStatus) UnmarshalJSON(b []byte) error {
@@ -253,7 +364,8 @@ func (r *tunnelRunner) dialOf(p map[string]any) *fakeDial {
 }
 
 func (r *tunnelRunner) appTo(d *fakeDial, env map[string]any) {
-	if d.ended || d.abandoned || !d.welcomed {
+	// An ended connection delivers only the flush_after ops received before its end.
+	if (d.ended && !d.flushing) || d.abandoned || !d.welcomed {
 		return
 	}
 	env["v"] = 1
@@ -286,8 +398,25 @@ func (r *tunnelRunner) connEvent(name string, p map[string]any) {
 			return
 		}
 		d.ended, tr.pending = true, nil
-		tr.cfg.events.disconnect(wsmixer.DisconnectReason{Phase: wsmixer.PhaseDial, Message: "dial failed"})
-		tr.backoff("dial failed")
+		reason := wsmixer.DisconnectReason{Phase: wsmixer.PhaseDial, Message: "dial failed"}
+		// An observable refused upgrade: the verdict WIRE.md §2.9 gives with
+		// the fixtures' static token (tunnel/README.md), as wsmixer.Client
+		// reaches it (TestClientStaticToken401Fatal; 403/404 in newDialError).
+		if status, ok := p["httpStatus"].(float64); ok {
+			reason.HTTPStatus = int(status)
+			reason.Message = fmt.Sprintf("upgrade refused: HTTP %d", int(status))
+			switch int(status) {
+			case http.StatusUnauthorized:
+				tr.tokenRejected(reason, true)
+				return
+			case http.StatusForbidden, http.StatusNotFound:
+				reason.Fatal = true
+				tr.endFatal(reason)
+				return
+			}
+		}
+		tr.cfg.events.disconnect(reason)
+		tr.backoff(reason.Message)
 	case "welcome":
 		if d.abandoned || tr.closed || !d.upgraded {
 			return
@@ -328,7 +457,11 @@ func (r *tunnelRunner) connEvent(name string, p map[string]any) {
 		}
 		r.appTo(d, e)
 	case "disabled":
-		e := map[string]any{"op": "disable", "id": d.serverID()}
+		id, ok := strField(p, "id") // possibly one the agent does not know (yet)
+		if !ok {
+			id = d.serverID()
+		}
+		e := map[string]any{"op": "disable", "id": id}
 		if m, ok := strField(p, "reason"); ok {
 			e["reason"] = m
 		}
@@ -356,7 +489,14 @@ func (r *tunnelRunner) connEvent(name string, p map[string]any) {
 			return
 		}
 		d.drained = true
-		tr.scheduleRedial(wsmixer.ReconnectDrain, fakeDrainDelay, 0)
+		delay := fakeDrainDelay
+		r.drainRetryAfter = 0
+		if ms, ok := p["retry_after_ms"].(float64); ok {
+			// wsmixer.Client waits the hint itself (no jitter on top).
+			delay = time.Duration(ms) * time.Millisecond
+			r.drainRetryAfter = delay
+		}
+		tr.scheduleRedial(wsmixer.ReconnectDrain, delay, 0)
 	case "disconnect":
 		r.disconnect(d, p)
 	default:
@@ -385,9 +525,16 @@ func (r *tunnelRunner) disconnect(d *fakeDial, p map[string]any) {
 			tr.pending = nil
 		}
 	} else {
-		tr.cfg.events.connEnd(d)
+		// As in wsmixer.Client, Done (d.ended) closes first; the disconnect
+		// report, the flushed deliveries and the Done watcher's connEnd are
+		// mutually unordered there. connEnd runs last here, after the flush
+		// (defers run in reverse).
+		defer tr.cfg.events.connEnd(d)
 	}
+	defer r.flushAfter(d, p)
 	switch {
+	case !d.welcomed && !tr.closed && reason.WSCode == 4011 && tr.tokenRejected(reason, false):
+		// a provider's rejected token: refreshed (or, the second time, fatal)
 	case tr.closed:
 		reason.Fatal = false
 		tr.cfg.events.disconnect(reason)
@@ -418,6 +565,25 @@ func (r *tunnelRunner) disconnect(d *fakeDial, p map[string]any) {
 			cause = "handshake failed"
 		}
 		tr.backoff(cause)
+	}
+}
+
+// flushAfter delivers a disconnect's flush_after ops: received on d before
+// it ended, delivered to the layer after the disconnect notification
+// (tunnel/README.md, runnerRequirement post-disconnect-delivery).
+func (r *tunnelRunner) flushAfter(d *fakeDial, p map[string]any) {
+	list, _ := p["flush_after"].([]any)
+	for _, item := range list {
+		for name, payload := range item.(map[string]any) {
+			m, _ := payload.(map[string]any)
+			if m == nil {
+				m = map[string]any{}
+			}
+			m["conn"] = float64(d.ordinal)
+			d.flushing = true
+			r.connEvent(name, m)
+			d.flushing = false
+		}
 	}
 }
 
@@ -466,9 +632,11 @@ func (r *tunnelRunner) matchRetry(cause string, delay time.Duration) {
 		case "overloaded":
 			return ri.Delay == time.Second && strings.HasPrefix(ri.Reason, "register failed: OVERLOADED: ")
 		case "drain":
-			return ri.Attempt == 0 && ri.Reason == "drain" && ri.Delay <= delay
+			return ri.Attempt == 0 && ri.Reason == "drain" && ri.Delay <= delay && ri.Delay >= r.drainRetryAfter
+		case "token-refresh":
+			return ri == RetryInfo{Attempt: 1, Delay: 0, Reason: "token-refresh"}
 		case "dial", "lost":
-			return ri.Delay <= delay && ri.Reason != "drain" && !strings.HasPrefix(ri.Reason, "register failed")
+			return ri.Delay <= delay && ri.Reason != "drain" && ri.Reason != "token-refresh" && !strings.HasPrefix(ri.Reason, "register failed")
 		}
 		r.t.Fatalf("unknown retry cause %q", cause)
 		return false
@@ -539,7 +707,14 @@ func runTunnelFixture(t *testing.T, f *tunnelFixture) {
 		_ = json.Unmarshal(raw, &p)
 		switch name {
 		case "configure":
-			pending = append(pending, tun.configureAsync(r.mergedConfig(f.Config, p)))
+			c := r.mergedConfig(f.Config, p)
+			if f.usesTokenProvider() && c.Token != "" {
+				c.TokenSource, c.Token = r.providerFor(c.Token), ""
+			}
+			pending = append(pending, tun.configureAsync(c))
+		case "token_provider":
+			result, _ := p["result"].(string)
+			r.providerResults = append(r.providerResults, result)
 		case "stop":
 			pending = append(pending, tun.stopAsync())
 		case "dispose":
@@ -637,6 +812,9 @@ func TestTunnelFixtures(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			if why, ok := tunnelFixtureSkips[name]; ok {
 				t.Skip(why)
+			}
+			if req := f.RunnerRequirement; req != "" && !runnerCapabilities[req] {
+				t.Skipf("runnerRequirement %q: this runner cannot meet it", req)
 			}
 			runTunnelFixture(t, &f)
 		})

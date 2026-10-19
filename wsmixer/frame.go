@@ -65,6 +65,14 @@ type Frame struct {
 	Payload  []byte
 }
 
+// zeroWindowIncrement is the stream-scoped error for a WINDOW increment of
+// 0 on a live stream (legal range 1..2^31-1). A WINDOW for a retired stream
+// is discarded as stale whatever its increment, so dispatch checks liveness
+// first (WIRE.md §2.5).
+func zeroWindowIncrement(streamID uint32) *StreamError {
+	return newStreamErrorf(streamID, ProtocolErrorCode, "WINDOW increment of 0 is not legal (range is 1..2^31-1)")
+}
+
 // DecodeFrame parses one WebSocket message into a Frame per WIRE.md
 // §2.2-2.4. The returned error is either a *ConnError (connection-fatal)
 // or a *StreamError (scoped to Frame.StreamID); both are safe to inspect even
@@ -117,10 +125,10 @@ func DecodeFrame(msg []byte) (*Frame, error) {
 		if len(payload) != 4 {
 			return nil, newConnErrorf(FrameSizeError, "WINDOW payload is %d bytes, must be exactly 4", len(payload))
 		}
+		// An increment of 0 is not rejected here: whether it is an error
+		// depends on the stream being live (WIRE.md §2.5), which only
+		// dispatch knows -- see zeroWindowIncrement.
 		increment := binary.BigEndian.Uint32(payload)
-		if increment == 0 {
-			return nil, newStreamErrorf(streamID, ProtocolErrorCode, "WINDOW increment of 0 is not legal (range is 1..2^31-1)")
-		}
 		if increment&streamIDHighBit != 0 {
 			return nil, newConnErrorf(FlowControlError, "WINDOW increment %d would push the send window past 2^31-1", increment)
 		}

@@ -222,8 +222,11 @@ func (c *Conn) handleStreamWindow(id uint32, inc uint32) bool {
 		return true
 	}
 	if st == nil {
-		c.discardStale(id, "WINDOW")
+		c.discardStale(id, "WINDOW") // a retired stream: stale whatever the increment, 0 included
 		return false
+	}
+	if inc == 0 {
+		return c.handleStreamErr(id, zeroWindowIncrement(id))
 	}
 	if err := st.handleWindow(inc); err != nil {
 		return c.handleStreamErr(id, err)

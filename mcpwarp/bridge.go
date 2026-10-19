@@ -159,6 +159,12 @@ const unrepresentable = "request cannot be represented as a web Request"
 // https://<Host><target> URL, and every forwarded header value, Host
 // included, must be one Go's HTTP client accepts. It returns that target.
 func representable(head *requestHead) (string, bool) {
+	// §4.5: CONNECT, TRACE and TRACK are refused in both modes, so every
+	// runtime agrees (a web Request cannot carry them).
+	switch strings.ToUpper(head.method) {
+	case "CONNECT", "TRACE", "TRACK":
+		return "", false
+	}
 	target := escapeOnce(head.target)
 	if _, err := url.Parse("https://" + head.host + target); err != nil {
 		return "", false
@@ -207,14 +213,14 @@ func escapeOnce(s string) string {
 	return b.String()
 }
 
-// urlByte: RFC 3986 unreserved, sub-delims, and ":@/?" -- what a path and
-// query may carry unencoded.
+// urlByte is §4.3's allowed set, passed through unescaped: RFC 3986
+// unreserved, sub-delims, ":@/?", and "[]" (WHATWG parity, a[]=1 queries).
 func urlByte(c byte) bool {
 	switch {
 	case 'a' <= c && c <= 'z', 'A' <= c && c <= 'Z', '0' <= c && c <= '9':
 		return true
 	}
-	return strings.IndexByte("-._~!$&'()*+,;=:@/?", c) >= 0
+	return strings.IndexByte("-._~!$&'()*+,;=:@/?[]", c) >= 0
 }
 
 // refuse writes an SDK-generated reply, drains whatever request bytes are

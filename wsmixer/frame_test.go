@@ -58,6 +58,12 @@ func TestFrameFixtures(t *testing.T) {
 				t.Fatalf("bad fixture hex: %v", err)
 			}
 			frame, err := DecodeFrame(raw)
+			// A WINDOW increment of 0 is a frame-level verdict the fixtures
+			// state for a live stream; it is checked at dispatch, after
+			// liveness (WIRE.md §2.5), so apply that same check here.
+			if err == nil && frame.Type == FrameWindow && frame.WindowIncrement() == 0 {
+				err = zeroWindowIncrement(frame.StreamID)
+			}
 
 			if f.Valid {
 				if err != nil {

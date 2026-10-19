@@ -263,6 +263,49 @@ func TestAgentCloseUnregisters(t *testing.T) {
 }
 
 // §2.5: a refusal before the first registration ends the agent.
+// An app message right after welcome, delivered while OnConnect is still
+// running, reaches the session: the transport tells the session about the
+// connection before binding its per-connection handler, so a message in that
+// window takes the unattributed path instead of being dropped as superseded.
+// The real wsmixer transport, with the window widened: the session learns of
+// the connection only once the first app message has been delivered.
+func TestAgentAppMessageDuringOnConnectNotDropped(t *testing.T) {
+	edge := newFakeEdge(t)
+	appSeen := make(chan struct{}, 1)
+	a, _ := newTestAgent(t, edge.url, func(c *agentConfig) {
+		c.newTransport = func(cfg transportConfig) transport {
+			connect, app := cfg.events.connect, cfg.events.app
+			cfg.events.app = func(c appConn, body []byte) {
+				app(c, body)
+				select {
+				case appSeen <- struct{}{}:
+				default:
+				}
+			}
+			cfg.events.connect = func(c appConn) {
+				select {
+				case <-appSeen:
+				case <-time.After(3 * time.Second):
+				}
+				connect(c)
+			}
+			return newWSTransport(cfg)
+		}
+	})
+	a.start()
+	ec := edge.nextConn(t)
+	ec.send(t, `{"mcpwarp":{"v":1,"op":"error","code":"UNSUPPORTED_VERSION","message":"unsupported version 2"}}`)
+	select {
+	case <-a.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the error right after welcome was dropped: the agent did not end")
+	}
+	var e *Error
+	if !errors.As(a.err, &e) || e.Code != "UNSUPPORTED_VERSION" || !e.Fatal {
+		t.Fatalf("agent ended with %#v", a.err)
+	}
+}
+
 func TestAgentRefusalBeforeFirstRegistrationIsFatal(t *testing.T) {
 	edge := newFakeEdge(t)
 	a, _ := newTestAgent(t, edge.url, nil)

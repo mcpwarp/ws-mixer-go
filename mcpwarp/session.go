@@ -62,6 +62,17 @@ const (
 // (interface equality) is what tells one connection from another.
 type appConn interface {
 	SendApp(ctx context.Context, body any) error
+	// Done is closed once the connection has ended (wsmixer.Conn.Done).
+	Done() <-chan struct{}
+}
+
+func connEnded(c appConn) bool {
+	select {
+	case <-c.Done():
+		return true
+	default:
+		return false
+	}
 }
 
 // afterFunc schedules f after d and returns its stop function
@@ -156,6 +167,7 @@ type session struct {
 	registration *Registration
 	everRegister bool
 	takenOver    bool
+	heldDisables map[string]*DisableMsg // this connection's disables for ids not known, by id
 
 	conn             appConn // the latest welcomed connection
 	connected        bool
@@ -258,6 +270,7 @@ func (s *session) onWelcome(c appConn) {
 	s.connected = true
 	s.sentRegisterConn = false
 	s.outstanding = opNone
+	s.heldDisables = nil // a held disable belongs to the connection it arrived on
 	s.cancelTimersLocked()
 	if s.takenOver {
 		return
@@ -279,6 +292,7 @@ func (s *session) onConnEnd(c appConn) {
 	s.connected = false
 	s.sentRegisterConn = false
 	s.outstanding = opNone
+	s.heldDisables = nil
 	s.cancelTimersLocked()
 	if !s.takenOver {
 		s.setStateLocked(stateConnecting)
@@ -300,6 +314,18 @@ func (s *session) onApp(c appConn, body []byte) {
 		s.emitLocked(event{kind: evError, err: err, origin: originMalformed})
 		return
 	}
+	// §2.7 Ended connection: registered, disable and enable delivered after
+	// their connection ended (queued messages flushed after the close) are
+	// ignored; conflict and error still apply. Decided by the connection's
+	// own Done: onConnEnd runs on a Done watcher, unordered against the
+	// disconnect report and those flushed deliveries.
+	ended := c != nil && connEnded(c)
+	switch env.(type) {
+	case *RegisteredMsg, *DisableMsg, *EnableMsg:
+		if ended {
+			return
+		}
+	}
 	switch m := env.(type) {
 	case *RegisteredMsg:
 		s.onRegisteredLocked(m)
@@ -320,17 +346,25 @@ func (s *session) onApp(c appConn, body []byte) {
 		if s.endingLocked() || s.takenOver {
 			return
 		}
-		if !s.hasServerID || m.ID == s.serverID {
-			s.serverID, s.hasServerID = m.ID, true
-			s.cancelTimersLocked()
-			s.setStateLocked(stateDisabled)
-			s.emitLocked(event{kind: evDisabled, serverID: m.ID, reason: m.Reason})
+		if s.hasServerID && m.ID == s.serverID {
+			s.disableLocked(m)
+			return
 		}
+		// A disable carries an id only, no name, and the edge fans it out to
+		// every connection of the owner: an unknown id, before or after a
+		// server id is known, may be another service's. Hold it until a
+		// registered brings that id (v0.6.3 §2.7).
+		held := *m
+		if s.heldDisables == nil {
+			s.heldDisables = map[string]*DisableMsg{}
+		}
+		s.heldDisables[m.ID] = &held
 	case *EnableMsg:
 		if s.endingLocked() || s.takenOver || m.Name != s.deps.name {
 			return
 		}
 		s.serverID, s.hasServerID = m.ID, true
+		s.heldDisables = nil // the enable came last
 		s.emitLocked(event{kind: evEnabled, serverID: m.ID})
 		s.setStateLocked(stateRegistering)
 		if s.connected {
@@ -347,6 +381,13 @@ func (s *session) onApp(c appConn, body []byte) {
 	case *ErrorMsg:
 		s.onAppErrorLocked(m)
 	}
+}
+
+// disableLocked applies a matching disable: state disabled, timers stopped.
+func (s *session) disableLocked(m *DisableMsg) {
+	s.cancelTimersLocked()
+	s.setStateLocked(stateDisabled)
+	s.emitLocked(event{kind: evDisabled, serverID: m.ID, reason: m.Reason})
 }
 
 // onReplaced handles a ws-mixer drain with reason "replaced" (§3.3): a
@@ -379,9 +420,18 @@ func (s *session) onRegisteredLocked(m *RegisteredMsg) {
 		s.cancelTimersLocked()
 		s.url = svc.URL
 		s.serverID, s.hasServerID = svc.ID, true
+		s.everRegister = true
+		held := s.heldDisables[svc.ID]
+		delete(s.heldDisables, svc.ID)
+		if held != nil {
+			// The held disable applies: disabled directly, never registered
+			// in between (tunnel/42_disable_unknown_id_held), so no
+			// registration either (§5.4).
+			s.disableLocked(held)
+			return
+		}
 		reg := Registration{URL: svc.URL, ServerID: svc.ID, Created: svc.Created}
 		s.registration = &reg
-		s.everRegister = true
 		s.setStateLocked(stateRegistered)
 		s.emitLocked(event{kind: evRegistered, registration: reg})
 		return

@@ -26,6 +26,7 @@ type transportEvents struct {
 type transportConfig struct {
 	url         string
 	token       wsmixer.TokenProvider
+	refreshable bool   // token is a caller's provider; wsmixer.Client tells that apart itself, fakes use this
 	integration string // lowercased
 	runtime, os string
 	options     wsmixer.Options
@@ -76,8 +77,11 @@ func newWSTransport(cfg transportConfig) transport {
 		HTTPClient: cfg.httpClient,
 		Reconnect:  cfg.reconnect,
 		OnConnect: func(c *wsmixer.Conn, _ *wsmixer.WelcomeMsg) {
-			c.OnApp(func(body json.RawMessage) { ev.app(c, body) })
+			// connect first: a message bound to c before the session knows c
+			// would be dropped as superseded; until the bind, c's messages
+			// take the unattributed path below.
 			ev.connect(c)
+			c.OnApp(func(body json.RawMessage) { ev.app(c, body) })
 			go func() {
 				<-c.Done()
 				ev.connEnd(c)

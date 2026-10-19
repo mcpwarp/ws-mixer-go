@@ -67,9 +67,26 @@ func (c *fakeClock) advance(d time.Duration) {
 
 // fakeConn records what the session sends on it.
 type fakeConn struct {
-	mu   sync.Mutex
-	sent []string
-	err  error
+	mu    sync.Mutex
+	sent  []string
+	err   error
+	ended bool
+}
+
+func (c *fakeConn) Done() <-chan struct{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.ended {
+		return closedChan()
+	}
+	return nil
+}
+
+// end closes Done, as wsmixer.Conn does before its end is reported.
+func (c *fakeConn) end() {
+	c.mu.Lock()
+	c.ended = true
+	c.mu.Unlock()
 }
 
 func (c *fakeConn) SendApp(_ context.Context, body any) error {
@@ -311,10 +328,15 @@ func TestSessionTimersCancelledByDisable(t *testing.T) {
 		`{"mcpwarp":{"v":1,"op":"disable","id":"srv_anki"}}`,
 		`{"mcpwarp":{"v":1,"op":"registered","errors":[{"name":"anki","code":"SERVER_DISABLED","id":"srv_anki"}]}}`,
 	} {
+		// A disable op matches a known server id only: register first, then
+		// re-register through enable to put a timer in flight.
+		const enable = `{"mcpwarp":{"v":1,"op":"enable","id":"srv_anki","name":"anki"}}`
 		h := newSessionHarness(t)
 		c := &fakeConn{}
 		h.s.onWelcome(c)
-		h.wantSent(c, registerAnki)
+		h.app(c, registeredAnki)
+		h.app(c, enable)
+		h.wantSent(c, registerAnki, registerAnki)
 		h.app(c, transientAnki) // 1 s retry pending
 		h.app(c, disable)
 		h.clock.advance(time.Minute)
@@ -323,7 +345,9 @@ func TestSessionTimersCancelledByDisable(t *testing.T) {
 		h2 := newSessionHarness(t)
 		c2 := &fakeConn{}
 		h2.s.onWelcome(c2)
-		h2.wantSent(c2, registerAnki)
+		h2.app(c2, registeredAnki)
+		h2.app(c2, enable)
+		h2.wantSent(c2, registerAnki, registerAnki)
 		h2.app(c2, `{"mcpwarp":{"v":1,"op":"error","code":"OVERLOADED"}}`)
 		h2.app(c2, disable)
 		h2.clock.advance(time.Minute)
@@ -334,9 +358,144 @@ func TestSessionTimersCancelledByDisable(t *testing.T) {
 	}
 }
 
+// v0.6.3 §2.7: a disable whose id is not known yet is held, and applied only
+// when a later registered brings that id.
+func TestSessionDisableWithUnknownIDIsHeld(t *testing.T) {
+	const disable = `{"mcpwarp":{"v":1,"op":"disable","id":"srv_anki","reason":"disabled"}}`
+	h := newSessionHarness(t)
+	c := &fakeConn{}
+	h.s.onWelcome(c)
+	h.app(c, disable)
+	if st := h.s.currentState(); st != stateRegistering || len(h.log.of(evDisabled)) != 0 {
+		t.Fatalf("an unknown-id disable was adopted: state %s", st)
+	}
+	if _, _, known, _ := h.s.snapshot(); known {
+		t.Fatal("an unknown-id disable set the server id")
+	}
+	h.app(c, registeredAnki) // brings srv_anki
+	if st := h.s.currentState(); st != stateDisabled || len(h.log.of(evDisabled)) != 1 {
+		t.Fatalf("after registered with the held id: state %s, %d disabled events", st, len(h.log.of(evDisabled)))
+	}
+	if n := len(h.log.of(evRegistered)); n != 0 {
+		t.Fatalf("%d registered events before the held disable, want 0 (disabled directly)", n)
+	}
+	// §5.4: expose() resolves disabled with no registration.
+	if u, id, known, reg := h.s.snapshot(); reg != nil || !known || id != "srv_anki" || u == "" {
+		t.Fatalf("after the held disable: url %q, id %q (known %v), registration %+v; want url and id, no registration", u, id, known, reg)
+	}
+
+	h2 := newSessionHarness(t)
+	c2 := &fakeConn{}
+	h2.s.onWelcome(c2)
+	h2.app(c2, disable)
+	h2.app(c2, `{"mcpwarp":{"v":1,"op":"registered","services":[{"name":"anki","id":"srv_other","url":"https://anki-tester.mcpwarp.test/mcp"}]}}`)
+	if st := h2.s.currentState(); st != stateRegistered || len(h2.log.of(evDisabled)) != 0 {
+		t.Fatalf("after registered with a different id: state %s, want registered", st)
+	}
+}
+
+// §2.7 Unknown disable id: held whatever the handle knows, an id already
+// known included, and several at once (the edge fans every disable of the
+// owner out); a later registered that brings one of them applies it.
+func TestSessionUnknownDisableHeldAfterIDKnown(t *testing.T) {
+	h := newSessionHarness(t)
+	c := &fakeConn{}
+	h.s.onWelcome(c)
+	h.app(c, registeredAnki)
+	h.app(c, `{"mcpwarp":{"v":1,"op":"disable","id":"srv_new"}}`)
+	h.app(c, `{"mcpwarp":{"v":1,"op":"disable","id":"srv_foreign"}}`)
+	if st := h.s.currentState(); st != stateRegistered || len(h.log.of(evDisabled)) != 0 {
+		t.Fatalf("an unknown-id disable applied: state %s", st)
+	}
+	h.app(c, `{"mcpwarp":{"v":1,"op":"registered","services":[{"name":"anki","id":"srv_new","url":"https://anki-tester.mcpwarp.test/mcp"}]}}`)
+	if st := h.s.currentState(); st != stateDisabled || len(h.log.of(evDisabled)) != 1 {
+		t.Fatalf("after registered with a held id: state %s, %d disabled events", st, len(h.log.of(evDisabled)))
+	}
+}
+
+// A held disable belongs to the connection it arrived on: a reconnect (its
+// end, the next welcome) drops it, so the next connection's registered does
+// not apply it.
+func TestSessionHeldDisableDroppedWithItsConnection(t *testing.T) {
+	h := newSessionHarness(t)
+	c1 := &fakeConn{}
+	h.s.onWelcome(c1)
+	h.app(c1, `{"mcpwarp":{"v":1,"op":"disable","id":"srv_anki"}}`)
+	h.s.onConnEnd(c1)
+	c2 := &fakeConn{}
+	h.s.onWelcome(c2)
+	h.app(c2, registeredAnki)
+	if st := h.s.currentState(); st != stateRegistered || len(h.log.of(evDisabled)) != 0 {
+		t.Fatalf("connection 1's held disable applied on connection 2: state %s", st)
+	}
+}
+
+// An enable clears a held disable: the registered answering the enable's
+// re-register does not apply the older disable.
+func TestSessionEnableClearsHeldDisable(t *testing.T) {
+	const enable = `{"mcpwarp":{"v":1,"op":"enable","id":"srv_anki","name":"anki"}}`
+	h := newSessionHarness(t)
+	c := &fakeConn{}
+	h.s.onWelcome(c)
+	h.app(c, `{"mcpwarp":{"v":1,"op":"disable","id":"srv_anki"}}`)
+	h.app(c, enable)
+	h.app(c, registeredAnki)
+	if st := h.s.currentState(); st != stateRegistered || len(h.log.of(evDisabled)) != 0 {
+		t.Fatalf("disable, enable, registered: state %s, want registered", st)
+	}
+
+	// The same after a SERVER_DISABLED refusal that carried no id.
+	h2 := newSessionHarness(t)
+	c2 := &fakeConn{}
+	h2.s.onWelcome(c2)
+	h2.app(c2, `{"mcpwarp":{"v":1,"op":"disable","id":"srv_anki"}}`)
+	h2.app(c2, `{"mcpwarp":{"v":1,"op":"registered","errors":[{"name":"anki","code":"SERVER_DISABLED"}]}}`)
+	h2.app(c2, enable)
+	h2.app(c2, registeredAnki)
+	if st := h2.s.currentState(); st != stateRegistered {
+		t.Fatalf("SERVER_DISABLED, enable, registered: state %s, want registered", st)
+	}
+}
+
+// §2.7 Ended connection: registered, disable and enable delivered after
+// their connection ended are ignored; a conflict still applies. "Ended" is
+// the connection's own Done: wsmixer runs onConnEnd on a Done watcher with
+// no order against the disconnect report or the flushed deliveries, so the
+// stale messages may arrive before it.
+func TestSessionEndedConnectionMessages(t *testing.T) {
+	for _, connEndFirst := range []bool{true, false} {
+		h := newSessionHarness(t)
+		c := &fakeConn{}
+		h.s.onWelcome(c)
+		h.app(c, registeredAnki)
+		c.end()
+		if connEndFirst {
+			h.s.onConnEnd(c)
+		}
+		st := h.s.currentState()
+		for _, m := range []string{
+			registeredAnki,
+			`{"mcpwarp":{"v":1,"op":"disable","id":"srv_anki"}}`,
+			`{"mcpwarp":{"v":1,"op":"enable","id":"srv_anki","name":"anki"}}`,
+		} {
+			h.app(c, m)
+		}
+		if got := h.s.currentState(); got != st || len(h.log.of(evRegistered)) != 1 || len(h.log.of(evDisabled)) != 0 {
+			t.Fatalf("connEnd first %v: an ended connection's message applied: state %s (was %s), %d registered, %d disabled",
+				connEndFirst, got, st, len(h.log.of(evRegistered)), len(h.log.of(evDisabled)))
+		}
+		h.app(c, `{"mcpwarp":{"v":1,"op":"conflict","id":"srv_anki","name":"anki"}}`)
+		if got := h.s.currentState(); got != stateConflict {
+			t.Fatalf("connEnd first %v: an ended connection's conflict: state %s, want conflict", connEndFirst, got)
+		}
+	}
+}
+
 // blockingConn's SendApp blocks an unregister until its ctx ends, like a full
 // control queue; anything else goes through.
 type blockingConn struct{}
+
+func (blockingConn) Done() <-chan struct{} { return nil }
 
 func (blockingConn) SendApp(ctx context.Context, body any) error {
 	if b, _ := json.Marshal(body); string(b) != unregisterAnki {

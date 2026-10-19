@@ -46,6 +46,7 @@ type bridgingFixture struct {
 	} `json:"limits"`
 	Handler struct {
 		Behaviour string `json:"behaviour"`
+		Status    int    `json:"status"`
 	} `json:"handler"`
 	In       string `json:"in"`
 	InExpand map[string]struct {
@@ -105,6 +106,30 @@ func (h hangingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return nil, req.Context().Err()
 }
 
+// echoTransport is the local server for behaviour "echo" in target mode: it
+// records the request and answers 200 with its content-type and body and no
+// Content-Length.
+type echoTransport struct{ rec *callRecorder }
+
+func (e echoTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	var body []byte
+	if req.Body != nil {
+		body, _ = io.ReadAll(req.Body)
+		_ = req.Body.Close()
+	}
+	e.rec.add(req.Method, req.URL.String(), req.Header, "", body)
+	h := http.Header{}
+	if ct := req.Header.Get("Content-Type"); ct != "" {
+		h.Set("Content-Type", ct)
+	}
+	return &http.Response{
+		Status: "200 OK", StatusCode: http.StatusOK,
+		Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
+		Header: h, Body: io.NopCloser(strings.NewReader(string(body))),
+		ContentLength: -1, Request: req,
+	}, nil
+}
+
 func TestBridgingFixtures(t *testing.T) {
 	dir := mcpwarpFixtureDir(t, "bridging")
 	entries, err := os.ReadDir(dir)
@@ -162,16 +187,22 @@ func runBridgingFixture(t *testing.T, f *bridgingFixture) {
 		c.maxBodyBytes = f.Limits.MaxRequestBodyBytes
 		switch f.Mode {
 		case "handler":
-			c.handler = fixtureHandler(t, f.Handler.Behaviour, rec)
+			c.handler = fixtureHandler(t, f.Handler.Behaviour, f.Handler.Status, rec)
 		case "target":
-			if f.Handler.Behaviour != "hang" {
+			var rt http.RoundTripper
+			switch f.Handler.Behaviour {
+			case "hang":
+				rt = hangingTransport{rec: rec}
+			case "echo":
+				rt = echoTransport{rec: rec}
+			default:
 				t.Fatalf("target behaviour %q", f.Handler.Behaviour)
 			}
 			u, err := url.Parse(f.Target)
 			if err != nil {
 				t.Fatal(err)
 			}
-			c.handler, c.target, c.transport = nil, u, hangingTransport{rec: rec}
+			c.handler, c.target, c.transport = nil, u, rt
 			if f.Limits.TargetTimeoutMs != nil {
 				c.targetTimeout = time.Duration(*f.Limits.TargetTimeoutMs * float64(time.Millisecond))
 			}
@@ -189,7 +220,10 @@ func runBridgingFixture(t *testing.T, f *bridgingFixture) {
 		ec.send(t, registeredNotes)
 		waitState(t, a, stateRegistered)
 	case "disabled":
+		// Before the registration: the disable carries an id only, so it is
+		// held until the registered that brings that id (v0.6.3 §2.7).
 		ec.send(t, `{"mcpwarp":{"v":1,"op":"disable","id":"srv_notes"}}`)
+		ec.send(t, registeredNotes)
 		waitState(t, a, stateDisabled)
 	case "closing":
 		ec.send(t, registeredNotes)
@@ -264,7 +298,8 @@ func runBridgingFixture(t *testing.T, f *bridgingFixture) {
 			t.Fatalf("app response\n got %+v\nwant %+v", got, want)
 		}
 	}
-	if f.Handler.Behaviour == "throw" {
+	badStatus := f.Handler.Behaviour == "status" && (f.Handler.Status < 200 || f.Handler.Status >= 600)
+	if f.Handler.Behaviour == "throw" || badStatus {
 		var handlerErrs int
 		for _, ev := range log.of(evError) {
 			if ev.origin == "" {
@@ -278,11 +313,18 @@ func runBridgingFixture(t *testing.T, f *bridgingFixture) {
 }
 
 // fixtureHandler is the fixture's app as an http.Handler: echo answers 200
-// with the request's content-type and body and no length; throw panics.
-func fixtureHandler(t *testing.T, behaviour string, rec *callRecorder) http.Handler {
+// with the request's content-type and body and no length; throw panics;
+// status answers that status with an empty body.
+func fixtureHandler(t *testing.T, behaviour string, status int, rec *callRecorder) http.Handler {
 	switch behaviour {
 	case "echo":
 		return echoHandler(func(r *http.Request, body []byte) { rec.add(r.Method, r.URL.String(), r.Header, r.Host, body) })
+	case "status":
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, _ := io.ReadAll(r.Body)
+			rec.add(r.Method, r.URL.String(), r.Header, r.Host, body)
+			w.WriteHeader(status)
+		})
 	case "throw":
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			body, _ := io.ReadAll(r.Body)
