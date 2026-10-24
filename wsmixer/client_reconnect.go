@@ -1943,6 +1943,30 @@ func (cl *Client) handleServerDrain(conn *Conn, d *DrainMsg) {
 	}()
 }
 
+// drainHandOverAfterClose is handleServerDrain's reconnect for a drain whose
+// connection closed before the drain was delivered (watchConn).
+func (cl *Client) drainHandOverAfterClose(d *DrainMsg, reason DisconnectReason) {
+	if cl.rc.Disabled {
+		reason.Message = "drained; reconnect disabled"
+		cl.goFatal(reason)
+		return
+	}
+	delay := cl.rc.jitter(2 * time.Second)
+	if d.RetryAfterMS != nil {
+		delay = time.Duration(*d.RetryAfterMS) * time.Millisecond
+	}
+	// watchConn runs on a wg-tracked goroutine, so a plain Add is safe here
+	// (tryTrack's doc comment).
+	cl.wg.Add(1)
+	cl.announceReconnect(ReconnectInfo{Attempt: 0, Delay: delay, Cause: ReconnectDrain})
+	reason.Fatal = false
+	cl.report(reason)
+	go func() {
+		defer cl.wg.Done()
+		cl.attemptLoop(delay, "drain")
+	}()
+}
+
 // --- watching an established connection for its eventual disconnect ------
 
 // watchConn blocks until conn ends, then classifies why and either reports
@@ -2054,6 +2078,17 @@ func (cl *Client) watchConn(conn *Conn) {
 	}
 
 	wsCode := cl.effectiveWSCode(conn)
+	if d := conn.receivedDrain(); d != nil && (wsCode == 4012 || wsCode == 1000) {
+		// The server drained, then closed with GOING_AWAY (or a clean close)
+		// before its drain was delivered -- a drain with no streams open
+		// closes at once -- so handleServerDrain never scheduled the
+		// replacement. It is still the drain hand-over, not a lost
+		// connection: the drain's redial and notice, in that order, then
+		// this conn's non-fatal report. Any other close code after a drain
+		// keeps its own verdict below (a fatal one stays fatal).
+		cl.drainHandOverAfterClose(d, reason)
+		return
+	}
 	switch wsCode {
 	case 4010, 4011:
 		cl.goFatal(reason)

@@ -157,6 +157,7 @@ func TestClientDrainRaceWinnerThenDrainAgain(t *testing.T) {
 	drain := &DrainMsg{T: "drain", Reason: "rollout", DeadlineMS: &deadlineMS}
 
 	c1 := <-connCh
+	first := cl.Conn()
 	if err := c1.sendControl(drain); err != nil {
 		t.Fatalf("drain 1: %v", err)
 	}
@@ -166,9 +167,15 @@ func TestClientDrainRaceWinnerThenDrainAgain(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("no first replacement")
 	}
+	// Wait until the client has published the replacement: the old conn
+	// stays cl.Conn() until then (it is not closed first here), so a drain
+	// sent on c2 earlier would reach a conn the client does not own yet.
 	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) && cl.Conn() == nil {
+	for time.Now().Before(deadline) && (cl.Conn() == nil || cl.Conn() == first) {
 		time.Sleep(5 * time.Millisecond)
+	}
+	if cur := cl.Conn(); cur == nil || cur == first {
+		t.Fatal("the replacement never became the client's connection")
 	}
 	if err := c2.sendControl(drain); err != nil {
 		t.Fatalf("drain 2: %v", err)

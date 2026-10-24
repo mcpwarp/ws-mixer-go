@@ -137,7 +137,31 @@ func TestTunnelSubscribeConcurrentWithChanges(t *testing.T) {
 	}
 	wg.Wait()
 	<-changes
-	time.Sleep(100 * time.Millisecond) // let the last deliveries land
+	// Deliveries are asynchronous whenever another goroutine is delivering,
+	// and the one deliverer works through every listener's slow first call
+	// (2 ms each, ~120 of them): wait, bounded, until every listener has had
+	// its first call; one that never gets it is a lost delivery.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		pending := -1
+		mu.Lock()
+		for i, r := range append([]*rec{primary}, subs...) {
+			r.mu.Lock()
+			if len(r.got) == 0 && pending < 0 {
+				pending = i
+			}
+			r.mu.Unlock()
+		}
+		mu.Unlock()
+		if pending < 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("listener %d never got its first snapshot (§6.4: Subscribe calls l immediately)", pending-1)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond) // let the deliveries in flight land
 
 	contiguous := func(all, part []TunnelStatus) bool {
 		for start := 0; start+len(part) <= len(all); start++ {

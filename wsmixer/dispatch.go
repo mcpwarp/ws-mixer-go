@@ -287,14 +287,14 @@ func (c *Conn) handleStreamErr(id uint32, err error) bool {
 // resetStream sends RESET for a stream-scoped violation and mirrors the
 // closed state locally, e.g. DATA/CLOSE arriving after the peer's CLOSE.
 func (c *Conn) resetStream(id uint32, code ErrorCode, msg string) {
-	c.sendControlFrame(EncodeReset(id, code, msg))
 	c.mu.Lock()
 	st := c.streams[id]
 	c.mu.Unlock()
 	if st != nil {
 		st.handleReset(code, msg)
-		c.retireStream(id)
+		c.retireStream(id) // before the RESET is queued, as (*Stream).Reset
 	}
+	c.sendControlFrame(EncodeReset(id, code, msg))
 }
 
 func (c *Conn) discardStale(id uint32, frameType string) {
@@ -439,6 +439,7 @@ func (c *Conn) handleDrainMsg(m *DrainMsg) (fatal bool) {
 		c.draining = true
 		c.peerDrained = true
 		c.peerLastStreamID = m.LastStreamID
+		c.peerDrainMsg = m
 	}
 	c.mu.Unlock()
 	c.opts.Metrics.DrainReceived(c.session, reason)

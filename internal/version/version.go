@@ -4,4 +4,4 @@
 package version
 
 // SDK is this module's release version.
-const SDK = "0.10.0"
+const SDK = "0.10.1"

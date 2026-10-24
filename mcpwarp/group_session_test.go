@@ -484,6 +484,57 @@ func TestGroupPauseUndoDropsOwedUnregister(t *testing.T) {
 	}
 }
 
+// v0.7.2 §2.6/§6A.7 (D-2026-10-19-05): a name of the dropped frame that is
+// removed or locally disabled and then re-added or re-enabled within the
+// pause is re-sent among the folded-in names in trigger order, after the
+// dropped frame's remaining names, not in its original slot.
+func TestGroupPauseReaddedDroppedNameFoldsLast(t *testing.T) {
+	all := func(names ...string) []groupServiceInit {
+		var out []groupServiceInit
+		for _, n := range names {
+			out = append(out, groupServiceInit{name: n, kind: KindHTTP})
+		}
+		return out
+	}
+	for _, tc := range []struct {
+		name string
+		undo func(h *groupHarness)
+	}{
+		{"remove+add", func(h *groupHarness) {
+			h.s.applyServices(all("alpha", "gamma"))
+			h.s.applyServices(all("alpha", "gamma", "delta", "beta"))
+		}},
+		{"disable+enable", func(h *groupHarness) {
+			h.s.applyServices(all("alpha", "beta", "gamma", "delta"))
+			h.s.localDisable("beta")
+			h.s.localEnable("beta")
+		}},
+	} {
+		h := newGroupHarness(t, "alpha")
+		c := &fakeConn{}
+		h.s.onWelcome(c)
+		h.app(c, registeredOK("alpha"))
+		c.take()
+		h.s.applyServices(all("alpha", "beta", "gamma"))
+		h.wantSent(c, registerOf("beta", "gamma"))
+		h.app(c, overloadedOp)
+		tc.undo(h)
+		h.wantSent(c)
+		h.clock.advance(time.Second)
+		if got, want := c.take(), []string{registerOf("gamma", "delta", "beta")}; len(got) != 1 || got[0] != want[0] {
+			t.Fatalf("%s: re-send %q, want %q", tc.name, got, want)
+		}
+		h.app(c, registeredOK("gamma", "delta", "beta"))
+		h.clock.advance(time.Minute)
+		h.wantSent(c)
+		for _, n := range []string{"alpha", "beta", "gamma", "delta"} {
+			if st := h.state(n); st != ServiceActive {
+				t.Fatalf("%s: %s %s, want active", tc.name, n, st)
+			}
+		}
+	}
+}
+
 // A Remove+Add within a pause keeps what the connection may hold: after a
 // second OVERLOADED drops the re-send, removing the name again still owes
 // its unregister, since the edge holds it from before the pause.

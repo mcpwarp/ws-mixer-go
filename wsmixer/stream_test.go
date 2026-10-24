@@ -2,7 +2,9 @@ package wsmixer
 
 import (
 	"context"
+	"errors"
 	"io"
+	"strings"
 	"testing"
 	"time"
 )
@@ -47,6 +49,106 @@ func TestStreamCloseResetsWhenPeerStillSending(t *testing.T) {
 	}
 	if st.State() != "closed" {
 		t.Errorf("state = %s, want closed", st.State())
+	}
+}
+
+// WIRE.md §2.8: Reset refuses a connection-only code locally (an error
+// wrapping ErrResetCode, nothing sent, the stream untouched) on either role,
+// and accepts a stream code and an application code.
+func TestStreamResetRejectsConnectionOnlyCodes(t *testing.T) {
+	for _, role := range []Role{RoleServer, RoleClient} {
+		c := newTestSchedConn(t)
+		c.role = role
+		st := registerTestStream(c, 1)
+		for _, code := range []ErrorCode{NoError, FlowControlError, FrameSizeError, UnsupportedCode,
+			UnauthorizedCode, GoingAwayCode, KeepaliveTimeout, ApplicationCloseCode} {
+			err := st.Reset(code, "x")
+			if !errors.Is(err, ErrResetCode) || !strings.Contains(err.Error(), code.String()) {
+				t.Fatalf("%s: Reset(%s) = %v, want an ErrResetCode naming the code", role, code, err)
+			}
+			select {
+			case b := <-c.controlQueue:
+				t.Fatalf("%s: Reset(%s) sent %x", role, code, b)
+			default:
+			}
+			if st.State() != "open" {
+				t.Fatalf("%s: state %s after a refused Reset(%s), want open", role, st.State(), code)
+			}
+		}
+		if err := st.Reset(CancelCode, "x"); err != nil {
+			t.Fatalf("%s: Reset(CANCEL) = %v", role, err)
+		}
+		if f := nextControlFrame(t, c); f.Type != FrameReset || f.ResetCode() != CancelCode {
+			t.Fatalf("%s: frame %+v, want RESET(CANCEL)", role, f)
+		}
+		st2 := registerTestStream(c, 3)
+		if err := st2.Reset(ErrorCode(0x1000_0001), "app"); err != nil {
+			t.Fatalf("%s: Reset(app code) = %v", role, err)
+		}
+		nextControlFrame(t, c)
+	}
+}
+
+// Reset retires the stream before its RESET is queued: a peer frame for the
+// id that lands while the RESET is still on its way out (here: the control
+// queue is full, so Reset is stuck in its send) is discarded as stale (WIRE.md
+// §2.5), never answered with RESET(PROTOCOL_ERROR) for a stream this side
+// already reset (window_stale_retired_stream).
+func TestStreamResetRetiresBeforeSending(t *testing.T) {
+	c := newTestSchedConn(t)
+	st := registerTestStream(c, 1)
+	for i := 0; i < cap(c.controlQueue); i++ {
+		c.controlQueue <- []byte("filler")
+	}
+	resetDone := make(chan struct{})
+	go func() {
+		defer close(resetDone)
+		_ = st.Reset(CancelCode, "local reset")
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for st.State() != "closed" && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond) // Reset is now blocked in its send
+	windowDone := make(chan struct{})
+	go func() {
+		defer close(windowDone)
+		c.handleStreamWindow(1, 0)
+	}()
+	deadline = time.Now().Add(2 * time.Second)
+	for c.stats.staleFrames.Load() == 0 && time.Now().Before(deadline) {
+		select {
+		case <-windowDone:
+		default:
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if n := c.stats.staleFrames.Load(); n != 1 {
+		t.Fatalf("%d stale frames, want the WINDOW discarded as stale", n)
+	}
+	// Drain the queue: the fillers, then the one RESET(CANCEL), no RESET(PROTOCOL_ERROR).
+	var resets []ErrorCode
+	for done := false; !done; {
+		select {
+		case b := <-c.controlQueue:
+			if string(b) == "filler" {
+				continue
+			}
+			f, err := DecodeFrame(b)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if f.Type == FrameReset {
+				resets = append(resets, f.ResetCode())
+			}
+		case <-time.After(200 * time.Millisecond):
+			done = true
+		}
+	}
+	<-resetDone
+	<-windowDone
+	if len(resets) != 1 || resets[0] != CancelCode {
+		t.Fatalf("RESET frames %v, want exactly [CANCEL]", resets)
 	}
 }
 

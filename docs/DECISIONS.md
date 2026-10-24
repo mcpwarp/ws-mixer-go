@@ -1178,3 +1178,40 @@ links its own spec counterpart explicitly, so read the link, not the number.
   `unregistered` or a whole-frame error op re-evaluates the group (G1/G5) when nothing is left outstanding,
   queued or scheduled, so a connecting group never stays `RETRYING` with nothing to send
   (`TestGroupSettleReevaluatesWhenNothingLeft`).
+
+## 2026-10-23
+
+- **D-2026-10-23-01** — v0.10.1: `spec.pin` → `v0.7.2` (389bae8, docs only over v0.7.1; every runner's counts
+  unchanged). Implements its §2.6/§6A.7 placement rule (spec D-2026-10-19-05): a name of an OVERLOADED-dropped
+  register that is removed or locally disabled during the pause leaves the paused frame's names (it still owes
+  its unregister if the connection may hold it, ruling i), and a re-add or re-enable in the same pause folds it
+  in again among the folded-in names in trigger order, after the dropped frame's remaining names, cancelling
+  the owed unregister (ruling ix). Dropped `[beta, gamma]`, remove `beta`, add `delta`, re-add `beta` → re-send
+  `[gamma, delta, beta]`; v0.10.0 kept `beta` in its original slot (`TestGroupPauseReaddedDroppedNameFoldsLast`,
+  remove/add and disable/enable). `version.SDK` → `0.10.1`.
+  Core (Anatoly-approved, retry semantics): a server draining with no streams open sends `drain` and closes
+  4012 at once; when that close was observed before the drain was delivered, `handleServerDrain` dropped the
+  flushed drain and the client took an ordinary loss's backoff (`{Attempt: n, Cause: "draining: rollout"}`,
+  the `TestExposeOnRetry` flake). The connection now records the server's drain on arrival
+  (`Conn.receivedDrain`), and `watchConn` treats a 4012 or 1000 close after it as the drain hand-over: the drain
+  redial (`OnReconnect{0, jitter or retry_after_ms, drain}`), then the non-fatal report; any other close code
+  after a drain keeps its own verdict, a fatal one stays fatal (`TestClientDrainThenGoingAwayCloseSeenFirstIsHandOver`).
+  WIRE.md §2.8 SHOULD: `(*Stream).Reset` refuses a connection-only code (NO_ERROR, FLOW_CONTROL_ERROR,
+  FRAME_SIZE_ERROR, UNSUPPORTED, UNAUTHORIZED, GOING_AWAY, KEEPALIVE_TIMEOUT, APPLICATION_CLOSE) on either role
+  with an error wrapping the new `wsmixer.ErrResetCode`, sends nothing and leaves the stream as it was; unknown
+  and application codes stay allowed (`TestStreamResetRejectsConnectionOnlyCodes`); `mcpwarp` resets only with
+  CANCEL and INTERNAL_ERROR.
+  A local RESET (`(*Stream).Reset`, the dispatcher's `resetStream`) and a CLOSE that completes the close now
+  retire the stream before the frame is queued, so a peer frame for that id arriving once the frame is out
+  (WINDOW increment 0 included) is discarded as stale (WIRE.md §2.5), never answered with
+  RESET(PROTOCOL_ERROR) for a stream already reset (`TestStreamResetRetiresBeforeSending`).
+  Open (pre-existing, present in v0.10.0): a server `drain` that arrives after `welcome` but before the client
+  has taken ownership of the connection (published it as `cl.conn` in `onAttemptSucceeded`; the drain is
+  delivered on the connection's own delivery goroutine, unordered against that) is not handled as a drain:
+  delivered before `dialOnce` binds its handler it is dropped (`client_reconnect.go:1475`, the
+  `boundConn.Load()` nil check), after the bind but before ownership `handleServerDrain` closes the connection
+  as stale with NO_ERROR (`client_reconnect.go:1866-1878`), so the client takes whatever redial that close
+  leads to (an ordinary loss's) instead of the drain hand-over. Not fixed in v0.10.1: it changes the core's
+  connection-ownership and retry ordering. The tests that hit it (`TestClientDrainRaceWinnerThenDrainAgain`,
+  `TestClientDrainThenErrorCloseDeliversOnDrain`) now wait for the client to own the connection before the
+  server drains, so they are deterministic.

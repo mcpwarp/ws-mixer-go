@@ -10,8 +10,12 @@ import (
 
 // DrainOptions configures a Drain call (WIRE.md §2.9).
 type DrainOptions struct {
-	Deadline   time.Duration // grace for in-flight streams; 0 = immediately
-	RetryAfter time.Duration // reconnect hint
+	Deadline time.Duration // grace for in-flight streams; 0 = immediately
+	// RetryAfter is sent as retry_after_ms: the minimum the client MUST wait
+	// before its replacement dial (WIRE.md §2.9; binding since spec v0.6.x,
+	// no longer a mere hint); 0 sends none. A server SHOULD NOT send more
+	// than 60000 ms; Drain sends the value as given and does not cap it.
+	RetryAfter time.Duration
 	Message    string
 
 	// CloseCode overrides the WS close code/error this Drain finishes with.

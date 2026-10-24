@@ -2,6 +2,7 @@ package wsmixer
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -453,6 +454,51 @@ func newFlakyServer(t *testing.T, statuses []int, ln testAcceptHandler) (string,
 	srv := httptest.NewServer(flaky)
 	t.Cleanup(srv.Close)
 	return "ws" + srv.URL[len("http"):] + "/tunnel", flaky
+}
+
+// A server that drains with no streams open sends drain and closes 4012 at
+// once. When that close is observed before the drain is delivered (here the
+// delivery goroutine is busy in OnApp), it is still the drain hand-over:
+// OnReconnect{0, <=2s, drain}, not an ordinary loss's backoff.
+func TestClientDrainThenGoingAwayCloseSeenFirstIsHandOver(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	_, url := startTestServer(t, testAcceptHandler{OnConn: func(c *Conn) {
+		go func() {
+			_ = c.SendApp(context.Background(), map[string]any{"hold": true})
+			_ = c.Drain(context.Background(), "rollout", DrainOptions{})
+		}()
+	}})
+	reconnects := make(chan ReconnectInfo, 4)
+	rec := newDisconnectRecorder()
+	var apps atomic.Int32
+	cl := NewClient(url, StaticToken("tok"), ClientConfig{
+		Reconnect:    testReconnectOptions(&fakeAfter{}, 0.5),
+		OnDisconnect: rec.onDisconnect,
+		OnReconnect:  func(i ReconnectInfo) { reconnects <- i },
+		OnApp: func(json.RawMessage) {
+			if apps.Add(1) == 1 {
+				<-release // hold the delivery goroutine: the drain waits behind this
+			}
+		},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := cl.Connect(ctx); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer cl.Close(context.Background())
+	select {
+	case i := <-reconnects:
+		if i.Attempt != 0 || i.Cause != ReconnectDrain || i.Delay > 2*time.Second {
+			t.Fatalf("OnReconnect %+v, want {0, <=2s, %s}", i, ReconnectDrain)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no reconnect after the drain and its 4012 close")
+	}
+	if r := rec.waitNext(t); r.Fatal {
+		t.Fatalf("the close after the drain was reported fatal: %+v", r)
+	}
 }
 
 // onceCloser returns a func that closes ch the first time only, for a

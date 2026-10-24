@@ -2,6 +2,8 @@ package wsmixer
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"time"
@@ -382,10 +384,11 @@ func (s *Stream) CloseWrite() error {
 	s.notifyLocked()
 	s.mu.Unlock()
 
-	s.conn.sendControlFrame(EncodeClose(s.id))
+	// A CLOSE that completes the close retires the stream first, as Reset does.
 	if closedNow {
 		s.conn.retireStream(s.id)
 	}
+	s.conn.sendControlFrame(EncodeClose(s.id))
 	return nil
 }
 
@@ -417,11 +420,36 @@ func (s *Stream) Close() error {
 	return err
 }
 
+// ErrResetCode is returned (wrapped, naming the code) by Reset for a code
+// WIRE.md §2.8 marks connection-only: NO_ERROR, FLOW_CONTROL_ERROR,
+// FRAME_SIZE_ERROR, UNSUPPORTED, UNAUTHORIZED, GOING_AWAY, KEEPALIVE_TIMEOUT
+// and APPLICATION_CLOSE. Nothing is sent and the stream is left as it was.
+var ErrResetCode = errors.New("wsmixer: not a stream reset code")
+
+// connectionOnly reports whether code is one of §2.8's connection-only codes
+// (no ✔ in its Stream column). Unknown codes and the layer above's codes
+// (>= 0x1000_0000) stay allowed.
+func connectionOnly(code ErrorCode) bool {
+	switch code {
+	case NoError, FlowControlError, FrameSizeError, UnsupportedCode,
+		UnauthorizedCode, GoingAwayCode, KeepaliveTimeout, ApplicationCloseCode:
+		return true
+	}
+	return false
+}
+
 // Reset aborts the stream in both directions with the given error code and an
 // optional human-readable message, discarding any buffered data. It is a
 // no-op if the stream is already fully closed. Never call Reset in answer to
-// a received RESET (loop prevention, WIRE.md §2.5).
+// a received RESET (loop prevention, WIRE.md §2.5). A connection-only code
+// (see ErrResetCode) is refused locally with an error that wraps
+// ErrResetCode, on either role, and nothing is sent: use
+// STREAM_CLOSED, REFUSED_STREAM, CANCEL, STREAM_LIMIT, PROTOCOL_ERROR,
+// INTERNAL_ERROR, ENHANCE_YOUR_CALM or an application code >= 0x1000_0000.
 func (s *Stream) Reset(code ErrorCode, msg string) error {
+	if connectionOnly(code) {
+		return fmt.Errorf("%w: %s is connection-only (WIRE.md §2.8)", ErrResetCode, code)
+	}
 	s.mu.Lock()
 	if s.state == streamClosed {
 		s.mu.Unlock()
@@ -433,8 +461,11 @@ func (s *Stream) Reset(code ErrorCode, msg string) error {
 	s.notifyLocked()
 	s.mu.Unlock()
 
-	s.conn.sendControlFrame(EncodeReset(s.id, code, msg))
+	// Retired before the RESET is queued: a peer frame for this id that
+	// arrives once the RESET is out is stale (WIRE.md §2.5), never a frame for
+	// a stream still live here.
 	s.conn.retireStream(s.id)
+	s.conn.sendControlFrame(EncodeReset(s.id, code, msg))
 	return nil
 }
 

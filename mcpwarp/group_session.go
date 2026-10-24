@@ -520,6 +520,16 @@ func (s *groupSession) registerLocked(names []string) {
 	s.pumpLocked()
 }
 
+// leavePausedResendLocked takes a removed or locally disabled name out of
+// the register paused by OVERLOADED: re-added or re-enabled in the same
+// pause, it folds in again after the frame's remaining names (v0.7.2
+// §2.6/§6A.7).
+func (s *groupSession) leavePausedResendLocked(name string) {
+	if f := s.out; f != nil && f.paused && f.op == opRegister {
+		f.names = slices.DeleteFunc(f.names, func(n string) bool { return n == name })
+	}
+}
+
 // dropQueuedUnregistersLocked takes names out of every queued unregister
 // frame, dropping frames left empty.
 func (s *groupSession) dropQueuedUnregistersLocked(names []string) {
@@ -997,6 +1007,7 @@ func (s *groupSession) applyServices(list []groupServiceInit) {
 		}
 		v := s.svcs[name]
 		delete(s.svcs, name)
+		s.leavePausedResendLocked(name)
 		if v.mayHold && s.connected {
 			s.removed[name] = v
 			unregister = append(unregister, name)
@@ -1023,6 +1034,7 @@ func (s *groupSession) localDisable(name string) {
 		return
 	}
 	v.localDisabled, v.awaiting = true, false
+	s.leavePausedResendLocked(name)
 	if v.mayHold && s.connected {
 		s.unregisterLocked([]string{name})
 	}

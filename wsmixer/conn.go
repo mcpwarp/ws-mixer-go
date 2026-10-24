@@ -205,6 +205,7 @@ type Conn struct {
 	hasAnnouncedLast   bool
 	peerLastStreamID   uint32              // client-only: last_stream_id from the server's drain message
 	peerDrained        bool                // client-only: the server's drain arrived (peerLastStreamID is set)
+	peerDrainMsg       *DrainMsg           // client-only: that drain, recorded on arrival, before its delivery
 	selfDrained        bool                // this side ran its own Drain()
 	outstandingPings   map[int64]time.Time // ids in [lowestUnacked, nextPingID) still awaiting a pong
 	lowestUnacked      int64               // watermark: every id below this has been acked at least once
@@ -511,6 +512,14 @@ func (c *Conn) enqueueDelivery(ev deliveryEvent) (ok bool) {
 
 // Session returns the handshake-assigned connection id (welcome.session).
 func (c *Conn) Session() string { return c.session }
+
+// receivedDrain is the server's drain message once it has arrived on this
+// connection (client side), whether or not it has been delivered yet.
+func (c *Conn) receivedDrain() *DrainMsg {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.peerDrainMsg
+}
 
 // Meta returns hello.meta verbatim (server side) or welcome.meta verbatim
 // (client side).

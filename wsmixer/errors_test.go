@@ -8,6 +8,7 @@ package wsmixer
 import (
 	"context"
 	"encoding/json"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -152,6 +153,7 @@ func TestClientApplicationCloseIsRecoverablePostRun(t *testing.T) {
 // always last). Pre-fix, deliveryLoop's priority close-check could drop this
 // exactly like the app-message case.
 func TestClientDrainThenErrorCloseDeliversOnDrain(t *testing.T) {
+	var client atomic.Pointer[Client]
 	_, url := startTestServer(t, testAcceptHandler{OnConn: func(c *Conn) {
 		// deliveryLoop (the thing under test) only exists once Run() has
 		// started it, unlike Close's separate pre-Run flush path (see
@@ -173,8 +175,36 @@ func TestClientDrainThenErrorCloseDeliversOnDrain(t *testing.T) {
 				}
 				time.Sleep(time.Millisecond)
 			}
+			// Only once the client has published this connection: a drain on
+			// a connection the client does not own yet is closed as stale
+			// (handleServerDrain), NO_ERROR, not this test's concern.
+			for time.Now().Before(deadline) {
+				if cl := client.Load(); cl != nil && cl.Conn() != nil {
+					break
+				}
+				time.Sleep(time.Millisecond)
+			}
 			_ = c.sendControl(&DrainMsg{T: "drain", Reason: "maintenance"})
-			c.fail(newConnErrorf(InternalErrorCode, "test: connection died right after drain"))
+			// fail() can close the socket before the writer has flushed the
+			// queued drain, or its own error{}, so neither would be on the
+			// wire. Wait until the client's connection has recorded the drain
+			// (on arrival, before its delivery), then send the error{}
+			// ourselves: the client closes on it at once, so the drain's
+			// delivery still races a closing connection, deterministically.
+			for time.Now().Before(deadline) {
+				if cl := client.Load(); cl != nil {
+					if cc := cl.Conn(); cc != nil && cc.receivedDrain() != nil {
+						break
+					}
+				}
+				time.Sleep(time.Millisecond)
+			}
+			_ = c.sendControl(&ErrorMsg{T: "error", Code: uint32(InternalErrorCode), Message: "test: connection died right after drain"})
+			select {
+			case <-c.Done():
+			case <-time.After(2 * time.Second):
+				c.fail(newConnErrorf(InternalErrorCode, "test: the client did not close on error{}"))
+			}
 		}()
 	}})
 
@@ -200,6 +230,7 @@ func TestClientDrainThenErrorCloseDeliversOnDrain(t *testing.T) {
 		},
 		OnDisconnect: rec.onDisconnect,
 	})
+	client.Store(cl)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := cl.Connect(ctx); err != nil {
