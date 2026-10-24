@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"net/url"
 	"regexp"
 	"strings"
 	"sync/atomic"
@@ -304,128 +303,6 @@ func TestAgentAppMessageDuringOnConnectNotDropped(t *testing.T) {
 	var e *Error
 	if !errors.As(a.err, &e) || e.Code != "UNSUPPORTED_VERSION" || !e.Fatal {
 		t.Fatalf("agent ended with %#v", a.err)
-	}
-}
-
-// §3.3 Per name: a conflict for one service of a group RESETs that
-// service's in-flight streams with CANCEL; the other service's request goes
-// on and the connection stays open. Real wsmixer transport.
-func TestGroupPerNameConflictResetsOnlyThatService(t *testing.T) {
-	edge := newFakeEdge(t)
-	release := make(chan struct{})
-	entered := make(chan string, 2)
-	block := func(name string) *app {
-		return newApp(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			entered <- name
-			select {
-			case <-release:
-			case <-r.Context().Done():
-			}
-			w.WriteHeader(http.StatusOK)
-		}), nil, 0, nil)
-	}
-	a, _ := newTestAgent(t, edge.url, func(c *agentConfig) {
-		c.group = &groupAgentConfig{services: []groupServiceInit{
-			{name: "a-svc", kind: KindHTTP, app: block("a-svc")},
-			{name: "b-svc", kind: KindHTTP, app: block("b-svc")},
-		}}
-	})
-	a.start()
-	ec := edge.nextConn(t)
-	ec.nextApp(t)
-	ec.send(t, `{"mcpwarp":{"v":1,"op":"registered","services":[{"name":"a-svc","id":"ia","url":"https://a-svc-alice.x/mcp"},{"name":"b-svc","id":"ib","url":"https://b-svc-alice.x/mcp"}]}}`)
-	deadline := time.Now().Add(5 * time.Second)
-	for v := a.group.snapshotView(); v["a-svc"].State != ServiceActive || v["b-svc"].State != ServiceActive; v = a.group.snapshotView() {
-		if time.Now().After(deadline) {
-			t.Fatalf("services %+v, want both active", v)
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-
-	type result struct {
-		out []byte
-		err error
-	}
-	request := func(name string) chan result {
-		ch := make(chan result, 1)
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		st, err := ec.c.OpenStream(ctx)
-		if err != nil {
-			t.Fatalf("OpenStream: %v", err)
-		}
-		if _, err := st.Write([]byte("POST /mcp HTTP/1.1\r\nHost: " + name + "-alice.x\r\nContent-Length: 0\r\n\r\n")); err != nil {
-			t.Fatal(err)
-		}
-		_ = st.CloseWrite()
-		go func() {
-			defer cancel()
-			var out []byte
-			buf := make([]byte, 4096)
-			for {
-				n, err := st.ReadContext(ctx, buf)
-				out = append(out, buf[:n]...)
-				if err != nil {
-					ch <- result{out, err}
-					return
-				}
-			}
-		}()
-		return ch
-	}
-	ra, rb := request("a-svc"), request("b-svc")
-	for i := 0; i < 2; i++ {
-		select {
-		case <-entered:
-		case <-time.After(5 * time.Second):
-			t.Fatal("the handlers were not both called")
-		}
-	}
-	ec.send(t, `{"mcpwarp":{"v":1,"op":"conflict","id":"ib","name":"b-svc","reason":"taken_over"}}`)
-	got := <-rb
-	var se *wsmixer.StreamError
-	if !errors.As(got.err, &se) || se.Code != wsmixer.CancelCode || se.Message != takenOverMessage {
-		t.Fatalf("b-svc's stream ended with %v (%q), want RESET CANCEL %q", got.err, got.out, takenOverMessage)
-	}
-	close(release)
-	got = <-ra
-	if got.err != io.EOF || !strings.HasPrefix(string(got.out), "HTTP/1.1 200 ") {
-		t.Fatalf("a-svc's stream: %q, %v; want a 200 and CLOSE", got.out, got.err)
-	}
-	if v := a.group.snapshotView(); v["a-svc"].State != ServiceActive || v["b-svc"].State != ServiceTakenOver {
-		t.Fatalf("services %+v, want a-svc active, b-svc taken_over", v)
-	}
-	select {
-	case <-ec.c.Done():
-		t.Fatal("a per-name conflict closed the connection")
-	default:
-	}
-}
-
-// A group service whose target is unreachable answers 502 and reports a
-// non-fatal error naming the service and its target (logged warn by the
-// group; §6A.4 gives an active service no lastError).
-func TestGroupTargetUnreachableReported(t *testing.T) {
-	edge := newFakeEdge(t)
-	u, _ := url.Parse("http://127.0.0.1:1/mcp")
-	a, log := newTestAgent(t, edge.url, func(c *agentConfig) {
-		ap := newApp(nil, u, time.Second, nil)
-		ap.name = "files"
-		c.group = &groupAgentConfig{services: []groupServiceInit{{name: "files", kind: KindHTTP, app: ap}}}
-	})
-	a.start()
-	ec := edge.nextConn(t)
-	ec.nextApp(t)
-	ec.send(t, `{"mcpwarp":{"v":1,"op":"registered","services":[{"name":"files","id":"if","url":"https://files-alice.x/mcp"}]}}`)
-	waitFor(t, func() bool { return a.group.snapshotView()["files"].State == ServiceActive })
-	in := "POST /mcp HTTP/1.1\r\nHost: files-alice.x\r\nContent-Length: 0\r\n\r\n"
-	out, _ := ec.roundTrip(t, []byte(in), len(in), 0)
-	if !strings.HasPrefix(string(out), "HTTP/1.1 502 ") {
-		t.Fatalf("reply %q, want a 502", out)
-	}
-	waitFor(t, func() bool { return len(log.of(evError)) > 0 })
-	msg := log.of(evError)[0].err.Error()
-	if !strings.Contains(msg, `service "files"`) || !strings.Contains(msg, "http://127.0.0.1:1/mcp") {
-		t.Fatalf("error %q, want the service name and its target", msg)
 	}
 }
 

@@ -220,6 +220,8 @@ func TestSessionBackoffCarriesAcrossReconnectAndResetsOnSuccess(t *testing.T) {
 	if st := h.s.currentState(); st != stateRegistered {
 		t.Fatalf("state %s, want registered", st)
 	}
+	h.app(c2, `{"mcpwarp":{"v":1,"op":"enable","id":"srv_anki","name":"anki"}}`) // a register outstanding again
+	h.wantSent(c2, registerAnki)
 	h.app(c2, transientAnki)
 	if r := h.retries("register"); r[len(r)-1].Delay != time.Second || r[len(r)-1].Attempt != 1 {
 		t.Fatalf("after success retry = %+v, want attempt 1 delay 1s", r[len(r)-1])
@@ -420,6 +422,105 @@ func TestSessionCloseWaitEndsOnItsOwnReply(t *testing.T) {
 			t.Fatalf("after %s the unregister's own reply did not end the wait", first)
 		}
 	}
+}
+
+// spec v0.8.0 §2.6 OVERLOADED re-send, for one service: during the pause a
+// registered naming the service settles the handle, cancels the re-send and
+// resets the OVERLOADED counter; an empty registered or an error op answers
+// nothing and leaves the counter (and the re-send) as they are; a registered
+// with nothing outstanding and no pause changes no counter.
+func TestSessionOverloadedPauseReplies(t *testing.T) {
+	overloaded := `{"mcpwarp":{"v":1,"op":"error","code":"OVERLOADED","message":"busy"}}`
+	enable := `{"mcpwarp":{"v":1,"op":"enable","id":"srv_anki","name":"anki"}}`
+	lastDelay := func(h *sessionHarness, kind string) time.Duration {
+		r := h.retries(kind)
+		if len(r) == 0 {
+			return 0
+		}
+		return r[len(r)-1].Delay
+	}
+	t.Run("registered settles and resets", func(t *testing.T) {
+		h := newSessionHarness(t)
+		c := &fakeConn{}
+		h.s.onWelcome(c)
+		h.wantSent(c, registerAnki)
+		h.app(c, overloaded)
+		h.app(c, registeredAnki)
+		h.clock.advance(time.Minute)
+		h.wantSent(c) // the re-send was cancelled
+		h.app(c, enable)
+		h.wantSent(c, registerAnki)
+		h.app(c, overloaded)
+		if d := lastDelay(h, "overloaded"); d != time.Second {
+			t.Fatalf("OVERLOADED after the settling registered waits %v, want 1s (counter reset)", d)
+		}
+	})
+	for _, tc := range []struct{ name, reply string }{
+		{"empty registered answers nothing", `{"mcpwarp":{"v":1,"op":"registered","services":[],"errors":[]}}`},
+		{"error op answers nothing", `{"mcpwarp":{"v":1,"op":"error","code":"UNKNOWN_OP","message":"x"}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newSessionHarness(t)
+			c := &fakeConn{}
+			h.s.onWelcome(c)
+			h.wantSent(c, registerAnki)
+			h.app(c, overloaded)
+			h.app(c, tc.reply)
+			if n := len(h.retries("register")); n != 0 {
+				t.Fatalf("%d transient re-sends scheduled during the pause, want none", n)
+			}
+			h.clock.advance(time.Second)
+			h.wantSent(c, registerAnki) // the re-send still goes out
+			h.app(c, overloaded)
+			if d := lastDelay(h, "overloaded"); d != 2*time.Second {
+				t.Fatalf("second OVERLOADED waits %v, want 2s (counter unchanged)", d)
+			}
+		})
+	}
+	t.Run("error op during a paused close unregister answers nothing", func(t *testing.T) {
+		h := newSessionHarness(t)
+		c := &fakeConn{}
+		h.s.onWelcome(c)
+		h.app(c, registeredAnki)
+		c.take()
+		done := make(chan struct{})
+		h.s.beginCloseAsync(context.Background(), unregisterBudget, func() { close(done) })
+		h.wantSent(c, unregisterAnki)
+		h.app(c, overloaded)
+		h.app(c, `{"mcpwarp":{"v":1,"op":"error","code":"BAD_REQUEST","message":"x"}}`)
+		select {
+		case <-done:
+			t.Fatal("an error op during the pause ended the close's wait")
+		default:
+		}
+		h.clock.advance(time.Second)
+		h.wantSent(c, unregisterAnki) // the re-send still goes out
+		h.app(c, `{"mcpwarp":{"v":1,"op":"unregistered","services":[]}}`)
+		select {
+		case <-done:
+		default:
+			t.Fatal("the re-sent unregister's reply did not end the close's wait")
+		}
+	})
+	t.Run("stray registered: applied, transient counter per §3.2", func(t *testing.T) {
+		h := newSessionHarness(t)
+		c := &fakeConn{}
+		h.s.onWelcome(c)
+		h.wantSent(c, registerAnki)
+		h.app(c, transientAnki) // nothing outstanding now, a transient re-send scheduled
+		h.app(c, registeredAnki)
+		if st := h.s.currentState(); st != stateRegistered {
+			t.Fatalf("state %s, want registered (§2.7: accepted with no frame outstanding)", st)
+		}
+		h.clock.advance(time.Minute)
+		h.wantSent(c) // the scheduled re-send was cancelled
+		h.app(c, enable)
+		h.wantSent(c, registerAnki)
+		h.app(c, transientAnki)
+		if d := lastDelay(h, "register"); d != time.Second {
+			t.Fatalf("transient re-send waits %v, want 1s (a successful registered resets §3.2's counter)", d)
+		}
+	})
 }
 
 // disable stops a pending transient retry and a pending OVERLOADED re-send.

@@ -208,6 +208,15 @@ Running the server side yourself (no production policy layer): accept the WebSoc
 `ws-mixer-server`'s `Listener` instead, which adds subprotocol/bearer-token pre-upgrade checks and
 production auth policy on top of `AcceptConn`.
 
+### Migrating to v0.11.0
+
+v0.11.0 removes the multi-service controller from `mcpwarp`, so every ws-mixer SDK offers the same
+functionality: `NewServiceGroup`, `ServiceGroup` and its methods, `ServiceGroupOptions`, `ServiceGroupConfig`,
+`ServiceConfig`, `ServiceState` and its constants, `ServiceStatus`, `ServiceGroupStatus`,
+`DescribeServiceStatus`, `StatusMessages.Services`, and the `service.*` / `NO_SERVICE_REGISTERED` status
+texts are gone. `Expose` and `NewTunnel` behave as in v0.10.1; for several services on one connection see
+[mcpwarp layer](#mcpwarp-layer).
+
 ### Migrating to v0.10.0
 
 `Client.Connect` returns nil as soon as the first `welcome` has landed. A fatal close right after it (say a
@@ -233,7 +242,10 @@ to the drain's `deadline_ms` + 1000 ms. Its end is reported through `OnDisconnec
 `ClientConfig.OnApp` is bound per `Client`, so `app` messages from the retiring connection keep arriving
 through it during that window. A host that needs per-connection delivery binds `(*Conn).OnApp` inside
 `OnConnect(conn, welcome)`, which replaces the handler on that one connection only (as the `mcpwarp`
-package does); messages that arrive before `OnConnect` runs still go to `ClientConfig.OnApp`.
+package does). Since v0.11.0 a connection's frames (`app`, `drain`, stream `OPEN`) are held from its
+`welcome` until the client makes it current and then delivered in wire order, even if it closes before
+`OnConnect` runs; one delivered before `OnConnect` has bound its handler goes to `ClientConfig.OnApp`. A
+connection that ends before it becomes current drops its held frames, and only its disconnect is reported.
 
 Binding per connection is not enough when the host funnels every connection into one shared handler: the
 retiring connection keeps the handler it was given at its own `OnConnect`. The host must also check each
@@ -287,47 +299,11 @@ plain func), when set, wins over `Token` and is called on every dial; `Configure
 the source in a variable and pass that same value -- a fresh `TokenSourceFunc` per call is a new source, and a
 new one restarts the tunnel.
 
-`NewServiceGroup` publishes several services over one connection (the mcpwarp CLI's case): each
-`ServiceConfig` has its own `Handler` or `Target`, every service has its own state, and a partial failure never
-changes the connection's:
-
-```go
-grp, err := mcpwarp.NewServiceGroup(mcpwarp.ServiceGroupOptions{Integration: id, Logger: slog.Default()})
-grp.Subscribe(func(s mcpwarp.ServiceGroupStatus) {
-	for name, svc := range s.Services { // pending, active, disabled, rejected, taken_over, unregistered
-		text := mcpwarp.DescribeServiceStatus(svc, mcpwarp.DescribeOptions{Locale: "en"})
-		showService(name, text.Label, svc.URL)
-	}
-})
-_ = grp.Configure(ctx, mcpwarp.ServiceGroupConfig{Enabled: true, Token: token, Services: []mcpwarp.ServiceConfig{
-	{Name: "notes", Handler: notesHandler},
-	{Name: "my-files", Target: "http://127.0.0.1:3000/mcp"},
-}})
-_ = grp.AddService(ctx, mcpwarp.ServiceConfig{Name: "calendar", Handler: calHandler}) // no redial
-_ = grp.Disable(ctx, "my-files")                                                        // local: unregistered, 503
-```
-
-A change of `Services` alone is applied on the live connection, diffed by name; a change of `Enabled`, the
-token, `URL` or `WebSocket` restarts it, like a tunnel. `register`/`unregister` frames carry at most
-`MaxServicesPerMessage` (100) names, one frame in flight. A conflict takes over one name only (that service's
-streams are RESET, the rest stay live), and `Enable(name)` is the only way to register a taken-over name again
-short of a restart. The group goes `error`/`INTERNAL` ("No service could be registered.") only when nothing was
-ever registered and every service was refused; a dashboard-disabled service keeps it online.
-
-Requests are routed per stream by the `Host` label, split at its last `-` (`my-files-alice.tunnel.…` →
-`my-files`). `ServiceGroupOptions.TrustServerIDHeader` routes by `X-Mcpwarp-Server-Id` instead; leave it off
-unless your edge sets that header and strips client copies, since otherwise any client can pick the service.
-A request for no configured service gets `503` (`404` off `/mcp`).
-
-A `disabled` service says why in `Code`: `DISABLED` from the dashboard, `""` after a local `Disable`. React to
-dashboard disable/enable by diffing `Subscribe` snapshots per name; a re-enabled service shows `pending`, then
-`active` once its `registered` arrives -- the edge may route to it a moment before that snapshot, and the group
-serves such requests if the service was active earlier on the connection, else answers `503`.
-`ServiceGroupOptions.Metrics` and `(*ServiceGroup).Client()` (the running `wsmixer.Client`, nil while none
-runs) give access to the transport.
-
-`DescribeStatus` takes the group's connection fields (`TunnelStatus{State, Code, LastError}`);
-`DescribeServiceStatus` describes one service, with `DescribeOptions.Messages.Services` overriding labels.
+`Expose` and `NewTunnel` publish one service per connection. A host that publishes several services on one
+connection (the mcpwarp CLI) builds that itself on `EncodeRegisterList`/`EncodeUnregisterList`,
+`RegisterEntry`, `MaxServicesPerMessage`, `DecodeEnvelope` (whose messages carry every entry, by name),
+`IsTransientRegisterError`, `ServerIDHeader`/`ServerNameHeader`, `TokenSource` and `wsmixer.Client`, following
+the spec's multi-service host guidance (MCPWARP.md §6A, §4.8).
 
 `DescribeStatus(status, DescribeOptions{Locale, Messages})` turns a `TunnelStatus` into `{Label, Detail}` in
 one of `StatusLocales` (en, de, es, fr, ja, zh-CN; unknown locales fall back by language, then to en). Its

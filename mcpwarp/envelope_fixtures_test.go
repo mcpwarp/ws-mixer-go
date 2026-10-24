@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -143,6 +144,48 @@ type fixtureService struct {
 	Kind ServiceKind `json:"kind"`
 }
 
+// encodeFixture encodes svcs with the list encoders, checking that a single
+// entry encodes the same through EncodeRegister/EncodeUnregister.
+func encodeFixture(t *testing.T, op string, svcs []fixtureService) string {
+	t.Helper()
+	if op == "register" {
+		entries := make([]RegisterEntry, len(svcs))
+		for i, s := range svcs {
+			entries[i] = RegisterEntry{Name: s.Name, Kind: s.Kind}
+		}
+		enc := EncodeRegisterList(entries)
+		if len(svcs) == 1 && string(EncodeRegister(svcs[0].Name, svcs[0].Kind)) != string(enc) {
+			t.Fatal("EncodeRegister and EncodeRegisterList disagree on one entry")
+		}
+		return string(enc)
+	}
+	names := make([]string, len(svcs))
+	for i, s := range svcs {
+		names[i] = s.Name
+	}
+	enc := EncodeUnregisterList(names)
+	if len(svcs) == 1 && string(EncodeUnregister(svcs[0].Name)) != string(enc) {
+		t.Fatal("EncodeUnregister and EncodeUnregisterList disagree on one entry")
+	}
+	return string(enc)
+}
+
+// The multi-entry register fixtures, whose encode side is host guidance in
+// the fixture runner, as tests of EncodeRegisterList.
+func TestEncodeRegisterListBatchFixtures(t *testing.T) {
+	fixtures := loadEnvelopeFixtures(t, "valid")
+	for _, name := range []string{"register_batch_valid.json", "register_two_services.json"} {
+		f, ok := fixtures[name]
+		if !ok {
+			t.Fatalf("no envelope/valid/%s", name)
+		}
+		svcs := allServices(t, f.Message)
+		if got, want := encodeFixture(t, f.Op, svcs), `{"mcpwarp":`+compactJSON(t, f.Message)+`}`; got != want {
+			t.Fatalf("%s: EncodeRegisterList\n got %s\nwant %s", name, got, want)
+		}
+	}
+}
+
 func allServices(t *testing.T, msg json.RawMessage) []fixtureService {
 	t.Helper()
 	var m struct {
@@ -194,29 +237,13 @@ func TestEnvelopeFixturesValid(t *testing.T) {
 			}
 			if isAgentToEdge(f.Op) {
 				svcs := allServices(t, f.Message)
-				var enc json.RawMessage
-				if f.Op == "register" {
-					entries := make([]RegisterEntry, len(svcs))
-					for i, s := range svcs {
-						entries[i] = RegisterEntry{Name: s.Name, Kind: s.Kind}
+				// The encode side of a multi-entry register is host guidance
+				// (spec v0.8.0 §10.6); TestEncodeRegisterListBatchFixtures
+				// keeps it as a test of EncodeRegisterList.
+				if len(svcs) == 1 {
+					if got, want := encodeFixture(t, f.Op, svcs), `{"mcpwarp":`+compactJSON(t, f.Message)+`}`; got != want {
+						t.Fatalf("encoder output\n got %s\nwant %s", got, want)
 					}
-					enc = EncodeRegisterList(entries)
-					if len(svcs) == 1 && string(EncodeRegister(svcs[0].Name, svcs[0].Kind)) != string(enc) {
-						t.Fatal("EncodeRegister and EncodeRegisterList disagree on one entry")
-					}
-				} else {
-					names := make([]string, len(svcs))
-					for i, s := range svcs {
-						names[i] = s.Name
-					}
-					enc = EncodeUnregisterList(names)
-					if len(svcs) == 1 && string(EncodeUnregister(svcs[0].Name)) != string(enc) {
-						t.Fatal("EncodeUnregister and EncodeUnregisterList disagree on one entry")
-					}
-				}
-				want := `{"mcpwarp":` + compactJSON(t, f.Message) + `}`
-				if string(enc) != want {
-					t.Fatalf("encoder output\n got %s\nwant %s", enc, want)
 				}
 				if len(svcs) > MaxServicesPerMessage {
 					t.Fatalf("%d entries in a valid fixture, over MaxServicesPerMessage", len(svcs))
@@ -259,13 +286,10 @@ func TestEnvelopeFixturesInvalid(t *testing.T) {
 				case code == "UNSUPPORTED_VERSION" || code == "UNKNOWN_OP":
 					requireUnknown(t, f.Message)
 				case code == string(AppTooManyServices):
-					// The edge's whole-frame answer; the agent's side is never
-					// sending it: the group splits into frames of at most 100.
+					// The edge's whole-frame answer to more than
+					// MaxServicesPerMessage entries, which no agent may send.
 					if n := len(allServices(t, f.Message)); n <= MaxServicesPerMessage {
 						t.Fatalf("%d entries, want more than MaxServicesPerMessage", n)
-					}
-					if frames := splitFrames(make([]string, len(allServices(t, f.Message)))); len(frames) < 2 {
-						t.Fatalf("splitFrames kept %d entries in one frame", len(frames[0]))
 					}
 				case strings.HasPrefix(code, "SCHEMA_"):
 					t.Skipf("agent→edge %s: the edge's verdict, not the agent's (§10.2)", code)
@@ -315,6 +339,55 @@ func TestDecodeEnvelopeNotOurs(t *testing.T) {
 		if env != nil || err != nil {
 			t.Errorf("DecodeEnvelope(%s) = (%#v, %v), want (nil, nil)", body, env, err)
 		}
+	}
+}
+
+// IsTransientRegisterError is exactly §2.5's transient set, read from the
+// pinned spec's table (the rows marked ✔ in its T column): hosts key their
+// per-name re-sends on it, so it must not drift from the spec silently.
+func TestIsTransientRegisterErrorSet(t *testing.T) {
+	want := []RegisterErrorCode{RegisterInternal, RegisterNoResponders, RegisterTimeout, RegisterAborted,
+		RegisterConnectionLost, RegisterMalformedReply, RegisterUnavailable, RegisterServiceError}
+	doc := filepath.Join(mcpwarpFixtureDir(t, "envelope"), "..", "..", "..", "..", "docs", "MCPWARP.md")
+	b, err := os.ReadFile(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, sec, ok := strings.Cut(string(b), "### 2.5 ")
+	if !ok {
+		t.Fatal("no §2.5 in MCPWARP.md")
+	}
+	sec, _, _ = strings.Cut(sec, "\n### ")
+	codeRE := regexp.MustCompile("`([A-Z_]+)`")
+	var transient, refusals []RegisterErrorCode
+	for _, line := range strings.Split(sec, "\n") {
+		cols := strings.Split(line, "|")
+		if len(cols) < 4 || !strings.Contains(cols[1], "`") {
+			continue
+		}
+		for _, m := range codeRE.FindAllStringSubmatch(cols[1], -1) {
+			if strings.TrimSpace(cols[2]) == "✔" {
+				transient = append(transient, RegisterErrorCode(m[1]))
+			} else {
+				refusals = append(refusals, RegisterErrorCode(m[1]))
+			}
+		}
+	}
+	if !reflect.DeepEqual(transient, want) {
+		t.Fatalf("§2.5 transient set %v, this SDK's %v", transient, want)
+	}
+	for _, c := range want {
+		if !IsTransientRegisterError(c) {
+			t.Errorf("IsTransientRegisterError(%s) = false", c)
+		}
+	}
+	for _, c := range append(refusals, "SOME_FUTURE_CODE", "") {
+		if IsTransientRegisterError(c) {
+			t.Errorf("IsTransientRegisterError(%q) = true, want a refusal", c)
+		}
+	}
+	if len(refusals) == 0 {
+		t.Fatal("no refusal rows parsed from §2.5")
 	}
 }
 

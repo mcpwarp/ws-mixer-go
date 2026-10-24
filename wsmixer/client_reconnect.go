@@ -1476,6 +1476,10 @@ func (cl *Client) dialOnce(ctx context.Context, token string) (*Conn, *WelcomeMs
 				cl.handleServerDrain(c, d)
 			}
 		},
+		// Nothing is delivered before onAttemptSucceeded makes the conn
+		// current (CLIENT-SDK.md Handler delivery), so boundConn is always
+		// set by the time a drain reaches OnDrain.
+		holdDelivery: true,
 	})
 	if err != nil {
 		return nil, nil, err
@@ -1523,6 +1527,11 @@ func (cl *Client) onAttemptSucceeded(conn *Conn, welcome *WelcomeMsg) {
 	cl.everConnected = true
 	cl.state = clientConnected
 	cl.conn = conn
+	// The conn is current: the frames it received since welcome are now
+	// delivered, in wire order, and stay owed even if it ends before
+	// OnConnect runs (CLIENT-SDK.md Handler delivery). Until OnConnect binds a
+	// handler of its own they reach ClientConfig's.
+	conn.releaseDelivery()
 	// Connect's first result is this welcome, resolved under cl.mu before
 	// watchConn starts: every other finishFirstResult caller (goFatal,
 	// onAttemptFailed, reportAndSchedule, closeStart) sets cl.closing under

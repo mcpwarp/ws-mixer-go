@@ -44,27 +44,6 @@ type agentConfig struct {
 	after        afterFunc                       // test seam; nil → time.AfterFunc
 	headDeadline time.Duration                   // test seam; 0 → 10 s
 	newTransport func(transportConfig) transport // test seam; nil → wsmixer.Client
-
-	group *groupAgentConfig // a ServiceGroup's connection: name, kind and handler/target are per service
-}
-
-// groupAgentConfig is a group connection's initial services.
-type groupAgentConfig struct {
-	services    []groupServiceInit
-	trustHeader bool
-}
-
-// registrar is the registration state machine under an agent: session for
-// one service, groupSession for a ServiceGroup.
-type registrar interface {
-	onWelcome(c appConn)
-	onConnEnd(c appConn)
-	onApp(c appConn, body []byte)
-	onReplaced() bool
-	closingNow() bool
-	beginCloseAsync(ctx context.Context, budget time.Duration, done func())
-	abortClose()
-	markClosed()
 }
 
 // helloMeta is hello.meta (§3.1).
@@ -82,14 +61,12 @@ type helloMeta struct {
 // transport callback, so a fake transport and clock drive it synchronously.
 type agent struct {
 	cfg     agentConfig
-	session *session      // one service; nil for a group
-	group   *groupSession // a group; nil for one service
-	reg     registrar
+	session *session
 	bridge  *bridge
 	tr      transport
 
 	streamsMu sync.Mutex
-	streams   map[*wsmixer.Stream]string // being served, with a group's selected service
+	streams   map[*wsmixer.Stream]struct{} // being served
 
 	heldMu          sync.Mutex
 	holdDisconnects bool // a drain{replaced} take-over waits for its conflict event
@@ -123,37 +100,24 @@ func newAgent(cfg agentConfig) *agent {
 		osName = cfg.os
 	}
 
-	a := &agent{cfg: cfg, done: make(chan struct{}), streams: map[*wsmixer.Stream]string{}}
-	activeConn := func() appConn { return a.tr.active() }
-	b := bridge{
-		maxBodyBytes: cfg.maxBodyBytes,
-		onError:      func(err error) { a.emit(event{kind: evError, err: err}) },
-		headDeadline: cfg.headDeadline,
-	}
-	if g := cfg.group; g != nil {
-		a.group = newGroupSession(groupDeps{
-			after:       cfg.after,
-			emit:        a.emit,
-			fatal:       a.onSessionFatal,
-			activeConn:  activeConn,
-			trustHeader: g.trustHeader,
-		}, g.services)
-		a.reg = a.group
-		b.route = a.route
-	} else {
-		a.session = newSession(sessionDeps{
-			name:       cfg.name,
-			kind:       cfg.kind,
-			after:      cfg.after,
-			emit:       a.emit,
-			fatal:      a.onSessionFatal,
-			activeConn: activeConn,
-		})
-		a.reg = a.session
-		b.availability = a.session.availability
-		b.handler, b.target, b.targetTimeout = cfg.handler, cfg.target, cfg.targetTimeout
-	}
-	a.bridge = newBridge(b, cfg.transport)
+	a := &agent{cfg: cfg, done: make(chan struct{}), streams: map[*wsmixer.Stream]struct{}{}}
+	a.session = newSession(sessionDeps{
+		name:       cfg.name,
+		kind:       cfg.kind,
+		after:      cfg.after,
+		emit:       a.emit,
+		fatal:      a.onSessionFatal,
+		activeConn: func() appConn { return a.tr.active() },
+	})
+	a.bridge = newBridge(bridge{
+		availability:  a.session.availability,
+		maxBodyBytes:  cfg.maxBodyBytes,
+		handler:       cfg.handler,
+		target:        cfg.target,
+		targetTimeout: cfg.targetTimeout,
+		onError:       func(err error) { a.emit(event{kind: evError, err: err}) },
+		headDeadline:  cfg.headDeadline,
+	}, cfg.transport)
 
 	newTransport := cfg.newTransport
 	if newTransport == nil {
@@ -170,11 +134,10 @@ func newAgent(cfg agentConfig) *agent {
 		reconnect:   cfg.reconnect,
 		httpClient:  cfg.httpClient,
 		name:        cfg.name,
-		group:       cfg.group != nil,
 		events: transportEvents{
-			connect:    a.reg.onWelcome,
-			connEnd:    a.reg.onConnEnd,
-			app:        a.reg.onApp,
+			connect:    a.session.onWelcome,
+			connEnd:    a.session.onConnEnd,
+			app:        a.session.onApp,
 			drain:      a.onDrain,
 			disconnect: a.onDisconnect,
 			retry:      a.onReconnect,
@@ -193,7 +156,7 @@ func (a *agent) client() *wsmixer.Client { return a.tr.client() }
 // each other, and the shared delivery goroutine never waits on a request.
 func (a *agent) onStream(st *wsmixer.Stream) {
 	a.streamsMu.Lock()
-	a.streams[st] = ""
+	a.streams[st] = struct{}{}
 	a.streamsMu.Unlock()
 	go func() {
 		defer func() {
@@ -203,36 +166,6 @@ func (a *agent) onStream(st *wsmixer.Stream) {
 		}()
 		a.bridge.serve(st, st.Conn().Done())
 	}()
-}
-
-// route is a group's per-stream selection (§4.8); the stream is tagged
-// with the selected service, for a per-name take-over.
-func (a *agent) route(st bridgeStream, head *requestHead) routeResult {
-	r, name := a.group.route(head)
-	if ws, ok := st.(*wsmixer.Stream); ok && name != "" {
-		a.streamsMu.Lock()
-		if _, live := a.streams[ws]; live {
-			a.streams[ws] = name
-		}
-		a.streamsMu.Unlock()
-	}
-	return r
-}
-
-// resetService RESETs the streams being served for one taken-over name
-// (§3.3 Per name); the others go on.
-func (a *agent) resetService(name string) {
-	a.streamsMu.Lock()
-	var cut []*wsmixer.Stream
-	for st, n := range a.streams {
-		if n == name {
-			cut = append(cut, st)
-		}
-	}
-	a.streamsMu.Unlock()
-	for _, st := range cut {
-		_ = st.Reset(wsmixer.CancelCode, takenOverMessage)
-	}
 }
 
 func (a *agent) onDisconnect(r wsmixer.DisconnectReason) {
@@ -283,11 +216,11 @@ func (a *agent) onDrain(reason string) {
 	a.heldMu.Lock()
 	a.holdDisconnects = true
 	a.heldMu.Unlock()
-	tookOver := a.reg.onReplaced()
+	tookOver := a.session.onReplaced()
 	if !tookOver {
 		a.releaseDisconnects()
 	}
-	if tookOver || a.reg.closingNow() {
+	if tookOver || a.session.currentState() == stateClosing {
 		a.closeTakenOver()
 	}
 }
@@ -327,12 +260,9 @@ func (a *agent) emit(ev event) {
 	if a.cfg.emit != nil {
 		a.cfg.emit(ev)
 	}
-	switch ev.kind {
-	case evConflict:
+	if ev.kind == evConflict {
 		a.releaseDisconnects()
 		a.closeTakenOver()
-	case evServiceConflict:
-		a.resetService(ev.serviceName)
 	}
 }
 
@@ -363,7 +293,7 @@ func (a *agent) closeAsync(ctx context.Context, done func()) {
 	}
 	a.closing = true
 	a.closeMu.Unlock()
-	a.reg.beginCloseAsync(ctx, unregisterBudget, func() {
+	a.session.beginCloseAsync(ctx, unregisterBudget, func() {
 		a.tr.close(false, func() {
 			a.finish(nil)
 			a.closeMu.Lock()
@@ -387,7 +317,7 @@ func (a *agent) close(ctx context.Context) error {
 	case <-ch:
 		return nil
 	case <-ctx.Done():
-		a.reg.abortClose()
+		a.session.abortClose()
 		return ctx.Err()
 	}
 }
@@ -403,7 +333,7 @@ func (a *agent) finish(err error) {
 	a.finished = true
 	a.err = err
 	a.closeMu.Unlock()
-	a.reg.markClosed()
+	a.session.markClosed()
 	close(a.done)
 	// Outside any lock: the listener may close this agent in turn.
 	a.emit(event{kind: evClose, err: err})

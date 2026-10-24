@@ -42,6 +42,10 @@ type ClientOptions struct {
 	// OnDrain is called when the server sends `drain`. The Go client does not
 	// reconnect on its own; the caller decides what to do.
 	OnDrain func(*DrainMsg)
+
+	// holdDelivery: the Client's dials. Nothing is delivered until the Client
+	// makes the connection current (Conn.releaseDelivery).
+	holdDelivery bool
 }
 
 // postUpgradeError marks a clientHandshake failure as having happened after
@@ -104,6 +108,9 @@ func Dial(ctx context.Context, url string, opts ClientOptions) (*Conn, error) {
 
 	c := newConn(ws, RoleClient, opts.Options)
 	c.hp.Store(&handlers{onStream: opts.OnStream, onApp: opts.OnApp, onDrain: opts.OnDrain})
+	if opts.holdDelivery {
+		c.deliveryGate = make(chan struct{})
+	}
 
 	if err := clientHandshake(ctx, c, opts); err != nil {
 		if ce, ok := err.(*ConnError); ok {

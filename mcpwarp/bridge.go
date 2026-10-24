@@ -51,30 +51,16 @@ type bridge struct {
 	onError       func(error)
 	headDeadline  time.Duration
 
-	// route, when set, selects the application per stream after the path
-	// check (§4.8) and replaces availability and handler/target.
-	route func(st bridgeStream, head *requestHead) routeResult
-
 	single *app
 }
 
-// app is where one service's requests go: a handler, or a target URL with
+// app is where the service's requests go: a handler, or a target URL with
 // its client and timeout.
 type app struct {
-	name          string // a group's service name; "" for a single service
 	handler       http.Handler
 	target        *url.URL
 	targetTimeout time.Duration
 	targetClient  *http.Client
-}
-
-// routeResult is a multi-service selection (§4.8 Precedence with
-// selection): reset (row 3c), unavailable (a 503 message, rows 3a, 3b,
-// 3d, 3e), or the app to call.
-type routeResult struct {
-	app         *app
-	reset       bool
-	unavailable string
 }
 
 func newApp(handler http.Handler, target *url.URL, targetTimeout time.Duration, transport http.RoundTripper) *app {
@@ -104,9 +90,7 @@ func newBridge(b bridge, transport http.RoundTripper) *bridge {
 	if b.onError == nil {
 		b.onError = func(error) {}
 	}
-	if b.route == nil {
-		b.single = newApp(b.handler, b.target, b.targetTimeout, transport)
-	}
+	b.single = newApp(b.handler, b.target, b.targetTimeout, transport)
 	return &b
 }
 
@@ -114,11 +98,9 @@ func newBridge(b bridge, transport http.RoundTripper) *bridge {
 // CLOSE or RESET (or leaves it to a connection that is already gone).
 // connDone is the connection's Done channel, for edge cancellation.
 func (b *bridge) serve(st bridgeStream, connDone <-chan struct{}) {
-	if b.route == nil {
-		if conflict, _ := b.availability(); conflict {
-			_ = st.Reset(wsmixer.CancelCode, takenOverMessage)
-			return
-		}
+	if conflict, _ := b.availability(); conflict {
+		_ = st.Reset(wsmixer.CancelCode, takenOverMessage)
+		return
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -155,17 +137,11 @@ func (b *bridge) serve(st bridgeStream, connDone <-chan struct{}) {
 		b.refuse(st, r, http.StatusNotFound, "not_found", head.method)
 		return
 	}
-	sel := routeResult{app: b.single}
-	if b.route != nil {
-		sel = b.route(st, head)
-	} else {
-		sel.reset, sel.unavailable = b.availability()
-	}
-	if sel.reset {
+	if conflict, unavailable := b.availability(); conflict {
 		_ = st.Reset(wsmixer.CancelCode, takenOverMessage)
 		return
-	} else if sel.unavailable != "" {
-		b.refuse(st, r, http.StatusServiceUnavailable, sel.unavailable, head.method)
+	} else if unavailable != "" {
+		b.refuse(st, r, http.StatusServiceUnavailable, unavailable, head.method)
 		return
 	}
 	body, err := readRequestBody(r, head, b.maxBodyBytes)
@@ -183,10 +159,10 @@ func (b *bridge) serve(st bridgeStream, connDone <-chan struct{}) {
 		return
 	}
 	go b.watchEdgeCancel(ctx, cancel, st, connDone)
-	if sel.app.handler != nil {
-		b.serveHandler(ctx, st, sel.app, head, target, body)
+	if b.single.handler != nil {
+		b.serveHandler(ctx, st, b.single, head, target, body)
 	} else {
-		b.serveTarget(ctx, st, sel.app, head, target, body)
+		b.serveTarget(ctx, st, b.single, head, target, body)
 	}
 }
 
@@ -416,11 +392,6 @@ func (b *bridge) serveTarget(ctx context.Context, st bridgeStream, a *app, head 
 			msg += " (" + code + ")"
 		}
 		b.reply(st, http.StatusBadGateway, msg, head.method)
-		if a.name != "" {
-			// A group's service: logged with its name and target (§6A.4 has
-			// no lastError for an active service, so the log is the only place).
-			b.onError(fmt.Errorf("mcpwarp: service %q: %s at %s", a.name, msg, a.target.Redacted()))
-		}
 		return
 	}
 	defer resp.Body.Close()

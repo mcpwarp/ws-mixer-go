@@ -206,6 +206,8 @@ type Conn struct {
 	peerLastStreamID   uint32              // client-only: last_stream_id from the server's drain message
 	peerDrained        bool                // client-only: the server's drain arrived (peerLastStreamID is set)
 	peerDrainMsg       *DrainMsg           // client-only: that drain, recorded on arrival, before its delivery
+	deliveryGate       chan struct{}       // a Client's connection: closed once it is current; nil delivers at once
+	deliveryState      int8                // deliveryHeld, deliveryReleased or deliveryDropped
 	selfDrained        bool                // this side ran its own Drain()
 	outstandingPings   map[int64]time.Time // ids in [lowestUnacked, nextPingID) still awaiting a pong
 	lowestUnacked      int64               // watermark: every id below this has been acked at least once
@@ -445,6 +447,25 @@ func (c *Conn) Run() {
 // already, unambiguously, arrived. flushDeliveryQueue drains exactly that
 // backlog, in order, before this returns.
 func (c *Conn) deliveryLoop() {
+	// A Client's connection delivers nothing until the Client has made it
+	// current (CLIENT-SDK.md Handler delivery): frames received since welcome
+	// wait in the queue, in wire order. One that ends before it ever becomes
+	// current owes nothing; only its disconnect is reported.
+	if g := c.deliveryGate; g != nil {
+		select {
+		case <-g:
+		case <-c.closed:
+			c.mu.Lock()
+			if c.deliveryState == deliveryHeld {
+				c.deliveryState = deliveryDropped
+			}
+			released := c.deliveryState == deliveryReleased
+			c.mu.Unlock()
+			if !released {
+				return
+			}
+		}
+	}
 	for {
 		select {
 		case ev := <-c.deliveryQueue:
@@ -512,6 +533,41 @@ func (c *Conn) enqueueDelivery(ev deliveryEvent) (ok bool) {
 
 // Session returns the handshake-assigned connection id (welcome.session).
 func (c *Conn) Session() string { return c.session }
+
+// deliveryState values: a held gate is either released (the connection
+// became current; its frames are owed even after it ends) or dropped (it
+// ended first). Decided once, under c.mu.
+const (
+	deliveryHeld int8 = iota
+	deliveryReleased
+	deliveryDropped
+)
+
+// releaseDelivery opens deliveryGate as the Client makes this connection
+// current: its queued and later frames are delivered, even if it closes
+// right after. A connection that had already ended never became current: its
+// queued frames are dropped with it and only its disconnect is reported
+// (spec D-2026-10-24-03).
+func (c *Conn) releaseDelivery() {
+	if c.deliveryGate == nil {
+		return
+	}
+	c.mu.Lock()
+	if c.deliveryState != deliveryHeld {
+		c.mu.Unlock()
+		return
+	}
+	select {
+	case <-c.closed:
+		c.deliveryState = deliveryDropped
+		c.mu.Unlock()
+		return
+	default:
+	}
+	c.deliveryState = deliveryReleased
+	c.mu.Unlock()
+	close(c.deliveryGate)
+}
 
 // receivedDrain is the server's drain message once it has arrived on this
 // connection (client side), whether or not it has been delivered yet.

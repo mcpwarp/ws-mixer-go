@@ -1205,7 +1205,7 @@ links its own spec counterpart explicitly, so read the link, not the number.
   retire the stream before the frame is queued, so a peer frame for that id arriving once the frame is out
   (WINDOW increment 0 included) is discarded as stale (WIRE.md §2.5), never answered with
   RESET(PROTOCOL_ERROR) for a stream already reset (`TestStreamResetRetiresBeforeSending`).
-  Open (pre-existing, present in v0.10.0): a server `drain` that arrives after `welcome` but before the client
+  Fixed in v0.11.0 (D-2026-10-24-01; was open, pre-existing, present in v0.10.0): a server `drain` that arrives after `welcome` but before the client
   has taken ownership of the connection (published it as `cl.conn` in `onAttemptSucceeded`; the drain is
   delivered on the connection's own delivery goroutine, unordered against that) is not handled as a drain:
   delivered before `dialOnce` binds its handler it is dropped (`client_reconnect.go:1475`, the
@@ -1215,3 +1215,53 @@ links its own spec counterpart explicitly, so read the link, not the number.
   connection-ownership and retry ordering. The tests that hit it (`TestClientDrainRaceWinnerThenDrainAgain`,
   `TestClientDrainThenErrorCloseDeliversOnDrain`) now wait for the client to own the connection before the
   server drains, so they are deterministic.
+
+## 2026-10-24
+
+- **D-2026-10-24-01** — v0.11.0, BREAKING (Anatoly's decision): every SDK offers the same functionality, so the
+  multi-service controller of D-2026-10-19-02 leaves `mcpwarp`. Removed: `NewServiceGroup`, `ServiceGroup` and
+  its methods (`Configure`, `Stop`, `Dispose`, `AddService`, `RemoveService`, `Enable`, `Disable`, `Status`,
+  `Subscribe`, `Client`), `ServiceGroupOptions` (incl. `TrustServerIDHeader`, `Metrics`), `ServiceGroupConfig`,
+  `ServiceConfig`, `ServiceState` and its six constants, `ServiceStatus`, `ServiceGroupStatus`,
+  `DescribeServiceStatus`, `StatusMessages.Services`, the `service.*` and `lastError.NO_SERVICE_REGISTERED`
+  status-text tables (a §6A.9 key, the group's G5 text, not a tunnel lastError) and `DescribeStatus`'s G5 detail
+  rule; `group.go`, `group_session.go`, `group_status.go` and their tests and fixture runner; the bridge's
+  per-stream route hook (Host label split, `X-Mcpwarp-Server-Id` trust gate), the agent's `registrar` interface,
+  per-name stream reset and stream tagging, the group's 502 warn line, the `closeFrameKey` and
+  `transportConfig.group` seams. `Expose` and `NewTunnel` behave as in v0.10.1 (their session, the v0.7.x
+  rulings, the drain and Reset fixes are unchanged); `wsmixer` is unchanged.
+  Kept, because a multi-service host such as the mcpwarp CLI builds on them: `RegisterEntry`,
+  `EncodeRegisterList`, `EncodeUnregisterList`, `MaxServicesPerMessage`, `EncodeRegister`/`EncodeUnregister`,
+  `DecodeEnvelope` with its per-name messages (it validates and keeps every entry of a batch reply, and the
+  single-service session ignores other names, §2.3), `RegisterErrorCode`/`AppErrorCode`/`IsTransientRegisterError`
+  (its doc now lists §2.5's transient set; `TestIsTransientRegisterErrorSet` compares it with the pinned spec's
+  table), `ServiceNameRE`/`ServiceNameMax`/`IsValidServiceName`/`DefaultURL`, `ServerIDHeader`/`ServerNameHeader`
+  (moved to `envelope.go`), `TokenSource`/`TokenSourceFunc`, `Error`, and the `Expose`/`Tunnel`/status-text API.
+  `version.SDK` → `0.11.0`; README: the service-group section replaced by a pointer to §6A, and "Migrating to
+  v0.11.0". `spec.pin` → `v0.8.0` (5962fec), which makes §6A informative and classifies the fixtures (MCPWARP.md §10.6,
+  spec/README.md "Fixture classification"). The runners follow it, skipping with "host guidance (spec v0.8.0
+  §10.6)": tunnel `ms_01`..`ms_14`; the four `multi_service_*` bridging fixtures; status-text `cases.json` cases
+  with `input.service` or an `input.status` carrying `services` (`rules.json` `hostOnlyCases`, whose two
+  markers the runner takes from its text); the
+  `rules.json` `hostOnly` keys are neither generated nor compared (the generator reads that list); the encoder
+  comparison of `register_batch_valid`/`register_two_services` (kept as `TestEncodeRegisterListBatchFixtures`).
+  Every envelope decode case, tunnel 01..45 and every other bridging and status-text case run; §10.6's
+  "schema verdict" rows are checker tooling, so the runners assert wire verdicts only.
+  Core (`wsmixer`, CLIENT-SDK.md Handler delivery, spec D-2026-10-24-03): a Client's connection delivers
+  nothing between `welcome` and becoming current. Its frames (`app`, `drain`, stream `OPEN`) wait in the
+  delivery queue, in wire order, and are delivered from the moment the Client makes it current (under `cl.mu`,
+  as `onAttemptSucceeded` publishes it): until `OnConnect` binds a handler of its own they reach
+  `ClientConfig`'s handlers (mcpwarp's unattributed path). A drain in that window is now the drain hand-over,
+  not a stale close. Whether the connection became current or ended first is decided once, under the
+  connection's lock: one that became current owes its frames even if it closes before `OnConnect` runs (an
+  `error`/`conflict` op right before a 4014 still reaches the layer, MCPWARP.md §2.7); one that ended first
+  drops them, and only its disconnect is reported. A connection that loses a drain race is still closed as
+  stale. `Dial` alone delivers at once, as before (`TestClientFramesBeforeCurrentAreQueued`: drain hand-over,
+  app messages in order once current, frames dropped for a connection that closed first, frames still
+  delivered for one that closed after becoming current but before its `OnConnect`).
+  Single-service session (spec v0.8.0 §2.6, D-2026-10-24-03): during an OVERLOADED pause a `registered` naming
+  the service settles the handle, cancels the re-send and resets the OVERLOADED counter (unchanged); an empty
+  `registered` or an error op answers nothing and leaves the counter and the re-send as they are (they used to
+  settle the frame, reset the counter and, for the empty reply, schedule a transient re-send); a `registered`
+  with nothing outstanding and no pause leaves the OVERLOADED counter alone (it used to reset it), the transient
+  counter following §3.2 as before (`TestSessionOverloadedPauseReplies`). `version.SDK` stays `0.11.0`.

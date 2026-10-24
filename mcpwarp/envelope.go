@@ -64,7 +64,12 @@ const (
 )
 
 // IsTransientRegisterError reports whether code is retried on the same
-// connection with backoff instead of being a refusal (TRANSIENT_REGISTER_ERRORS).
+// connection with backoff instead of being a refusal: exactly §2.5's
+// TRANSIENT_REGISTER_ERRORS, INTERNAL, NO_RESPONDERS, TIMEOUT, ABORTED,
+// CONNECTION_LOST, MALFORMED_REPLY, UNAVAILABLE and SERVICE_ERROR. Every
+// other code, unknown ones included, is a refusal (SERVER_DISABLED being the
+// dashboard-disabled one). A host that registers several names keys its
+// per-name re-send on this (§3.2 Transient per name).
 func IsTransientRegisterError(code RegisterErrorCode) bool {
 	switch code {
 	case RegisterInternal, RegisterNoResponders, RegisterTimeout, RegisterAborted,
@@ -201,6 +206,15 @@ func EncodeRegister(name string, kind ServiceKind) json.RawMessage {
 func EncodeUnregister(name string) json.RawMessage {
 	return encodeBody(unregisterEnvelope{V: envelopeVersion, Op: "unregister", Services: []unregisterService{{Name: name}}})
 }
+
+// ServerIDHeader and ServerNameHeader are the edge-added routing headers
+// (§4.8), for a host that routes several services itself. This SDK's
+// single-service bridge serves every stream with its one service and
+// forwards both headers to the application unchanged.
+const (
+	ServerIDHeader   = "X-Mcpwarp-Server-Id"
+	ServerNameHeader = "X-Mcpwarp-Server-Name"
+)
 
 // MaxServicesPerMessage is the most entries one register/unregister may
 // carry (§2.1 Batch); the edge answers a larger register with the

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -499,6 +500,235 @@ func TestClientDrainThenGoingAwayCloseSeenFirstIsHandOver(t *testing.T) {
 	if r := rec.waitNext(t); r.Fatal {
 		t.Fatalf("the close after the drain was reported fatal: %+v", r)
 	}
+}
+
+// isRunning reports whether the conn's loops have started (its writer can
+// flush a frame).
+func (c *Conn) isRunning() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.running
+}
+
+// CLIENT-SDK.md Handler delivery (spec v0.8.0): frames a connection receives
+// after its welcome but before the client makes it current are queued and
+// delivered once it is, not dropped or treated as stale. probeWidenWindow
+// holds that window open while the server's drain and app messages arrive.
+func TestClientFramesBeforeCurrentAreQueued(t *testing.T) {
+	t.Run("drain is a hand-over", func(t *testing.T) {
+		deadlineMS := int64(30_000)
+		var conns atomic.Int32
+		_, url := startTestServer(t, testAcceptHandler{OnConn: func(c *Conn) {
+			if conns.Add(1) != 1 {
+				return // only the first connection is drained
+			}
+			go func() {
+				for !c.isRunning() {
+					time.Sleep(time.Millisecond)
+				}
+				_ = c.sendControl(&DrainMsg{T: "drain", Reason: "rollout", DeadlineMS: &deadlineMS})
+			}()
+		}})
+		var first atomic.Bool
+		probeWidenWindow = func() {
+			if first.CompareAndSwap(false, true) {
+				time.Sleep(200 * time.Millisecond) // the drain arrives in here
+			}
+		}
+		t.Cleanup(func() { probeWidenWindow = nil })
+		reconnects := make(chan ReconnectInfo, 4)
+		rec := newDisconnectRecorder()
+		cl := NewClient(url, StaticToken("tok"), ClientConfig{
+			Reconnect:    testReconnectOptions(&fakeAfter{}, 0),
+			OnReconnect:  func(i ReconnectInfo) { reconnects <- i },
+			OnDisconnect: rec.onDisconnect,
+		})
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := cl.Connect(ctx); err != nil {
+			t.Fatalf("Connect: %v", err)
+		}
+		defer cl.Close(context.Background())
+		select {
+		case i := <-reconnects:
+			if i.Cause != ReconnectDrain || i.Attempt != 0 {
+				t.Fatalf("OnReconnect %+v, want the drain hand-over", i)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("no reconnect for the drain")
+		}
+		// A hand-over retires the drained conn only after its replacement's
+		// welcome: its end is reported Superseded. A stale close would end it
+		// first, unsuperseded.
+		if r := rec.waitNext(t); !r.Superseded || r.Fatal {
+			t.Fatalf("the drained connection ended with %+v, want a superseded hand-over end", r)
+		}
+	})
+	t.Run("closed before current drops its frames", func(t *testing.T) {
+		var conns atomic.Int32
+		_, url := startTestServer(t, testAcceptHandler{OnConn: func(c *Conn) {
+			if conns.Add(1) != 1 {
+				return
+			}
+			go func() {
+				for !c.isRunning() {
+					time.Sleep(time.Millisecond)
+				}
+				_ = c.SendApp(context.Background(), map[string]int{"seq": 1})
+				_ = c.Close(uint32(InternalErrorCode), "gone right after welcome")
+			}()
+		}})
+		var first atomic.Bool
+		probeWidenWindow = func() {
+			if first.CompareAndSwap(false, true) {
+				time.Sleep(300 * time.Millisecond) // the app and the close land in here
+			}
+		}
+		t.Cleanup(func() { probeWidenWindow = nil })
+		var apps atomic.Int32
+		rec := newDisconnectRecorder()
+		cl := NewClient(url, StaticToken("tok"), ClientConfig{
+			Reconnect:    testReconnectOptions(&fakeAfter{}, 0),
+			OnApp:        func(json.RawMessage) { apps.Add(1) },
+			OnDisconnect: rec.onDisconnect,
+		})
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := cl.Connect(ctx); err != nil {
+			t.Fatalf("Connect: %v", err)
+		}
+		defer cl.Close(context.Background())
+		r := rec.waitNext(t)
+		if r.Phase != PhaseConnected || r.Fatal {
+			t.Fatalf("disconnect %+v, want a non-fatal connected-phase loss", r)
+		}
+		time.Sleep(200 * time.Millisecond)
+		if n := apps.Load(); n != 0 {
+			t.Fatalf("%d app messages delivered for a connection that never became current, want none", n)
+		}
+	})
+	t.Run("current then closed still flushes", func(t *testing.T) {
+		// Conn 2 becomes current, then gets an app op and its 4014 close
+		// while callbackLoop is still busy (conn 1's slow OnDisconnect), so
+		// before its OnConnect runs. Having become current it owes the op
+		// (MCPWARP.md §2.7: an ended connection's error/conflict still apply).
+		var conns atomic.Int32
+		_, url := startTestServer(t, testAcceptHandler{OnConn: func(c *Conn) {
+			n := conns.Add(1)
+			go func() {
+				for !c.isRunning() {
+					time.Sleep(time.Millisecond)
+				}
+				switch n {
+				case 1:
+					_ = c.Close(uint32(ProtocolErrorCode), "drop conn 1")
+				case 2:
+					_ = c.SendApp(context.Background(), map[string]string{"op": "error", "code": "CONNECTION_LIMIT"})
+					_ = c.Close(uint32(ApplicationCloseCode), "CONNECTION_LIMIT: over")
+				}
+			}()
+		}})
+		var mu sync.Mutex
+		var order []string
+		note := func(s string) { mu.Lock(); order = append(order, s); mu.Unlock() }
+		var disconnects atomic.Int32
+		cl := NewClient(url, StaticToken("tok"), ClientConfig{
+			Reconnect: testReconnectOptions(&fakeAfter{}, 0),
+			OnConnect: func(*Conn, *WelcomeMsg) { note("connect") },
+			OnApp:     func(body json.RawMessage) { note("app " + string(body)) },
+			OnDisconnect: func(r DisconnectReason) {
+				n := disconnects.Add(1)
+				note(fmt.Sprintf("disconnect %d", n))
+				if n == 1 {
+					time.Sleep(300 * time.Millisecond) // callbackLoop busy while conn 2 lands and ends
+				}
+			},
+		})
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := cl.Connect(ctx); err != nil {
+			t.Fatalf("Connect: %v", err)
+		}
+		defer cl.Close(context.Background())
+		deadline := time.Now().Add(5 * time.Second)
+		for disconnects.Load() < 2 && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
+		mu.Lock()
+		got := append([]string(nil), order...)
+		mu.Unlock()
+		app, d2 := -1, -1
+		for i, s := range got {
+			switch {
+			case strings.HasPrefix(s, "app ") && app < 0:
+				app = i
+			case s == "disconnect 2":
+				d2 = i
+			}
+		}
+		if app < 0 || d2 < 0 || app > d2 {
+			t.Fatalf("callbacks %q: want conn 2's app op delivered before its disconnect", got)
+		}
+	})
+	t.Run("app messages wait for current, in order", func(t *testing.T) {
+		_, url := startTestServer(t, testAcceptHandler{OnConn: func(c *Conn) {
+			go func() {
+				for !c.isRunning() {
+					time.Sleep(time.Millisecond)
+				}
+				for i := 1; i <= 3; i++ {
+					_ = c.SendApp(context.Background(), map[string]int{"seq": i})
+				}
+			}()
+		}})
+		var first atomic.Bool
+		probeWidenWindow = func() {
+			if first.CompareAndSwap(false, true) {
+				time.Sleep(200 * time.Millisecond)
+			}
+		}
+		t.Cleanup(func() { probeWidenWindow = nil })
+		var cl *Client
+		var mu sync.Mutex
+		var got []string
+		notCurrent := 0
+		done := make(chan struct{})
+		doneOnce := onceCloser(done)
+		cl = NewClient(url, StaticToken("tok"), ClientConfig{
+			Reconnect: testReconnectOptions(&fakeAfter{}, 0),
+			OnApp: func(body json.RawMessage) {
+				mu.Lock()
+				defer mu.Unlock()
+				if cl.Conn() == nil {
+					notCurrent++
+				}
+				got = append(got, string(body))
+				if len(got) == 3 {
+					doneOnce()
+				}
+			},
+		})
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := cl.Connect(ctx); err != nil {
+			t.Fatalf("Connect: %v", err)
+		}
+		defer cl.Close(context.Background())
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("the app messages were not delivered")
+		}
+		time.Sleep(50 * time.Millisecond)
+		mu.Lock()
+		defer mu.Unlock()
+		if want := []string{`{"seq":1}`, `{"seq":2}`, `{"seq":3}`}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("delivered %q, want %q exactly once, in order", got, want)
+		}
+		if notCurrent != 0 {
+			t.Fatalf("%d messages delivered before the connection was current", notCurrent)
+		}
+	})
 }
 
 // onceCloser returns a func that closes ch the first time only, for a

@@ -42,10 +42,6 @@ type tunnelRunner struct {
 	overload int         // expected attempt of the next OVERLOADED re-send
 	snaps    []TunnelStatus
 
-	group      bool        // a group fixture (config.services)
-	sentFrames []sentFrame // a group's register/unregister frames not yet matched by a sent event
-	groupSnaps []ServiceGroupStatus
-
 	providers       map[string]TokenSource // one source per token value (token_provider fixtures)
 	providerResults []string               // results of the next provider calls
 	drainRetryAfter time.Duration          // the last drain's retry_after_ms, for its retry event
@@ -296,15 +292,11 @@ func (d *fakeDial) Done() <-chan struct{} {
 	return nil
 }
 
-func (d *fakeDial) SendApp(ctx context.Context, body any) error {
+func (d *fakeDial) SendApp(_ context.Context, body any) error {
 	if d.ended || d.abandoned || !d.welcomed {
 		return errors.New("fake: connection gone")
 	}
 	b, _ := json.Marshal(body)
-	if d.tr.cfg.group {
-		d.tr.r.groupFrame(ctx, d, b)
-		return nil
-	}
 	if string(b) == string(EncodeUnregister(d.tr.cfg.name)) && !d.held {
 		d.tr.cfg.events.app(d, []byte(fmt.Sprintf(`{"mcpwarp":{"v":1,"op":"unregistered","services":[{"name":%q}]}}`, d.tr.cfg.name)))
 	}
@@ -643,11 +635,9 @@ func (r *tunnelRunner) matchRetry(cause string, delay time.Duration) {
 		case "register":
 			return ri.Delay == delay && strings.HasPrefix(ri.Reason, "register failed: ") && !strings.HasPrefix(ri.Reason, "register failed: OVERLOADED: ")
 		case "overloaded":
-			want := time.Second // always 1000 in a single-service fixture
-			if r.group {
-				want = delay
-			}
-			return ri.Delay == want && strings.HasPrefix(ri.Reason, "register failed: OVERLOADED: ")
+			// min(1000 × 2^(n-1), 30000) for the n-th consecutive OVERLOADED
+			// (tunnel/README.md); each single-service fixture has n = 1.
+			return ri.Delay == delay && strings.HasPrefix(ri.Reason, "register failed: OVERLOADED: ")
 		case "drain":
 			return ri.Attempt == 0 && ri.Reason == "drain" && ri.Delay <= delay && ri.Delay >= r.drainRetryAfter
 		case "token-refresh":
@@ -795,6 +785,15 @@ func snapString(ss []TunnelStatus) string {
 	return b.String()
 }
 
+// hostGuidanceSkip is the skip reason for the fixtures MCPWARP.md §10.6 and
+// spec/README.md "Fixture classification" class as host guidance (tunnel
+// ms_01..ms_14, the four multi_service_* bridging fixtures, rules.json's
+// hostOnlyCases): an SDK runner skips them by default.
+const hostGuidanceSkip = "host guidance (spec v0.8.0 §10.6)"
+
+// hostGuidanceTunnel is §10.6's tunnel ms_01..ms_14 (tunnel/ms_NN_*.json).
+func hostGuidanceTunnel(name string) bool { return strings.HasPrefix(name, "ms_") }
+
 // tunnelFixtureSkips are fixtures whose inputs Go's types cannot express.
 var tunnelFixtureSkips = map[string]string{
 	"07_invalid_config.json": "drives §6.2 checks 4/5 with token/name null; Go's TunnelConfig has string fields, so a null is \"\" " +
@@ -826,22 +825,21 @@ func TestTunnelFixtures(t *testing.T) {
 		if err := json.Unmarshal(b, &f); err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
-		_, group := f.Config["services"]
-		if !group {
+		host := hostGuidanceTunnel(name)
+		if !host {
 			if err := json.Unmarshal(f.ExpectRaw, &f.Expect); err != nil {
 				t.Fatalf("%s: expect: %v", name, err)
 			}
 		}
 		t.Run(name, func(t *testing.T) {
+			if host {
+				t.Skip(hostGuidanceSkip)
+			}
 			if why, ok := tunnelFixtureSkips[name]; ok {
 				t.Skip(why)
 			}
 			if req := f.RunnerRequirement; req != "" && !runnerCapabilities[req] {
 				t.Skipf("runnerRequirement %q: this runner cannot meet it", req)
-			}
-			if group {
-				runGroupFixture(t, &f)
-				return
 			}
 			runTunnelFixture(t, &f)
 		})

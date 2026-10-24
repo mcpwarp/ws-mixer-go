@@ -3,7 +3,6 @@ package mcpwarp
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"sync"
 	"time"
 
@@ -93,9 +92,6 @@ const (
 	evRetry
 	evDisconnect
 	evClose
-	evGroup           // group: the services changed, or a connection-level effect
-	evServiceConflict // group: one name taken over (§3.3 Per name)
-	evLog             // group: a §6A.10 log line
 )
 
 // errorOrigin says where a non-fatal error event came from; "" is a handler
@@ -131,13 +127,7 @@ type event struct {
 	retry        retryInfo                // evRetry
 	retryKind    string                   // evRetry: "register" or "overloaded"
 	disconnect   wsmixer.DisconnectReason // evDisconnect
-
-	heldDisable   bool                     // evRegistered: a held disable's evDisabled follows at once (§5.9)
-	groupServices map[string]ServiceStatus // evGroup, and a group's evConflict (G6)
-	groupEffect   groupEffect              // evGroup
-	serviceName   string                   // evServiceConflict
-	logLevel      slog.Level               // evLog
-	logMsg        string                   // evLog
+	heldDisable  bool                     // evRegistered: a held disable's evDisabled follows at once (§5.9)
 }
 
 type outstandingOp int
@@ -438,23 +428,32 @@ func (s *session) onRegisteredLocked(m *RegisteredMsg) {
 	for _, e := range m.Errors {
 		ours = ours || e.Name == s.deps.name
 	}
+	paused := s.outstanding == opRegister && s.overloadStop != nil
 	if !ours {
-		// §2.3 Empty reply (v0.7.1 ruling 2): it answers the outstanding
-		// register as an all-transient reply, re-sent after the backoff; no
-		// handle state changes.
-		if s.outstanding == opRegister {
+		// §2.3 Empty reply: it answers the outstanding register as an
+		// all-transient reply, re-sent after the backoff; no handle state
+		// changes. During an OVERLOADED pause the dropped frame is not on the
+		// wire, so it answers nothing (spec v0.8.0 §2.6).
+		if s.outstanding == opRegister && !paused {
 			s.settleLocked()
 			s.scheduleRegisterRetryLocked(string(RegisterInternal), "unlisted in reply")
 		}
 		return
 	}
+	// A registered naming the service answers the outstanding register, an
+	// OVERLOADED-paused one included (the re-queued frame counts as answered:
+	// settled, re-send cancelled, OVERLOADED counter reset). With nothing
+	// outstanding it is still applied (§2.7) but leaves the OVERLOADED
+	// counter alone; the transient counter follows §3.2 either way.
+	answers := s.outstanding == opRegister
 	for _, svc := range m.Services {
 		if svc.Name != s.deps.name {
 			continue
 		}
-		s.outstanding = opNone
+		if answers {
+			s.settleLocked()
+		}
 		s.transientFailures = 0
-		s.overloadedResends = 0
 		s.cancelTimersLocked()
 		s.url = svc.URL
 		s.serverID, s.hasServerID = svc.ID, true
@@ -477,7 +476,9 @@ func (s *session) onRegisteredLocked(m *RegisteredMsg) {
 		if e.Name != s.deps.name {
 			continue
 		}
-		s.settleLocked()
+		if answers {
+			s.settleLocked()
+		}
 		if !IsTransientRegisterError(e.Code) {
 			s.transientFailures = 0 // a non-transient entry is a successful reply (§3.2)
 		}
@@ -632,6 +633,10 @@ func (s *session) onAppErrorLocked(m *ErrorMsg) {
 		switch op := s.outstanding; {
 		case s.closePreReply:
 			s.closePreReply = false // it answers the register in flight when the close began
+		case op != opNone && s.overloadStop != nil:
+			// During an OVERLOADED pause it answers nothing, a close's
+			// unregister included: the dropped frame is not on the wire; counter,
+			// re-send and the close's wait stay (spec v0.8.0 §2.6).
 		case op != opNone:
 			s.settleLocked()
 			if op == opUnregister {
@@ -772,8 +777,6 @@ func (s *session) markClosed() {
 	s.releaseUnregLocked()
 	s.setStateLocked(stateClosed)
 }
-
-func (s *session) closingNow() bool { return s.currentState() == stateClosing }
 
 func (s *session) currentState() exposeState {
 	s.mu.Lock()

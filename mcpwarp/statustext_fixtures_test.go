@@ -45,6 +45,8 @@ func TestStatusTextFixtures(t *testing.T) {
 		InvalidConfig struct {
 			Generic string `json:"genericLastError"`
 		} `json:"invalidConfigComposition"`
+		HostOnly      []string `json:"hostOnly"`
+		HostOnlyCases string   `json:"hostOnlyCases"`
 	}
 	readStatusJSON(t, dir, "rules.json", &rules)
 
@@ -63,6 +65,13 @@ func TestStatusTextFixtures(t *testing.T) {
 		}
 	})
 
+	hostOnly := map[string]bool{}
+	for _, k := range rules.HostOnly {
+		hostOnly[k] = true
+	}
+	if len(hostOnly) == 0 {
+		t.Fatal("rules.json has no hostOnly keys (spec v0.8.0+)")
+	}
 	var enKeys []string
 	for _, locale := range rules.Locales {
 		var file map[string]statusEntry
@@ -76,11 +85,11 @@ func TestStatusTextFixtures(t *testing.T) {
 			enKeys = keys
 		}
 		t.Run(locale+".json", func(t *testing.T) {
-			if !reflect.DeepEqual(keys, enKeys) || len(keys) != 24 {
-				t.Fatalf("key set %v, want the 24 keys of en.json (17 pairs, 7 multi-service)", keys)
+			if !reflect.DeepEqual(keys, enKeys) {
+				t.Fatalf("key set %v, want en.json's", keys)
 			}
 			states, codes := map[TunnelState]string{}, map[StatusCode]string{}
-			services, noService := map[ServiceState]string{}, ""
+			pairs := 0
 			for _, k := range keys {
 				e := file[k]
 				state, code, _ := strings.Cut(k, ".")
@@ -88,21 +97,10 @@ func TestStatusTextFixtures(t *testing.T) {
 				if e.Detail != nil {
 					want.Detail = *e.Detail
 				}
-				switch state {
-				case "service": // §6A.9: the service state's label only (a code-less rejected still gets a detail)
-					services[ServiceState(code)] = e.Label
-					if got := DescribeServiceStatus(ServiceStatus{State: ServiceState(code)}, DescribeOptions{Locale: locale}); got.Label != e.Label || e.Detail != nil {
-						t.Errorf("%s: DescribeServiceStatus label %q, want %q (entry detail %v)", k, got.Label, e.Label, e.Detail)
-					}
-					continue
-				case "lastError": // §6A.9: the group's fatal status
-					noService = want.Detail
-					st := TunnelStatus{State: StateError, Code: CodeInternal, LastError: lastNoServiceRegistered}
-					if got := DescribeStatus(st, DescribeOptions{Locale: locale}); got != want {
-						t.Errorf("%s: DescribeStatus = %+v, want %+v", k, got, want)
-					}
-					continue
+				if hostOnly[k] {
+					continue // rules.json hostOnly (§10.6): host guidance, optional in an SDK's tables
 				}
+				pairs++
 				states[TunnelState(state)] = e.Label
 				if code != "none" {
 					s := e.Label
@@ -119,9 +117,11 @@ func TestStatusTextFixtures(t *testing.T) {
 					t.Errorf("%s: DescribeStatus = %+v, want %+v", k, got, want)
 				}
 			}
+			if pairs != 17 {
+				t.Fatalf("%d <state>.<CODE> keys, want the 17 legal pairs", pairs)
+			}
 			table := statusTables[locale]
-			if !reflect.DeepEqual(table.states, states) || !reflect.DeepEqual(table.codes, codes) ||
-				!reflect.DeepEqual(table.services, services) || table.noServiceRegistered != noService {
+			if !reflect.DeepEqual(table.states, states) || !reflect.DeepEqual(table.codes, codes) {
 				t.Fatalf("generated tables drifted from %s.json; run `go generate ./mcpwarp/`", locale)
 			}
 		})
@@ -132,37 +132,37 @@ func TestStatusTextFixtures(t *testing.T) {
 			Description string `json:"description"`
 			Input       struct {
 				Status struct {
-					State     string `json:"state"`
-					URL       string `json:"url"`
-					Code      string `json:"code"`
-					LastError string `json:"lastError"`
+					State     string          `json:"state"`
+					URL       string          `json:"url"`
+					Code      string          `json:"code"`
+					LastError string          `json:"lastError"`
+					Services  json.RawMessage `json:"services"`
 				} `json:"status"`
-				Service *struct {
-					State     string `json:"state"`
-					ID        string `json:"id"`
-					URL       string `json:"url"`
-					Code      string `json:"code"`
-					LastError string `json:"lastError"`
-				} `json:"service"`
-				Locale *string `json:"locale"`
+				Service json.RawMessage `json:"service"`
+				Locale  *string         `json:"locale"`
 			} `json:"input"`
 			Expect statusEntry `json:"expect"`
 		} `json:"cases"`
 	}
 	readStatusJSON(t, dir, "cases.json", &cases)
+	// rules.json hostOnlyCases is prose; take its two markers from it, and
+	// fail when its wording changes so the runner is updated with it.
+	byService := strings.Contains(rules.HostOnlyCases, "input.service")
+	byStatusServices := strings.Contains(rules.HostOnlyCases, "input.status carries services")
+	if !byService || !byStatusServices {
+		t.Fatalf("rules.json hostOnlyCases %q: update the host-only case markers", rules.HostOnlyCases)
+	}
 	for i, c := range cases.Cases {
 		t.Run("cases.json/"+c.Description, func(t *testing.T) {
 			s := c.Input.Status
+			if byService && c.Input.Service != nil || byStatusServices && s.Services != nil {
+				t.Skip(hostGuidanceSkip)
+			}
 			opts := DescribeOptions{}
 			if c.Input.Locale != nil {
 				opts.Locale = *c.Input.Locale
 			}
-			var got StatusText
-			if sv := c.Input.Service; sv != nil { // §10.6: describeServiceStatus
-				got = DescribeServiceStatus(ServiceStatus{State: ServiceState(sv.State), ID: sv.ID, URL: sv.URL, Code: sv.Code, LastError: sv.LastError}, opts)
-			} else {
-				got = DescribeStatus(TunnelStatus{State: TunnelState(s.State), URL: s.URL, Code: StatusCode(s.Code), LastError: s.LastError}, opts)
-			}
+			got := DescribeStatus(TunnelStatus{State: TunnelState(s.State), URL: s.URL, Code: StatusCode(s.Code), LastError: s.LastError}, opts)
 			want := StatusText{Label: c.Expect.Label}
 			if c.Expect.Detail != nil {
 				want.Detail = *c.Expect.Detail
@@ -187,22 +187,5 @@ func TestDescribeStatusOverrides(t *testing.T) {
 	}
 	if got := DescribeStatus(TunnelStatus{State: "weird"}, DescribeOptions{}); got != (StatusText{Label: "weird"}) {
 		t.Fatalf("unknown state: %+v", got)
-	}
-}
-
-// §6A.9: messages override service-state labels only; the rejected detail
-// stays the table's, and lastError is never shown.
-func TestDescribeServiceStatusOverrides(t *testing.T) {
-	got := DescribeServiceStatus(ServiceStatus{State: ServiceRejected, Code: "QUOTA_EXCEEDED", LastError: "x"}, DescribeOptions{
-		Messages: StatusMessages{
-			Services: map[ServiceState]string{ServiceRejected: "Nope", "bogus": "x"},
-			Codes:    map[StatusCode]string{CodeQuotaExceeded: "ignored"},
-		},
-	})
-	if got != (StatusText{Label: "Nope", Detail: "Plan limit reached"}) {
-		t.Fatalf("got %+v", got)
-	}
-	if got := DescribeServiceStatus(ServiceStatus{State: ServiceDisabled}, DescribeOptions{}); got != (StatusText{Label: "Disabled"}) {
-		t.Fatalf("locally disabled: %+v", got)
 	}
 }
